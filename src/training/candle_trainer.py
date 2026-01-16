@@ -60,10 +60,14 @@ class AccuracyCallback(BaseCallback):
         self.bet_timings: list[float] = []
         
     def _on_step(self) -> bool:
-        # Check for episode ends
+        # Check for episode ends - VecEnv puts terminal info in 'terminal_info' or just 'infos'
         if "infos" in self.locals:
-            for info in self.locals["infos"]:
-                if info.get("bet_placed") is not None:
+            for i, info in enumerate(self.locals["infos"]):
+                # Check if this is a terminal state
+                dones = self.locals.get("dones", [])
+                is_done = dones[i] if i < len(dones) else False
+                
+                if is_done and info.get("bet_placed") is not None:
                     # Episode ended with a bet
                     predicted = info.get("bet_placed")
                     actual = info.get("candle_direction")
