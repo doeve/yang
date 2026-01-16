@@ -262,18 +262,22 @@ class CandlePredictionEnv(gym.Env):
         terminated = False
         truncated = False
         
-        # Handle bet placement
+        # Handle bet placement - ONCE BET IS PLACED, EPISODE ENDS
+        # This prevents data leakage (model can't see price after betting)
         if self._bet_placed is None and action != Action.WAIT:
             self._bet_placed = action
             self._bet_step = self._current_step
-        
-        # Advance time
-        self._current_step += 1
-        
-        # Check if candle is complete
-        if self._current_step >= self._candle_end_idx:
+            # Bet placed - jump to end and compute reward
             terminated = True
             reward = self._compute_reward()
+        else:
+            # Still waiting - advance time
+            self._current_step += 1
+            
+            # Check if candle is complete without a bet
+            if self._current_step >= self._candle_end_idx:
+                terminated = True
+                reward = self.config.no_bet_reward  # Penalty for not betting
         
         obs = self._get_observation()
         info = self._get_info()
