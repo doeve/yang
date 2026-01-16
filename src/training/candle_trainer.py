@@ -159,7 +159,6 @@ class CandleTrainer:
             gamma=self.config.gamma,
             ent_coef=self.config.ent_coef,
             verbose=1,
-            tensorboard_log=str(self.log_dir / "tensorboard"),
         )
         
         # Setup callbacks
