@@ -1,0 +1,79 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data and logs (keep directory structure)
+data/raw/*
+data/processed/*
+data/models/*
+logs/*
+!data/.gitkeep
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/models/.gitkeep
+!logs/.gitkeep
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node.js (web/)
+node_modules/
+web/node_modules/
+web/dist/
+web/build/
+
+# Misc
+*.log
+*.tmp
+.cache/

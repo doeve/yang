@@ -1,0 +1,95 @@
+[project]
+name = "polymarket-ml-trader"
+version = "0.1.0"
+description = "ML training system for crypto-based Polymarket prediction markets"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Dave", email = "dave@example.com" }
+]
+keywords = ["polymarket", "trading", "machine-learning", "reinforcement-learning"]
+
+dependencies = [
+    # Core ML
+    "torch>=2.1.0",
+    "stable-baselines3>=2.2.0",
+    "gymnasium>=0.29.0",
+    
+    # Data & Numerics
+    "numpy>=1.26.0",
+    "pandas>=2.1.0",
+    "pyarrow>=14.0.0",
+    "polars>=0.20.0",
+    
+    # API & Web
+    "fastapi>=0.109.0",
+    "uvicorn[standard]>=0.27.0",
+    "websockets>=12.0",
+    "httpx>=0.26.0",
+    "httpx-socks[asyncio]>=0.9.0",
+    "aiohttp>=3.9.0",
+    
+    # Database
+    "sqlalchemy>=2.0.0",
+    "aiosqlite>=0.19.0",
+    
+    # Utilities
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+    "python-dotenv>=1.0.0",
+    "structlog>=24.1.0",
+    "rich>=13.7.0",
+    "typer>=0.9.0",
+    
+    # Technical Analysis
+    "ta>=0.11.0",
+    
+    # Visualization (backend)
+    "matplotlib>=3.8.0",
+    "seaborn>=0.13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+    "pytest-benchmark>=4.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.8.0",
+    "pre-commit>=3.6.0",
+]
+
+export = [
+    "onnx>=1.15.0",
+    "onnxruntime>=1.16.0",
+]
+
+[project.scripts]
+yang = "src.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-v --tb=short"

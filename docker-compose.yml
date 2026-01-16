@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - POLYMARKET_API_KEY=${POLYMARKET_API_KEY:-}
+    command: ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      - api
+    environment:
+      - API_URL=http://api:8000
+
+  # Optional: GPU-enabled training container
+  trainer:
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - POLYMARKET_API_KEY=${POLYMARKET_API_KEY:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    profiles:
+      - gpu
