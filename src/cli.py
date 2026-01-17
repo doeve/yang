@@ -387,6 +387,139 @@ def train_multi(
         console.print(f"  Total trades: {balance_callback.total_trades:,}")
 
 
+@app.command("train-enhanced")
+def train_enhanced(
+    data_dir: str = typer.Option("./data", help="Data directory"),
+    output_dir: str = typer.Option("./logs", help="Output directory"),
+    name: str = typer.Option("enhanced_multi_asset", help="Training run name"),
+    timesteps: int = typer.Option(2_000_000, help="Total timesteps"),
+    n_envs: int = typer.Option(8, help="Number of environments"),
+    recurrent: bool = typer.Option(True, help="Use RecurrentPPO (LSTM)"),
+):
+    """Train with enhanced features (order flow, multi-timeframe, skip action).
+    
+    This uses the EnhancedMultiAssetEnv which includes:
+    - Order flow features (volume delta, trade imbalance, large trades, VWAP)
+    - Multi-timeframe features (1h/4h price and volume momentum)
+    - Skip action (model can choose not to bet on uncertain candles)
+    - Timing rewards (bonus for waiting until late in candle)
+    - Risk-adjusted rewards (Kelly-inspired position sizing)
+    - Increased history window (500 vs 300)
+    """
+    import pandas as pd
+    from stable_baselines3 import SAC
+    from stable_baselines3.common.vec_env import VecNormalize
+    from .simulation.enhanced_multi_asset_env import (
+        EnhancedMultiAssetEnv,
+        EnhancedMultiAssetConfig,
+        make_enhanced_multi_asset_vec_env,
+    )
+    from .training.advanced_trainer import BalanceCallback
+    from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
+    
+    try:
+        from sb3_contrib import RecurrentPPO
+    except ImportError:
+        RecurrentPPO = None
+        if recurrent:
+            console.print("[yellow]sb3-contrib not found. Falling back to SAC.[/yellow]")
+            recurrent = False
+    
+    data_path = Path(data_dir)
+    
+    btc_path = data_path / "btcusdt_100ms.parquet"
+    if not btc_path.exists():
+        btc_path = data_path / "btcusdt_1s_30days.parquet"
+    
+    if not btc_path.exists():
+        console.print("[red]No BTC data found.[/red]")
+        raise typer.Exit(1)
+    
+    console.print(f"[blue]Loading BTC data from {btc_path}[/blue]")
+    btc_data = pd.read_parquet(btc_path)
+    if "close" in btc_data.columns and "price" not in btc_data.columns:
+        btc_data = btc_data.rename(columns={"close": "price"})
+    
+    dxy_data = None
+    eurusd_data = None
+    
+    if (data_path / "dxy_1h.parquet").exists():
+        console.print("[blue]Loading DXY data[/blue]")
+        dxy_data = pd.read_parquet(data_path / "dxy_1h.parquet")
+    
+    if (data_path / "eurusd_1h.parquet").exists():
+        console.print("[blue]Loading EUR/USD data[/blue]")
+        eurusd_data = pd.read_parquet(data_path / "eurusd_1h.parquet")
+    
+    config = EnhancedMultiAssetConfig(
+        include_order_flow=True,
+        include_multi_timeframe=True,
+        enable_skip=True,
+        use_risk_adjusted_rewards=True,
+    )
+    
+    console.print()
+    console.print(f"[blue]Starting enhanced training: {name}[/blue]")
+    console.print(f"  Model: {'RecurrentPPO (LSTM)' if recurrent else 'SAC (MLP)'}")
+    console.print(f"  Timesteps: {timesteps:,}")
+    console.print(f"  Features: Order Flow + Multi-TF + Skip + Risk-Adjusted")
+    console.print()
+    
+    log_dir = Path(output_dir) / name
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    train_env = make_enhanced_multi_asset_vec_env(btc_data, dxy_data, eurusd_data, n_envs, config)
+    train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True)
+    
+    console.print(f"[dim]Observation space: {train_env.observation_space.shape}[/dim]")
+    
+    balance_callback = BalanceCallback(eval_freq=25_000 // n_envs)
+    checkpoint_callback = CheckpointCallback(
+        save_freq=100_000 // n_envs,
+        save_path=str(log_dir / "checkpoints"),
+        name_prefix="model",
+        save_vecnormalize=True,
+    )
+    callbacks = CallbackList([balance_callback, checkpoint_callback])
+    
+    if recurrent and RecurrentPPO:
+        model = RecurrentPPO(
+            "MlpLstmPolicy",
+            train_env,
+            learning_rate=3e-4,
+            n_steps=2048,
+            batch_size=256,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            policy_kwargs={"shared_lstm": True, "enable_critic_lstm": False},
+            verbose=1,
+            tensorboard_log=str(log_dir / "tensorboard"),
+        )
+    else:
+        model = SAC(
+            "MlpPolicy",
+            train_env,
+            learning_rate=3e-4,
+            buffer_size=100_000,
+            batch_size=256,
+            verbose=1,
+            tensorboard_log=str(log_dir / "tensorboard"),
+        )
+    
+    model.learn(total_timesteps=timesteps, callback=callbacks, progress_bar=True)
+    
+    model_path = log_dir / "enhanced_model"
+    model.save(str(model_path))
+    train_env.save(str(log_dir / "vec_normalize.pkl"))
+    
+    console.print()
+    console.print("[green]Training complete![/green]")
+    console.print(f"  Model: {model_path}")
+    if balance_callback.total_trades > 0:
+        console.print(f"  Accuracy: {balance_callback.correct_trades / balance_callback.total_trades:.1%}")
+
+
 @app.command()
 def evaluate(
     model_path: str = typer.Argument(..., help="Path to trained model"),

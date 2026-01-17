@@ -13,7 +13,7 @@ except ImportError:
     RecurrentPPO = None
 
 def evaluate_multi_model(
-    model_path: str = "logs/recurrent_multi_asset_fixed/multi_asset_model",
+    model_path: str = "logs/recurrent_multi_asset/multi_asset_model",
     data_dir: str = "data",
     n_steps: int = 1000
 ):
