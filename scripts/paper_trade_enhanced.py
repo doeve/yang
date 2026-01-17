@@ -822,24 +822,537 @@ class EnhancedLivePaperTrader:
         console.print(f"Skipped Candles: {self.skipped_candles}")
 
 
+class HistoricalBacktester:
+    """
+    Backtester that fetches random historical data from Binance and tests the model.
+    
+    This allows testing on unseen data that wasn't in the training set.
+    """
+    
+    BINANCE_REST = "https://api.binance.com/api/v3"
+    HISTORY_LENGTH = 500
+    
+    def __init__(
+        self,
+        model_path: str,
+        data_dir: str = "./data",
+        initial_balance: float = 10000.0,
+        candle_minutes: int = 15,
+        num_candles: int = 100,
+        days_back_min: int = 30,
+        days_back_max: int = 365,
+    ):
+        self.model_path = Path(model_path)
+        self.data_dir = Path(data_dir)
+        self.initial_balance = initial_balance
+        self.balance = initial_balance
+        self.candle_minutes = candle_minutes
+        self.num_candles = num_candles
+        self.days_back_min = days_back_min
+        self.days_back_max = days_back_max
+        
+        # Model state
+        self.model = None
+        self.is_recurrent = False
+        self.lstm_states = None
+        self.episode_starts = np.ones((1,), dtype=bool)
+        self.vec_normalize = None
+        
+        # Config flags
+        self.has_dxy = True
+        self.has_eurusd = True
+        self.include_order_flow = True
+        self.include_multi_tf = True
+        
+        # Feature trackers
+        self.order_flow = LiveOrderFlowTracker()
+        self.multi_tf = LiveMultiTimeframeTracker(ticks_per_hour=60)  # 1m data = 60 ticks/hour
+        
+        # Stats
+        self.trades: list[dict] = []
+        self.total_trades = 0
+        self.correct_trades = 0
+        self.skipped_candles = 0
+    
+    async def _load_model(self):
+        """Load trained model and VecNormalize."""
+        console.print(f"\n[bold blue]Loading model from {self.model_path}...[/bold blue]")
+        
+        # Check path
+        actual_path = self.model_path
+        if not actual_path.exists() and not str(actual_path).endswith('.zip'):
+            zip_path = Path(str(actual_path) + '.zip')
+            if zip_path.exists():
+                actual_path = zip_path
+        
+        # Try loading
+        if RecurrentPPO:
+            try:
+                self.model = RecurrentPPO.load(str(self.model_path).replace('.zip', ''))
+                self.is_recurrent = True
+                console.print("[green]✓ Loaded RecurrentPPO (LSTM policy)[/green]")
+            except Exception:
+                pass
+        
+        if self.model is None:
+            try:
+                self.model = SAC.load(str(self.model_path).replace('.zip', ''))
+                self.is_recurrent = False
+                console.print("[green]✓ Loaded SAC (MLP policy)[/green]")
+            except Exception as e:
+                console.print(f"[red]✗ Failed to load model: {e}[/red]")
+                raise
+        
+        # Load VecNormalize
+        vec_path = self.model_path.parent / "vec_normalize.pkl"
+        if vec_path.exists():
+            console.print("[blue]Loading VecNormalize stats...[/blue]")
+            
+            dxy_data = None
+            eurusd_data = None
+            
+            dxy_path = self.data_dir / "dxy_1h.parquet"
+            if dxy_path.exists():
+                dxy_data = pd.read_parquet(dxy_path)
+            else:
+                self.has_dxy = False
+            
+            eurusd_path = self.data_dir / "eurusd_1h.parquet"
+            if eurusd_path.exists():
+                eurusd_data = pd.read_parquet(eurusd_path)
+            else:
+                self.has_eurusd = False
+            
+            btc_path = self.data_dir / "btcusdt_100ms.parquet"
+            if not btc_path.exists():
+                btc_path = self.data_dir / "btcusdt_1s_30days.parquet"
+            
+            if not btc_path.exists():
+                console.print("[red]✗ No BTC data found for VecNormalize[/red]")
+                raise FileNotFoundError("BTC data required")
+            
+            btc_data = pd.read_parquet(btc_path)
+            if "close" in btc_data.columns and "price" not in btc_data.columns:
+                btc_data = btc_data.rename(columns={"close": "price"})
+            
+            config = EnhancedMultiAssetConfig(
+                random_start=False,
+                include_order_flow=self.include_order_flow,
+                include_multi_timeframe=self.include_multi_tf,
+                enable_skip=True,
+            )
+            
+            def make_env():
+                return EnhancedMultiAssetEnv(btc_data, dxy_data, eurusd_data, config=config)
+            
+            dummy_env = DummyVecEnv([make_env])
+            self.vec_normalize = VecNormalize.load(str(vec_path), dummy_env)
+            self.vec_normalize.training = False
+            self.vec_normalize.norm_reward = False
+            console.print("[green]✓ Loaded VecNormalize[/green]")
+    
+    async def _fetch_historical_data(self, client: httpx.AsyncClient) -> pd.DataFrame:
+        """Fetch historical 1m kline data for a random time period."""
+        console.print("\n[blue]Fetching historical data from Binance...[/blue]")
+        
+        # Select random start time
+        now = datetime.now(timezone.utc)
+        days_back = np.random.randint(self.days_back_min, self.days_back_max + 1)
+        
+        # Calculate how much data we need
+        # For N candles of M minutes, plus 500 history, plus buffer
+        minutes_needed = (self.num_candles + 10) * self.candle_minutes + self.HISTORY_LENGTH * 2
+        
+        # Random start within the range
+        max_start = now - timedelta(days=self.days_back_min)
+        min_start = now - timedelta(days=self.days_back_max) 
+        
+        range_seconds = (max_start - min_start).total_seconds()
+        random_offset = np.random.randint(0, max(1, int(range_seconds)))
+        start_time = min_start + timedelta(seconds=random_offset)
+        end_time = start_time + timedelta(minutes=minutes_needed)
+        
+        console.print(f"  Period: {start_time.strftime('%Y-%m-%d %H:%M')} to {end_time.strftime('%Y-%m-%d %H:%M')} UTC")
+        console.print(f"  ({days_back} days ago, ~{minutes_needed} minutes of data)")
+        
+        # Fetch in chunks (Binance limit is 1000)
+        all_klines = []
+        current_start = int(start_time.timestamp() * 1000)
+        end_ms = int(end_time.timestamp() * 1000)
+        
+        while current_start < end_ms:
+            params = {
+                "symbol": "BTCUSDT",
+                "interval": "1m",
+                "startTime": current_start,
+                "endTime": end_ms,
+                "limit": 1000,
+            }
+            
+            try:
+                resp = await client.get(f"{self.BINANCE_REST}/klines", params=params)
+                resp.raise_for_status()
+                klines = resp.json()
+                
+                if not klines:
+                    break
+                
+                all_klines.extend(klines)
+                current_start = int(klines[-1][0]) + 60000  # Next minute
+                
+                await asyncio.sleep(0.1)  # Rate limiting
+                
+            except Exception as e:
+                console.print(f"[red]Error fetching klines: {e}[/red]")
+                break
+        
+        if not all_klines:
+            raise ValueError("No historical data fetched")
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(all_klines, columns=[
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "quote_volume", "trades", "taker_buy_base",
+            "taker_buy_quote", "ignore"
+        ])
+        
+        df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+        df["price"] = df["close"].astype(float)
+        df["volume"] = df["volume"].astype(float)
+        df = df[["timestamp", "price", "volume"]].copy()
+        
+        console.print(f"[green]✓ Fetched {len(df)} data points[/green]")
+        console.print(f"  Price range: ${df['price'].min():,.2f} - ${df['price'].max():,.2f}")
+        
+        return df
+    
+    def _build_observation(
+        self,
+        prices: np.ndarray,
+        volumes: np.ndarray,
+        candle_open: float,
+        time_in_candle: float,
+        hour: int,
+    ) -> np.ndarray:
+        """Build observation vector from historical data."""
+        seq_len = self.HISTORY_LENGTH
+        obs_parts = []
+        
+        # === BTC Prices (500) ===
+        if len(prices) < seq_len:
+            pad = np.full(seq_len - len(prices), prices[0] if len(prices) > 0 else candle_open)
+            prices = np.concatenate([pad, prices])
+        else:
+            prices = prices[-seq_len:]
+        
+        btc_norm = (prices / candle_open - 1.0) * 100 if candle_open > 0 else np.zeros(seq_len)
+        obs_parts.append(btc_norm.astype(np.float32))
+        
+        # === BTC Volumes (500) ===
+        if len(volumes) < seq_len:
+            pad = np.zeros(seq_len - len(volumes))
+            volumes = np.concatenate([pad, volumes])
+        else:
+            volumes = volumes[-seq_len:]
+        
+        vol_max = volumes.max() if volumes.max() > 0 else 1.0
+        obs_parts.append((volumes / vol_max).astype(np.float32))
+        
+        # === Order Flow Features (6) ===
+        if self.include_order_flow:
+            obs_parts.append(self.order_flow.get_features())
+        
+        # === Multi-Timeframe Features (4) ===
+        if self.include_multi_tf:
+            obs_parts.append(self.multi_tf.get_features())
+        
+        # === Forex Returns (placeholder zeros - not available for historical) ===
+        if self.has_dxy:
+            obs_parts.append(np.array([0.0, 0.0], dtype=np.float32))
+        if self.has_eurusd:
+            obs_parts.append(np.array([0.0, 0.0], dtype=np.float32))
+        
+        # === Context Features (7) ===
+        current_price = prices[-1] if len(prices) > 0 else candle_open
+        current_vs_open = (current_price / candle_open - 1.0) * 100 if candle_open > 0 else 0
+        time_remaining = 1.0 - time_in_candle
+        
+        hour_sin = np.sin(2 * np.pi * hour / 24)
+        hour_cos = np.cos(2 * np.pi * hour / 24)
+        
+        # ATR
+        if len(prices) > 14:
+            changes = np.abs(np.diff(prices[-15:]))
+            atr = np.mean(changes) / (candle_open + 1e-8) * 100
+        else:
+            atr = 0.0
+        
+        # Volatility regime
+        if len(prices) > 100:
+            recent_changes = np.abs(np.diff(prices[-100:]))
+            vol_regime = (np.mean(recent_changes[-14:]) - np.mean(recent_changes)) / (np.std(recent_changes) + 1e-8)
+        else:
+            vol_regime = 0.0
+        
+        context = np.array([
+            current_vs_open,
+            time_remaining,
+            time_in_candle,
+            hour_sin,
+            hour_cos,
+            atr,
+            np.clip(vol_regime, -3, 3),
+        ], dtype=np.float32)
+        obs_parts.append(context)
+        
+        obs = np.concatenate(obs_parts)
+        return np.clip(obs, -100.0, 100.0).astype(np.float32).reshape(1, -1)
+    
+    def _normalize_obs(self, obs: np.ndarray) -> np.ndarray:
+        """Apply VecNormalize observation normalization."""
+        if self.vec_normalize is not None:
+            return self.vec_normalize.normalize_obs(obs)
+        return obs
+    
+    def _get_model_prediction(self, obs: np.ndarray) -> tuple[float, float, float]:
+        """Get direction, size, and skip_prob from model."""
+        obs_norm = self._normalize_obs(obs)
+        
+        if self.is_recurrent:
+            action, self.lstm_states = self.model.predict(
+                obs_norm,
+                state=self.lstm_states,
+                episode_start=self.episode_starts,
+                deterministic=True,
+            )
+        else:
+            action, _ = self.model.predict(obs_norm, deterministic=True)
+        
+        self.episode_starts[0] = False
+        
+        direction = float(action[0][0])
+        size = float(np.clip(action[0][1], 0.0, 1.0))
+        skip_prob = float(action[0][2]) if len(action[0]) > 2 else 0.0
+        
+        return direction, size, skip_prob
+    
+    async def run(self):
+        """Run historical backtest."""
+        await self._load_model()
+        
+        async with httpx.AsyncClient(timeout=60) as client:
+            df = await self._fetch_historical_data(client)
+        
+        console.print("\n[bold green]═══ STARTING HISTORICAL BACKTEST ═══[/bold green]")
+        console.print(f"Initial Balance: ${self.initial_balance:,.2f}")
+        console.print(f"Candle Duration: {self.candle_minutes} minutes")
+        console.print(f"Target Candles: {self.num_candles}")
+        
+        # Group data into candles
+        candle_seconds = self.candle_minutes * 60
+        df["candle_idx"] = (df["timestamp"].astype(np.int64) // 10**9 // candle_seconds).astype(int)
+        
+        candle_groups = list(df.groupby("candle_idx"))
+        
+        # Skip first few candles to build up history
+        start_idx = max(0, self.HISTORY_LENGTH // self.candle_minutes + 5)
+        end_idx = min(len(candle_groups), start_idx + self.num_candles)
+        
+        console.print(f"Processing candles {start_idx} to {end_idx} ({end_idx - start_idx} candles)\n")
+        
+        # Initialize order flow with early data
+        for _, group in candle_groups[:start_idx]:
+            for _, row in group.iterrows():
+                self.order_flow.update(row["price"], row["volume"])
+                self.multi_tf.update(row["price"], row["volume"])
+        
+        # Collect all prices/volumes for history
+        all_prices = df["price"].values
+        all_volumes = df["volume"].values
+        
+        # Process each candle
+        candles_processed = 0
+        
+        for candle_idx, (_, group) in enumerate(candle_groups[start_idx:end_idx]):
+            if len(group) < 2:
+                continue
+            
+            candle_open = group["price"].iloc[0]
+            candle_close = group["price"].iloc[-1]
+            candle_return = (candle_close - candle_open) / candle_open * 100
+            actual_direction = "UP" if candle_return > 0 else "DOWN"
+            candle_time = group["timestamp"].iloc[0]
+            hour = candle_time.hour
+            
+            # Reset episode for new candle
+            self.episode_starts[0] = True
+            
+            # Get all data up to this candle for history
+            candle_end_in_df = group.index[-1]
+            history_prices = all_prices[:candle_end_in_df]
+            history_volumes = all_volumes[:candle_end_in_df]
+            
+            # Simulate decision point (middle of candle)
+            mid_point = len(group) // 2
+            decision_time = mid_point / len(group)
+            
+            # Update order flow with candle data up to decision point
+            for i in range(mid_point):
+                row = group.iloc[i]
+                self.order_flow.update(row["price"], row["volume"])
+                self.multi_tf.update(row["price"], row["volume"])
+            
+            # Build observation at decision point
+            prices_at_decision = np.concatenate([history_prices[:-len(group)+mid_point], group["price"].iloc[:mid_point].values])
+            volumes_at_decision = np.concatenate([history_volumes[:-len(group)+mid_point], group["volume"].iloc[:mid_point].values])
+            
+            obs = self._build_observation(
+                prices_at_decision[-self.HISTORY_LENGTH*2:],
+                volumes_at_decision[-self.HISTORY_LENGTH*2:],
+                candle_open,
+                decision_time,
+                hour,
+            )
+            
+            # Get model prediction
+            direction, size, skip_prob = self._get_model_prediction(obs)
+            
+            # Update order flow with rest of candle
+            for i in range(mid_point, len(group)):
+                row = group.iloc[i]
+                self.order_flow.update(row["price"], row["volume"])
+                self.multi_tf.update(row["price"], row["volume"])
+            
+            # Evaluate trade
+            if skip_prob > 0.5:
+                self.skipped_candles += 1
+                if candles_processed < 20:
+                    console.print(f"[dim]Candle {candles_processed + 1}: SKIPPED (skip_prob={skip_prob:.2f}) | Actual: {actual_direction} ({candle_return:+.2f}%)[/dim]")
+            elif abs(direction) > 0.1 and size > 0.05:
+                predicted = "UP" if direction > 0 else "DOWN"
+                position_size = size * 0.5
+                
+                if predicted == actual_direction:
+                    pnl_pct = abs(candle_return) * position_size
+                    self.correct_trades += 1
+                    result = "[green]✓[/green]"
+                else:
+                    pnl_pct = -abs(candle_return) * (position_size ** 2) * 2
+                    result = "[red]✗[/red]"
+                
+                self.balance *= (1 + pnl_pct / 100)
+                self.total_trades += 1
+                
+                self.trades.append({
+                    "time": candle_time,
+                    "predicted": predicted,
+                    "actual": actual_direction,
+                    "size": position_size,
+                    "pnl_pct": pnl_pct,
+                    "balance": self.balance,
+                })
+                
+                if candles_processed < 20:
+                    console.print(
+                        f"Candle {candles_processed + 1}: {predicted} (size={position_size:.1%}) → "
+                        f"{actual_direction} ({candle_return:+.2f}%) | PnL: {pnl_pct:+.2f}% {result}"
+                    )
+            else:
+                if candles_processed < 20:
+                    console.print(f"[dim]Candle {candles_processed + 1}: No position (weak signal)[/dim]")
+            
+            candles_processed += 1
+        
+        self._print_summary()
+    
+    def _print_summary(self):
+        """Print backtest summary."""
+        console.print("\n" + "═" * 50)
+        console.print("[bold]BACKTEST RESULTS[/bold]")
+        console.print("═" * 50)
+        
+        table = Table(show_header=True, header_style="bold cyan")
+        table.add_column("Metric")
+        table.add_column("Value", style="green")
+        
+        pnl = self.balance - self.initial_balance
+        pnl_pct = pnl / self.initial_balance * 100
+        pnl_color = "green" if pnl >= 0 else "red"
+        
+        table.add_row("Initial Balance", f"${self.initial_balance:,.2f}")
+        table.add_row("Final Balance", f"${self.balance:,.2f}")
+        table.add_row("Total PnL", f"[{pnl_color}]${pnl:+,.2f} ({pnl_pct:+.2f}%)[/{pnl_color}]")
+        
+        table.add_row("─" * 15, "─" * 20)
+        
+        table.add_row("Total Trades", str(self.total_trades))
+        if self.total_trades > 0:
+            accuracy = self.correct_trades / self.total_trades
+            table.add_row("Correct Trades", str(self.correct_trades))
+            table.add_row("Accuracy", f"{accuracy:.1%}")
+        
+        table.add_row("Skipped Candles", str(self.skipped_candles))
+        
+        if self.trades:
+            pnls = [t["pnl_pct"] for t in self.trades]
+            table.add_row("─" * 15, "─" * 20)
+            table.add_row("Best Trade", f"+{max(pnls):.2f}%")
+            table.add_row("Worst Trade", f"{min(pnls):.2f}%")
+            table.add_row("Avg Trade", f"{np.mean(pnls):+.2f}%")
+        
+        console.print(table)
+
+
 async def main():
-    parser = argparse.ArgumentParser(description="Enhanced live paper trading")
+    parser = argparse.ArgumentParser(
+        description="Enhanced paper trading (live or historical backtest)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Live trading
+  python scripts/paper_trade_enhanced.py --model logs/my_enhanced_model/enhanced_model.zip
+  
+  # Backtest on random historical period
+  python scripts/paper_trade_enhanced.py --backtest --model logs/my_enhanced_model/enhanced_model.zip
+  
+  # Backtest with custom settings
+  python scripts/paper_trade_enhanced.py --backtest --num-candles 200 --days-back-min 60 --days-back-max 180
+"""
+    )
     parser.add_argument("--model", "-m", default="logs/my_enhanced_model/enhanced_model")
     parser.add_argument("--data", "-d", default="./data")
     parser.add_argument("--balance", "-b", type=float, default=10000.0)
     parser.add_argument("--candle-minutes", "-c", type=int, default=15)
     
+    # Backtest-specific arguments
+    parser.add_argument("--backtest", action="store_true", help="Run historical backtest instead of live trading")
+    parser.add_argument("--num-candles", "-n", type=int, default=100, help="Number of candles to backtest")
+    parser.add_argument("--days-back-min", type=int, default=30, help="Minimum days back for random period")
+    parser.add_argument("--days-back-max", type=int, default=365, help="Maximum days back for random period")
+    
     args = parser.parse_args()
     
-    trader = EnhancedLivePaperTrader(
-        model_path=args.model,
-        data_dir=args.data,
-        initial_balance=args.balance,
-        candle_minutes=args.candle_minutes,
-    )
-    
-    await trader.run()
+    if args.backtest:
+        backtester = HistoricalBacktester(
+            model_path=args.model,
+            data_dir=args.data,
+            initial_balance=args.balance,
+            candle_minutes=args.candle_minutes,
+            num_candles=args.num_candles,
+            days_back_min=args.days_back_min,
+            days_back_max=args.days_back_max,
+        )
+        await backtester.run()
+    else:
+        trader = EnhancedLivePaperTrader(
+            model_path=args.model,
+            data_dir=args.data,
+            initial_balance=args.balance,
+            candle_minutes=args.candle_minutes,
+        )
+        await trader.run()
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+
