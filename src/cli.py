@@ -173,6 +173,220 @@ def train_candle(
     console.print(f"  Total predictions: {result['total_predictions']:,}")
 
 
+@app.command("train-advanced")
+def train_advanced(
+    data_dir: str = typer.Option("./data", help="Data directory"),
+    output_dir: str = typer.Option("./logs", help="Output directory"),
+    name: str = typer.Option("advanced_candle", help="Training run name"),
+    timesteps: int = typer.Option(500_000, help="Total timesteps"),
+    n_envs: int = typer.Option(8, help="Number of environments"),
+    initial_balance: float = typer.Option(1000.0, help="Starting balance"),
+):
+    """Train with position sizing (learns BOTH direction AND bet size).
+    
+    Uses SAC algorithm with continuous action space.
+    The model learns Kelly-like position sizing based on confidence.
+    """
+    import pandas as pd
+    from .training.advanced_trainer import AdvancedTrainer, AdvancedTrainingConfig
+    
+    # Load data
+    data_path = Path(data_dir) / "btcusdt_100ms.parquet"
+    if not data_path.exists():
+        data_path = Path(data_dir) / "btcusdt_1s_30days.parquet"
+    
+    if not data_path.exists():
+        console.print("[red]No price data found.[/red]")
+        raise typer.Exit(1)
+    
+    console.print(f"[blue]Loading data from {data_path}[/blue]")
+    price_data = pd.read_parquet(data_path)
+    
+    if "close" in price_data.columns and "price" not in price_data.columns:
+        price_data = price_data.rename(columns={"close": "price"})
+    
+    config = AdvancedTrainingConfig(
+        total_timesteps=timesteps,
+        n_envs=n_envs,
+        initial_balance=initial_balance,
+        log_dir=output_dir,
+        experiment_name=name,
+    )
+    
+    console.print(f"[blue]Starting advanced training: {name}[/blue]")
+    console.print(f"  Algorithm: SAC (continuous actions)")
+    console.print(f"  Timesteps: {timesteps:,}")
+    console.print(f"  Initial balance: ${initial_balance:,.0f}")
+    console.print()
+    
+    trainer = AdvancedTrainer(price_data, config)
+    result = trainer.train()
+    
+    console.print()
+    console.print("[green]Training complete![/green]")
+    console.print(f"  Model saved to: {result['model_path']}")
+    console.print(f"  Final accuracy: {result['final_accuracy']:.1%}")
+    console.print(f"  Avg final balance: ${result['avg_final_balance']:,.2f}")
+    console.print(f"  Avg position size: {result['avg_position_size']:.1%}")
+    console.print(f"  Total trades: {result['total_trades']:,}")
+
+
+@app.command("collect-forex")
+def collect_forex(
+    data_dir: str = typer.Option("./data", help="Data directory"),
+    interval: str = typer.Option("1h", help="Data interval (1m, 5m, 1h)"),
+):
+    """Collect forex data (DXY, EUR/USD) for correlation with BTC."""
+    import asyncio
+    from .data.forex_collector import ForexCollector
+    
+    console.print("[blue]Collecting forex data...[/blue]")
+    
+    collector = ForexCollector(data_dir)
+    results = asyncio.run(collector.collect_all(interval))
+    
+    console.print()
+    for symbol, df in results.items():
+        console.print(f"[green]✓[/green] {symbol}: {len(df)} rows")
+        console.print(f"    Range: {df['timestamp'].min()} to {df['timestamp'].max()}")
+
+
+@app.command("train-multi")
+def train_multi(
+    data_dir: str = typer.Option("./data", help="Data directory"),
+    output_dir: str = typer.Option("./logs", help="Output directory"),
+    name: str = typer.Option("multi_asset", help="Training run name"),
+    timesteps: int = typer.Option(2_000_000, help="Total timesteps"),
+    n_envs: int = typer.Option(8, help="Number of environments"),
+    recurrent: bool = typer.Option(True, help="Use RecurrentSAC (LSTM)"),
+):
+    """Train with BTC + forex correlation (DXY, EUR/USD).
+    
+    Run 'collect-forex' first to download forex data.
+    Uses asymmetric reward for proper position sizing.
+    """
+    import pandas as pd
+    from stable_baselines3 import SAC
+    from stable_baselines3.common.vec_env import VecNormalize
+    from .simulation.multi_asset_env import MultiAssetEnv, MultiAssetConfig, make_multi_asset_vec_env
+    from .training.advanced_trainer import BalanceCallback
+    from stable_baselines3.common.callbacks import CallbackList
+    
+    # Try importing RecurrentPPO
+    try:
+        from sb3_contrib import RecurrentPPO
+    except ImportError:
+        RecurrentPPO = None
+        if recurrent:
+            console.print("[yellow]sb3-contrib not found. Falling back to standard SAC.[/yellow]")
+            recurrent = False
+    
+    data_path = Path(data_dir)
+    
+    # Load BTC data
+    btc_path = data_path / "btcusdt_100ms.parquet"
+    if not btc_path.exists():
+        btc_path = data_path / "btcusdt_1s_30days.parquet"
+    
+    if not btc_path.exists():
+        console.print("[red]No BTC data found. Run data collection first.[/red]")
+        raise typer.Exit(1)
+    
+    console.print(f"[blue]Loading BTC data from {btc_path}[/blue]")
+    btc_data = pd.read_parquet(btc_path)
+    if "close" in btc_data.columns and "price" not in btc_data.columns:
+        btc_data = btc_data.rename(columns={"close": "price"})
+    
+    # Load forex data if available
+    dxy_data = None
+    eurusd_data = None
+    
+    dxy_path = data_path / "dxy_1h.parquet"
+    if dxy_path.exists():
+        console.print(f"[blue]Loading DXY data from {dxy_path}[/blue]")
+        dxy_data = pd.read_parquet(dxy_path)
+    
+    eurusd_path = data_path / "eurusd_1h.parquet"
+    if eurusd_path.exists():
+        console.print(f"[blue]Loading EUR/USD data from {eurusd_path}[/blue]")
+        eurusd_data = pd.read_parquet(eurusd_path)
+    
+    if dxy_data is None and eurusd_data is None:
+        console.print("[yellow]No forex data found. Training with BTC only.[/yellow]")
+        console.print("[yellow]Run 'collect-forex' to add correlation data.[/yellow]")
+    
+    # Create environment
+    config = MultiAssetConfig()
+    
+    console.print()
+    console.print(f"[blue]Starting multi-asset training: {name}[/blue]")
+    console.print(f"  Assets: BTC" + (" + DXY" if dxy_data is not None else "") + (" + EUR/USD" if eurusd_data is not None else ""))
+    console.print(f"  Model: {'RecurrentPPO (LSTM)' if recurrent else 'SAC (MLP)'}")
+    console.print(f"  Timesteps: {timesteps:,}")
+    console.print(f"  Reward: Asymmetric (squared penalty for wrong bets)")
+    console.print()
+    
+    train_env = make_multi_asset_vec_env(btc_data, dxy_data, eurusd_data, n_envs, config)
+    train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True)
+    
+    log_dir = Path(output_dir) / name
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Callbacks
+    from src.training.advanced_trainer import BalanceCallback
+    from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
+    
+    balance_callback = BalanceCallback(eval_freq=25_000 // n_envs)
+    checkpoint_callback = CheckpointCallback(
+        save_freq=50_000 // n_envs,
+        save_path=str(Path(log_dir) / "checkpoints"),
+        name_prefix="model",
+        save_vecnormalize=True,
+    )
+    
+    callbacks = CallbackList([balance_callback, checkpoint_callback])
+    
+    if recurrent and RecurrentPPO:
+        model = RecurrentPPO(
+            "MlpLstmPolicy",
+            train_env,
+            learning_rate=3e-4,
+            n_steps=2048,
+            batch_size=256,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            policy_kwargs={"shared_lstm": True, "enable_critic_lstm": False},
+            verbose=1,
+        )
+    else:
+        model = SAC(
+            "MlpPolicy",
+            train_env,
+            learning_rate=3e-4,
+            buffer_size=100_000,
+            batch_size=256,
+            verbose=1,
+        )
+    
+    model.learn(
+        total_timesteps=timesteps,
+        callback=callbacks,
+        progress_bar=True,
+    )
+    
+    model_path = log_dir / "multi_asset_model"
+    model.save(str(model_path))
+    train_env.save(str(log_dir / "vec_normalize.pkl"))
+    
+    console.print()
+    console.print("[green]Training complete![/green]")
+    console.print(f"  Model saved to: {model_path}")
+    if balance_callback.total_trades > 0:
+        console.print(f"  Final accuracy: {balance_callback.correct_trades / balance_callback.total_trades:.1%}")
+        console.print(f"  Total trades: {balance_callback.total_trades:,}")
+
+
 @app.command()
 def evaluate(
     model_path: str = typer.Argument(..., help="Path to trained model"),
