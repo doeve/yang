@@ -28,7 +28,7 @@ console = Console()
 
 
 def evaluate_enhanced_model(
-    model_path: str = "logs/enhanced_multi_asset/enhanced_model",
+    model_path: str = "logs/my_enhanced_model/enhanced_model",
     data_dir: str = "data",
     n_episodes: int = 100,
 ):
