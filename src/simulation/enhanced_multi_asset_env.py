@@ -27,6 +27,7 @@ class EnhancedMultiAssetConfig:
     """Configuration for enhanced multi-asset environment."""
     
     candle_minutes: int = 15
+    # candle_minutes: int = 5
     price_history_length: int = 500  # Increased from 300
     max_position_size: float = 0.5
     random_start: bool = True

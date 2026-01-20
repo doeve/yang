@@ -277,3 +277,10 @@ mypy src/
 ## License
 
 MIT
+
+python scripts/paper_trade_enhanced.py --backtest \
+    --model logs/my_enhanced_model/enhanced_model.zip \
+    --num-candles 100 \
+    --days-back-min 30 \
+    --days-back-max 365
+

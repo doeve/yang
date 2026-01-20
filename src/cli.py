@@ -515,9 +515,13 @@ def train_enhanced(
     
     console.print()
     console.print("[green]Training complete![/green]")
-    console.print(f"  Model: {model_path}")
+    console.print()
+    console.print("[bold]Model Location:[/bold]")
+    console.print(f"  Model file: {model_path.resolve()}.zip")
+    console.print(f"  VecNormalize: {(log_dir / 'vec_normalize.pkl').resolve()}")
+    console.print()
     if balance_callback.total_trades > 0:
-        console.print(f"  Accuracy: {balance_callback.correct_trades / balance_callback.total_trades:.1%}")
+        console.print(f"  Final Accuracy: {balance_callback.correct_trades / balance_callback.total_trades:.1%}")
 
 
 @app.command()
