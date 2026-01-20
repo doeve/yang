@@ -27,8 +27,7 @@ class EnhancedMultiAssetConfig:
     """Configuration for enhanced multi-asset environment."""
     
     candle_minutes: int = 15
-    # candle_minutes: int = 5
-    price_history_length: int = 500  # Increased from 300
+    price_history_length: int = 100  # Reduced from 500 for LSTM efficiency
     max_position_size: float = 0.5
     random_start: bool = True
     
@@ -50,6 +49,7 @@ class EnhancedMultiAssetConfig:
     # Risk-adjusted rewards
     use_risk_adjusted_rewards: bool = True
     sharpe_window: int = 20  # Rolling window for Sharpe calculation
+    reward_scale: float = 10.0  # Scale rewards for better signal-to-noise
     
     # Assets
     include_dxy: bool = True
@@ -161,7 +161,7 @@ class EnhancedMultiAssetEnv(gym.Env):
             # Small reward for skipping uncertain situations (if move was small)
             actual_move = abs(self._candle_return) * 100
             if actual_move < 0.1:  # The candle moved less than 0.1%
-                reward = 0.05  # Good decision to skip
+                reward = 0.05 * self.config.reward_scale  # Good decision to skip
             else:
                 reward = 0.0  # Neutral - missed opportunity but not penalized
             
@@ -190,17 +190,17 @@ class EnhancedMultiAssetEnv(gym.Env):
                     move_pct, self._position_direction, self._position_size, timing_bonus
                 )
             else:
-                # Original asymmetric reward
+                # Original asymmetric reward (also scaled)
                 if self._position_direction > 0:  # BET UP
                     if move_pct > 0:
-                        reward = move_pct * self._position_size + timing_bonus
+                        reward = (move_pct * self._position_size + timing_bonus) * self.config.reward_scale
                     else:
-                        reward = -1.0 * (self._position_size ** 2) * abs(move_pct) * 2.0
+                        reward = -1.0 * (self._position_size ** 2) * abs(move_pct) * 2.0 * self.config.reward_scale
                 else:  # BET DOWN
                     if move_pct < 0:
-                        reward = abs(move_pct) * self._position_size + timing_bonus
+                        reward = (abs(move_pct) * self._position_size + timing_bonus) * self.config.reward_scale
                     else:
-                        reward = -1.0 * (self._position_size ** 2) * abs(move_pct) * 2.0
+                        reward = -1.0 * (self._position_size ** 2) * abs(move_pct) * 2.0 * self.config.reward_scale
         else:
             # Continue waiting
             self._current_step += 1
@@ -209,9 +209,9 @@ class EnhancedMultiAssetEnv(gym.Env):
                 # Penalty for indecision when there was a clear move
                 actual_move = abs(self._candle_return) * 100
                 if actual_move > 0.2:  # Missed a significant move
-                    reward = -0.1 * actual_move  # Penalty proportional to missed move
+                    reward = -0.1 * actual_move * self.config.reward_scale  # Scaled penalty
                 else:
-                    reward = 0.01  # Small reward for correctly identifying uncertain candle
+                    reward = 0.01 * self.config.reward_scale  # Small reward for correct skip
         
         self._reward_history.append(reward)
         
@@ -227,45 +227,60 @@ class EnhancedMultiAssetEnv(gym.Env):
         """
         Compute risk-adjusted reward using Kelly-inspired logic.
         
-        Rewards:
-        1. Higher reward for correct direction
-        2. Bonus for appropriate sizing (not over-betting on small moves)
-        3. Bonus for timing (waiting for confirmation)
-        4. Penalty scaled by position size squared for wrong bets
+        Rewards are scaled by config.reward_scale for better gradient signal.
+        
+        Design principles:
+        1. Correct direction is rewarded proportionally to move size and position
+        2. Wrong direction is penalized more heavily (asymmetric risk)
+        3. Appropriate sizing is rewarded (don't over-bet on small moves)
+        4. Timing bonus for waiting for confirmation
         """
         is_correct = (direction > 0 and move_pct > 0) or (direction < 0 and move_pct < 0)
         abs_move = abs(move_pct)
         
         if is_correct:
             # === WIN ===
+            # Base reward: proportional to move and position size
             base_reward = abs_move * position_size
             
-            # Kelly-optimal sizing bonus
-            # Ideal: size proportional to edge
-            # If abs_move is small but size is small = good
-            # If abs_move is large and size is large = good
-            # If abs_move is small but size is large = suboptimal
-            edge_estimate = abs_move / 100  # Rough edge
-            optimal_size = min(edge_estimate * 5, 0.5)  # Cap at 50%
-            sizing_accuracy = 1.0 - abs(position_size - optimal_size)
-            sizing_bonus = sizing_accuracy * 0.2
+            # Confidence bonus: reward sizing proportional to move magnitude
+            # Small moves should have small positions, large moves can have larger
+            # Optimal: position_size ≈ min(abs_move * 2, 0.5)
+            optimal_size = min(abs_move * 2, 0.5)
+            sizing_diff = abs(position_size - optimal_size)
             
+            # Reward good sizing, small penalty for over/under-sizing
+            if sizing_diff < 0.1:
+                sizing_bonus = 0.3  # Great sizing
+            elif sizing_diff < 0.2:
+                sizing_bonus = 0.1  # Good sizing
+            else:
+                sizing_bonus = -0.1 * sizing_diff  # Suboptimal sizing
+            
+            # Compound the reward
             reward = base_reward + timing_bonus + sizing_bonus
+            
+            # Extra reward for high-conviction correct calls
+            if abs_move > 0.3 and position_size > 0.2:
+                reward += 0.2  # Bonus for correct high-conviction trade
             
         else:
             # === LOSS ===
-            # Quadratic penalty scaled by position size
-            # Larger positions on wrong bets = much larger penalty
-            base_penalty = abs_move * (position_size ** 2) * 2.0
+            # Quadratic penalty: larger positions on wrong bets hurt more
+            base_penalty = abs_move * (position_size ** 1.5) * 1.5
             
-            # Extra penalty for betting large on small uncertain moves
-            if abs_move < 0.1 and position_size > 0.3:
-                overbet_penalty = position_size * 0.5
+            # Extra penalty for over-betting on uncertain small moves
+            if abs_move < 0.15 and position_size > 0.25:
+                overbet_penalty = position_size * 0.3
                 base_penalty += overbet_penalty
             
             reward = -base_penalty
         
-        return reward
+        # Apply reward scaling for better gradient signal
+        reward = reward * self.config.reward_scale
+        
+        # Clip to prevent extreme values
+        return float(np.clip(reward, -5.0, 5.0))
     
     def _setup_data(
         self, 

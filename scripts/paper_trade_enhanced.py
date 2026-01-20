@@ -291,7 +291,7 @@ class EnhancedLivePaperTrader:
     
     BINANCE_REST = "https://api.binance.com/api/v3"
     CANDLE_MINUTES = 15
-    HISTORY_LENGTH = 500  # Enhanced env uses 500
+    HISTORY_LENGTH = 100  # Must match EnhancedMultiAssetConfig.price_history_length
     
     def __init__(
         self,
@@ -830,7 +830,7 @@ class HistoricalBacktester:
     """
     
     BINANCE_REST = "https://api.binance.com/api/v3"
-    HISTORY_LENGTH = 500
+    HISTORY_LENGTH = 100  # Must match EnhancedMultiAssetConfig.price_history_length
     
     def __init__(
         self,

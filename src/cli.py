@@ -486,13 +486,22 @@ def train_enhanced(
         model = RecurrentPPO(
             "MlpLstmPolicy",
             train_env,
-            learning_rate=3e-4,
+            learning_rate=5e-5,           # Reduced from 3e-4 for LSTM stability
             n_steps=2048,
-            batch_size=256,
+            batch_size=64,                # Smaller batches for stable gradients
+            n_epochs=4,                   # Fewer epochs per update (was 10 default)
             gamma=0.99,
             gae_lambda=0.95,
-            clip_range=0.2,
-            policy_kwargs={"shared_lstm": True, "enable_critic_lstm": False},
+            clip_range=0.1,               # Tighter clipping for stable updates
+            target_kl=0.01,               # Early stop if KL divergence too high
+            ent_coef=0.01,                # Encourage exploration
+            max_grad_norm=0.5,
+            policy_kwargs={
+                "shared_lstm": False,          # Separate LSTMs for actor/critic
+                "enable_critic_lstm": True,    # Better value estimation for complex rewards
+                "lstm_hidden_size": 256,
+                "n_lstm_layers": 1,
+            },
             verbose=1,
             tensorboard_log=str(log_dir / "tensorboard"),
         )
@@ -523,6 +532,288 @@ def train_enhanced(
     if balance_callback.total_trades > 0:
         console.print(f"  Final Accuracy: {balance_callback.correct_trades / balance_callback.total_trades:.1%}")
 
+
+@app.command("train-probability")
+def train_probability(
+    data_dir: str = typer.Option("./data", help="Data directory"),
+    output_dir: str = typer.Option("./logs/probability_model", help="Output directory"),
+    epochs: int = typer.Option(100, help="Training epochs"),
+    learning_rate: float = typer.Option(1e-4, help="Learning rate"),
+    model_type: str = typer.Option("lstm", help="Model type (lstm/gru)"),
+):
+    """Train Layer 1 probability model (LSTM/GRU).
+    
+    Trains a calibrated probability model for predicting P(candle closes up).
+    Uses Brier score loss with temperature scaling calibration.
+    """
+    import pandas as pd
+    from .training.probability_trainer import train_probability_model
+    
+    data_path = Path(data_dir)
+    
+    # Load BTC data
+    btc_path = data_path / "btcusdt_100ms.parquet"
+    if not btc_path.exists():
+        btc_path = data_path / "btcusdt_1s_30days.parquet"
+    
+    if not btc_path.exists():
+        console.print("[red]No BTC data found. Run 'collect' first.[/red]")
+        raise typer.Exit(1)
+    
+    console.print(f"[blue]Loading BTC data from {btc_path}[/blue]")
+    btc_data = pd.read_parquet(btc_path)
+    if "close" in btc_data.columns and "price" not in btc_data.columns:
+        btc_data = btc_data.rename(columns={"close": "price"})
+    
+    # Load forex data if available
+    dxy_data = None
+    eurusd_data = None
+    
+    if (data_path / "dxy_1h.parquet").exists():
+        console.print("[blue]Loading DXY data[/blue]")
+        dxy_data = pd.read_parquet(data_path / "dxy_1h.parquet")
+    
+    if (data_path / "eurusd_1h.parquet").exists():
+        console.print("[blue]Loading EUR/USD data[/blue]")
+        eurusd_data = pd.read_parquet(data_path / "eurusd_1h.parquet")
+    
+    console.print()
+    console.print(f"[blue]Training probability model ({model_type.upper()})[/blue]")
+    console.print(f"  Epochs: {epochs}")
+    console.print(f"  Learning rate: {learning_rate}")
+    console.print(f"  Output: {output_dir}")
+    console.print()
+    
+    model, metrics = train_probability_model(
+        btc_data=btc_data,
+        dxy_data=dxy_data,
+        eurusd_data=eurusd_data,
+        output_dir=output_dir,
+        epochs=epochs,
+        learning_rate=learning_rate,
+        model_type=model_type,
+    )
+    
+    console.print()
+    console.print("[bold green]Model trained and calibrated![/bold green]")
+    console.print(f"  Brier Score: {metrics['brier_score']:.4f}")
+    console.print(f"  Accuracy: {metrics['accuracy']:.1%}")
+    console.print(f"  ECE: {metrics['ece']:.4f}")
+
+
+@app.command("train-execution")
+def train_execution(
+    probability_model: str = typer.Argument(..., help="Path to trained probability model"),
+    data_dir: str = typer.Option("./data", help="Data directory"),
+    output_dir: str = typer.Option("./logs/execution_model", help="Output directory"),
+    timesteps: int = typer.Option(500_000, help="Total training timesteps"),
+    n_envs: int = typer.Option(4, help="Number of environments"),
+):
+    """Train Layer 2 execution policy (SAC).
+    
+    Uses the trained probability model to generate states and trains
+    a SAC agent to make optimal execution decisions.
+    """
+    from stable_baselines3 import SAC
+    from stable_baselines3.common.vec_env import VecNormalize
+    from stable_baselines3.common.callbacks import CheckpointCallback
+    from .simulation.polymarket_execution_env import (
+        PolymarketExecutionEnv,
+        PolymarketExecutionConfig,
+        make_polymarket_vec_env,
+    )
+    
+    log_dir = Path(output_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    console.print(f"[blue]Training execution policy (SAC)[/blue]")
+    console.print(f"  Probability model: {probability_model}")
+    console.print(f"  Timesteps: {timesteps:,}")
+    console.print(f"  Environments: {n_envs}")
+    console.print()
+    
+    config = PolymarketExecutionConfig()
+    train_env = make_polymarket_vec_env(n_envs, config)
+    train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True)
+    
+    checkpoint_callback = CheckpointCallback(
+        save_freq=50_000 // n_envs,
+        save_path=str(log_dir / "checkpoints"),
+        name_prefix="sac",
+        save_vecnormalize=True,
+    )
+    
+    model = SAC(
+        "MlpPolicy",
+        train_env,
+        learning_rate=3e-4,
+        buffer_size=100_000,
+        batch_size=256,
+        gamma=0.99,
+        tau=0.005,
+        ent_coef="auto",
+        verbose=1,
+        tensorboard_log=str(log_dir / "tensorboard"),
+    )
+    
+    model.learn(
+        total_timesteps=timesteps,
+        callback=checkpoint_callback,
+        progress_bar=True,
+    )
+    
+    model_path = log_dir / "execution_model"
+    model.save(str(model_path))
+    train_env.save(str(log_dir / "vec_normalize.pkl"))
+    
+    console.print()
+    console.print("[green]Execution policy trained![/green]")
+    console.print(f"  Model: {model_path}.zip")
+
+
+@app.command("paper-trade-polymarket")
+def paper_trade_polymarket(
+    probability_model: str = typer.Argument(..., help="Path to probability model"),
+    execution_model: str = typer.Option(None, help="Path to execution model (optional)"),
+    data_dir: str = typer.Option("./data", help="Data directory"),
+    num_candles: int = typer.Option(100, help="Number of candles to simulate"),
+    initial_balance: float = typer.Option(1000.0, help="Initial balance"),
+):
+    """Paper trade with the two-layer Polymarket system.
+    
+    Uses LSTM probability model + SAC execution policy (or rule-based fallback)
+    to simulate trading on historical data.
+    """
+    import pandas as pd
+    from .inference.two_layer_inference import create_bot
+    
+    data_path = Path(data_dir)
+    
+    # Load data
+    btc_path = data_path / "btcusdt_100ms.parquet"
+    if not btc_path.exists():
+        btc_path = data_path / "btcusdt_1s_30days.parquet"
+    
+    if not btc_path.exists():
+        console.print("[red]No BTC data found.[/red]")
+        raise typer.Exit(1)
+    
+    console.print(f"[blue]Loading data...[/blue]")
+    btc_data = pd.read_parquet(btc_path)
+    if "close" in btc_data.columns and "price" not in btc_data.columns:
+        btc_data = btc_data.rename(columns={"close": "price"})
+    
+    dxy_data = None
+    if (data_path / "dxy_1h.parquet").exists():
+        dxy_data = pd.read_parquet(data_path / "dxy_1h.parquet")
+    
+    eurusd_data = None
+    if (data_path / "eurusd_1h.parquet").exists():
+        eurusd_data = pd.read_parquet(data_path / "eurusd_1h.parquet")
+    
+    # Create bot
+    console.print(f"[blue]Loading models...[/blue]")
+    bot = create_bot(probability_model, execution_model)
+    
+    # Create candles
+    candle_minutes = 15
+    candle_seconds = candle_minutes * 60
+    
+    if not pd.api.types.is_datetime64_any_dtype(btc_data["timestamp"]):
+        btc_data["timestamp"] = pd.to_datetime(btc_data["timestamp"], utc=True)
+    
+    btc_data["candle_idx"] = (btc_data["timestamp"].astype("int64") // 10**9 // candle_seconds).astype(int)
+    
+    candles = []
+    for candle_id, group in btc_data.groupby("candle_idx"):
+        if len(group) < 10:
+            continue
+        candles.append({
+            "start_idx": group.index[0],
+            "end_idx": group.index[-1],
+            "open": group["price"].iloc[0],
+            "close": group["price"].iloc[-1],
+            "return": (group["price"].iloc[-1] - group["price"].iloc[0]) / group["price"].iloc[0],
+        })
+    
+    if len(candles) < num_candles + 100:
+        console.print(f"[yellow]Not enough candles. Have {len(candles)}, need {num_candles + 100}[/yellow]")
+        num_candles = len(candles) - 100
+    
+    # Simulate trading
+    console.print()
+    console.print(f"[blue]Simulating {num_candles} candles...[/blue]")
+    
+    balance = initial_balance
+    trades = []
+    holds = []
+    
+    from rich.progress import Progress
+    
+    with Progress() as progress:
+        task = progress.add_task("Trading", total=num_candles)
+        
+        for i in range(100, 100 + num_candles):
+            candle = candles[i]
+            
+            # Get data up to candle midpoint
+            mid_idx = (candle["start_idx"] + candle["end_idx"]) // 2
+            feature_data = btc_data.iloc[:mid_idx]
+            
+            # Simulate market price (with some noise from model)
+            market_yes = 0.5 + candle["return"] * 10 + 0.02 * (2 * (i % 2) - 1)
+            market_yes = max(0.1, min(0.9, market_yes))
+            
+            candle_end = btc_data["timestamp"].iloc[candle["end_idx"]]
+            
+            # Get decision
+            decision = bot.step(
+                btc_data=feature_data.tail(2000),
+                market_yes_price=market_yes,
+                dxy_data=dxy_data,
+                eurusd_data=eurusd_data,
+                candle_end_timestamp=candle_end,
+            )
+            
+            # Calculate outcome
+            outcome = candle["close"] > candle["open"]
+            
+            if decision["action"] == "hold":
+                holds.append(decision)
+            else:
+                # Execute trade
+                size = decision["size"] * balance
+                
+                if decision["action"] == "buy_yes":
+                    pnl = size * (1.0 if outcome else -1.0)
+                else:  # buy_no
+                    pnl = size * (1.0 if not outcome else -1.0)
+                
+                # Apply fees
+                pnl -= size * 0.001  # 0.1% fee
+                
+                balance += pnl
+                
+                bot.record_trade_outcome(decision, outcome, pnl)
+                trades.append({**decision, "pnl": pnl, "outcome": outcome})
+            
+            progress.update(task, advance=1)
+    
+    # Report results
+    console.print()
+    console.print("[bold]Results:[/bold]")
+    console.print(f"  Initial Balance: ${initial_balance:,.2f}")
+    console.print(f"  Final Balance: ${balance:,.2f}")
+    console.print(f"  PnL: ${balance - initial_balance:,.2f} ({(balance/initial_balance - 1)*100:.1f}%)")
+    console.print()
+    console.print(f"  Trades: {len(trades)}")
+    console.print(f"  Holds: {len(holds)}")
+    console.print(f"  Hold Rate: {len(holds) / num_candles:.1%}")
+    
+    if trades:
+        wins = sum(1 for t in trades if t["pnl"] > 0)
+        console.print(f"  Win Rate: {wins / len(trades):.1%}")
+        console.print(f"  Avg Edge: {sum(t['edge'] for t in trades) / len(trades):.3f}")
 
 @app.command()
 def evaluate(
