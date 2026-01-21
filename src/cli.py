@@ -1262,5 +1262,29 @@ def list_runs(
     console.print(table)
 
 
+@app.command("paper-trade-live")
+def paper_trade_live_cmd(
+    deep_lob_model: str = typer.Option("./logs/deep_lob_balanced", help="Path to DeepLOB model"),
+    balance: float = typer.Option(1000.0, help="Initial balance in USD"),
+    aggressive: bool = typer.Option(True, help="Use aggressive trading mode"),
+):
+    """Live paper trading with real-time Binance data.
+    
+    Simulates Polymarket 15-minute crypto markets using live BTC data.
+    Each 15-minute candle is a separate market where we bet on Up/Down.
+    
+    Press Ctrl+C to stop.
+    """
+    import asyncio
+    from .paper_trade_live import run_live_paper_trading
+    
+    asyncio.run(run_live_paper_trading(
+        deep_lob_model=deep_lob_model,
+        initial_balance=balance,
+        aggressive=aggressive,
+    ))
+
+
 if __name__ == "__main__":
     app()
+
