@@ -1,0 +1,11 @@
+{
+  "n_intervals": 1250,
+  "n_up": 500,
+  "n_down": 500,
+  "n_hold": 250,
+  "up_threshold": 0.0001,
+  "down_threshold": -0.0001,
+  "interval_seconds": 200,
+  "days_back": 30,
+  "generated_at": "2026-01-21T09:03:34.707730"
+}

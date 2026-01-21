@@ -35,7 +35,7 @@ from src.models.calibration import (
     plot_calibration_curve,
 )
 from src.data.multi_resolution_features import (
-    MultiResolutionFeatureBuilder,
+    EnhancedFeatureBuilder,
     create_training_dataset,
 )
 
@@ -48,14 +48,14 @@ class TrainingConfig:
     """Configuration for probability model training."""
     
     # Training parameters
-    epochs: int = 100
-    batch_size: int = 64
-    learning_rate: float = 1e-4
-    weight_decay: float = 1e-4
+    epochs: int = 200              # More epochs for complex features
+    batch_size: int = 32           # Smaller batches for better generalization
+    learning_rate: float = 5e-5    # Lower LR for stability
+    weight_decay: float = 1e-3     # Stronger regularization
     
     # Early stopping
-    patience: int = 15
-    min_delta: float = 1e-5
+    patience: int = 30             # More patience for complex model
+    min_delta: float = 1e-6
     
     # Data splits (strict time-based)
     train_ratio: float = 0.7
@@ -64,15 +64,18 @@ class TrainingConfig:
     
     # Model
     model_type: str = "lstm"  # 'lstm' or 'gru'
-    hidden_dim: int = 64
+    hidden_dim: int = 128          # Larger for 46 features
     num_layers: int = 2
-    dropout: float = 0.3
+    dropout: float = 0.4           # More dropout
     
     # Calibration
     calibrate_temperature: bool = True
     
+    # Data normalization
+    normalize_features: bool = True  # NEW: Normalize features
+    
     # Saving
-    save_every: int = 10
+    save_every: int = 20
 
 
 class TimeSeriesDataset(Dataset):
@@ -150,6 +153,29 @@ class ProbabilityModelTrainer:
         X_train, y_train = X[:train_end], y[:train_end]
         X_val, y_val = X[train_end:val_end], y[train_end:val_end]
         X_test, y_test = X[val_end:], y[val_end:]
+        
+        # Feature normalization (fit on train, apply to all)
+        if self.config.normalize_features:
+            console.print("[dim]Normalizing features...[/dim]")
+            # Reshape to 2D for normalization
+            n_train, seq_len, n_features = X_train.shape
+            X_train_2d = X_train.reshape(-1, n_features)
+            
+            # Compute mean and std from training data only
+            self.feature_mean = np.mean(X_train_2d, axis=0)
+            self.feature_std = np.std(X_train_2d, axis=0) + 1e-8  # Avoid division by zero
+            
+            # Normalize all sets
+            X_train = ((X_train.reshape(-1, n_features) - self.feature_mean) / self.feature_std).reshape(n_train, seq_len, n_features)
+            X_val = ((X_val.reshape(-1, n_features) - self.feature_mean) / self.feature_std).reshape(len(X_val), seq_len, n_features)
+            X_test = ((X_test.reshape(-1, n_features) - self.feature_mean) / self.feature_std).reshape(len(X_test), seq_len, n_features)
+            
+            # Clip extreme values
+            X_train = np.clip(X_train, -10, 10)
+            X_val = np.clip(X_val, -10, 10)
+            X_test = np.clip(X_test, -10, 10)
+            
+            console.print(f"[dim]After normalization - Mean: {X_train.mean():.3f}, Std: {X_train.std():.3f}[/dim]")
         
         console.print(f"Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
         
@@ -282,7 +308,7 @@ class ProbabilityModelTrainer:
                 history["train_loss"].append(avg_train_loss)
                 history["val_loss"].append(val_metrics["loss"])
                 history["val_accuracy"].append(val_metrics["accuracy"])
-                history["val_brier"].append(val_metrics["brier"])
+                history["val_brier"].append(val_metrics["brier_score"])
                 
                 # Update scheduler
                 scheduler.step(val_metrics["loss"])
@@ -302,7 +328,7 @@ class ProbabilityModelTrainer:
                     task,
                     advance=1,
                     description=f"Epoch {epoch+1}: train_loss={avg_train_loss:.4f}, "
-                               f"val_brier={val_metrics['brier']:.4f}, "
+                               f"val_brier={val_metrics['brier_score']:.4f}, "
                                f"val_acc={val_metrics['accuracy']:.3f}"
                 )
                 

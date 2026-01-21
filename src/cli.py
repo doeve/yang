@@ -601,6 +601,150 @@ def train_probability(
     console.print(f"  ECE: {metrics['ece']:.4f}")
 
 
+@app.command("train-deep-lob")
+def train_deep_lob(
+    data_dir: str = typer.Option("./data", help="Data directory"),
+    output_dir: str = typer.Option("./logs/deep_lob_model", help="Output directory"),
+    epochs: int = typer.Option(200, help="Training epochs"),
+    alpha: float = typer.Option(0.001, help="Threshold for Up/Down classification (0.001 = 0.1%)"),
+):
+    """Train DeepLOB 3-class model (research-based architecture).
+    
+    Uses Order Flow Imbalance, CNN-LSTM with attention, and focal loss.
+    Predicts: Down (0), Hold (1), Up (2) with threshold filtering.
+    Evaluates on F1 score instead of accuracy.
+    """
+    import pandas as pd
+    from .training.deep_lob_trainer import train_deep_lob_model
+    
+    data_path = Path(data_dir)
+    
+    # Load BTC data (prefer 100ms with buy_pressure)
+    btc_path = data_path / "btcusdt_100ms.parquet"
+    if not btc_path.exists():
+        console.print("[red]No btcusdt_100ms.parquet found. This model requires buy_pressure.[/red]")
+        raise typer.Exit(1)
+    
+    console.print(f"[blue]Loading BTC data from {btc_path}[/blue]")
+    btc_data = pd.read_parquet(btc_path)
+    
+    # Load trades data if available
+    trades_data = None
+    trades_path = data_path / "btcusdt_aggtrades.parquet"
+    if trades_path.exists():
+        console.print("[blue]Loading aggregated trades for TFI[/blue]")
+        trades_data = pd.read_parquet(trades_path)
+    
+    console.print()
+    console.print(f"[blue]Training DeepLOB 3-class model[/blue]")
+    console.print(f"  Epochs: {epochs}")
+    console.print(f"  Alpha threshold: {alpha} ({alpha*100:.1f}%)")
+    console.print(f"  Output: {output_dir}")
+    console.print()
+    
+    model, results = train_deep_lob_model(
+        btc_data=btc_data,
+        trades_data=trades_data,
+        output_dir=output_dir,
+        epochs=epochs,
+        alpha_threshold=alpha,
+    )
+    
+    console.print()
+    console.print("[bold green]DeepLOB model trained![/bold green]")
+    console.print(f"  F1 Macro: {results['f1_macro']:.3f}")
+    console.print(f"  Accuracy: {results['accuracy']:.1%}")
+
+
+@app.command("fetch-balanced-data")
+def fetch_balanced_data_cmd(
+    n_up: int = typer.Option(500, help="Number of Up intervals"),
+    n_down: int = typer.Option(500, help="Number of Down intervals"),
+    n_hold: int = typer.Option(250, help="Number of Hold intervals"),
+    days_back: int = typer.Option(30, help="Days of history to sample from"),
+    output_dir: str = typer.Option("./data/balanced", help="Output directory"),
+):
+    """Fetch balanced training data from Binance.
+    
+    Randomly samples historical intervals ensuring equal representation
+    of Up, Down, and Hold outcomes. This prevents training bias from
+    trending markets.
+    """
+    import asyncio
+    from .data.balanced_data_generator import fetch_balanced_data
+    
+    console.print("[bold blue]Fetching Balanced Training Data[/bold blue]")
+    console.print(f"  Target: {n_up} Up, {n_down} Down, {n_hold} Hold")
+    console.print(f"  Days back: {days_back}")
+    console.print(f"  Output: {output_dir}")
+    console.print()
+    
+    output_file = asyncio.run(fetch_balanced_data(
+        n_up=n_up,
+        n_down=n_down,
+        n_hold=n_hold,
+        days_back=days_back,
+        output_dir=output_dir,
+    ))
+    
+    console.print()
+    console.print(f"[bold green]✓ Balanced data saved to {output_file}[/bold green]")
+
+
+@app.command("train-deep-lob-balanced")
+def train_deep_lob_balanced(
+    data_dir: str = typer.Option("./data/balanced", help="Directory with balanced data"),
+    output_dir: str = typer.Option("./logs/deep_lob_balanced", help="Output directory"),
+    epochs: int = typer.Option(150, help="Training epochs"),
+    alpha: float = typer.Option(0.0001, help="Alpha threshold for Up/Down"),
+):
+    """Train DeepLOB on balanced data (unbiased Up/Down).
+    
+    Uses data from fetch-balanced-data command which has equal
+    representation of Up, Down, and Hold outcomes.
+    """
+    import pandas as pd
+    from .training.deep_lob_trainer import train_deep_lob_balanced
+    
+    data_path = Path(data_dir)
+    balanced_file = data_path / "balanced_intervals.parquet"
+    
+    if not balanced_file.exists():
+        console.print("[red]No balanced_intervals.parquet found.[/red]")
+        console.print("Run 'fetch-balanced-data' first to generate balanced training data.")
+        raise typer.Exit(1)
+    
+    console.print(f"[blue]Loading balanced data from {balanced_file}[/blue]")
+    balanced_data = pd.read_parquet(balanced_file)
+    
+    # Load metadata
+    import json
+    metadata_file = data_path / "balanced_metadata.json"
+    if metadata_file.exists():
+        with open(metadata_file) as f:
+            metadata = json.load(f)
+        console.print(f"  Intervals: {metadata['n_intervals']}")
+        console.print(f"  Up: {metadata['n_up']}, Down: {metadata['n_down']}, Hold: {metadata['n_hold']}")
+    
+    console.print()
+    console.print(f"[blue]Training DeepLOB on balanced data[/blue]")
+    console.print(f"  Epochs: {epochs}")
+    console.print(f"  Output: {output_dir}")
+    console.print()
+    
+    model, results = train_deep_lob_balanced(
+        balanced_data=balanced_data,
+        output_dir=output_dir,
+        epochs=epochs,
+        alpha_threshold=alpha,
+    )
+    
+    console.print()
+    console.print("[bold green]DeepLOB balanced model trained![/bold green]")
+    console.print(f"  F1 Macro: {results['f1_macro']:.3f}")
+    console.print(f"  Accuracy: {results['accuracy']:.1%}")
+
+
 @app.command("train-execution")
 def train_execution(
     probability_model: str = typer.Argument(..., help="Path to trained probability model"),
@@ -669,6 +813,114 @@ def train_execution(
     console.print()
     console.print("[green]Execution policy trained![/green]")
     console.print(f"  Model: {model_path}.zip")
+
+
+@app.command("train-execution-deeplob")
+def train_execution_deeplob(
+    output_dir: str = typer.Option("./logs/sac_deeplob", help="Output directory"),
+    timesteps: int = typer.Option(300_000, help="Total training timesteps"),
+    n_envs: int = typer.Option(8, help="Number of environments"),
+):
+    """Train SAC execution policy for DeepLOB 3-class predictions.
+    
+    Uses DeepLOBExecutionEnv which receives 3-class probabilities (Down/Hold/Up)
+    and learns optimal trade execution decisions.
+    """
+    from stable_baselines3 import SAC
+    from stable_baselines3.common.vec_env import VecNormalize
+    from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
+    from .simulation.deep_lob_execution_env import (
+        DeepLOBExecutionEnv,
+        DeepLOBExecutionConfig,
+        make_deep_lob_vec_env,
+    )
+    
+    log_dir = Path(output_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    console.print(f"[blue]Training DeepLOB execution policy (SAC)[/blue]")
+    console.print(f"  Timesteps: {timesteps:,}")
+    console.print(f"  Environments: {n_envs}")
+    console.print()
+    
+    config = DeepLOBExecutionConfig()
+    train_env = make_deep_lob_vec_env(n_envs, config)
+    train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True)
+    
+    # Eval env
+    eval_env = make_deep_lob_vec_env(1, config)
+    eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False)
+    
+    checkpoint_callback = CheckpointCallback(
+        save_freq=25_000 // n_envs,
+        save_path=str(log_dir / "checkpoints"),
+        name_prefix="sac",
+        save_vecnormalize=True,
+    )
+    
+    eval_callback = EvalCallback(
+        eval_env,
+        best_model_save_path=str(log_dir),
+        log_path=str(log_dir),
+        eval_freq=10_000 // n_envs,
+        deterministic=True,
+    )
+    
+    model = SAC(
+        "MlpPolicy",
+        train_env,
+        learning_rate=3e-4,
+        buffer_size=100_000,
+        batch_size=256,
+        gamma=0.99,
+        tau=0.005,
+        ent_coef="auto",
+        verbose=1,
+        tensorboard_log=str(log_dir / "tensorboard"),
+    )
+    
+    model.learn(
+        total_timesteps=timesteps,
+        callback=[checkpoint_callback, eval_callback],
+        progress_bar=True,
+    )
+    
+    model_path = log_dir / "execution_model"
+    model.save(str(model_path))
+    train_env.save(str(log_dir / "vec_normalize.pkl"))
+    
+    console.print()
+    console.print("[green]DeepLOB execution policy trained![/green]")
+    console.print(f"  Model: {model_path}.zip")
+    console.print(f"  Best model: {log_dir / 'best_model.zip'}")
+
+
+@app.command("paper-trade-deeplob")
+def paper_trade_deeplob(
+    deep_lob_model: str = typer.Option("./logs/deep_lob_v2", help="DeepLOB model path"),
+    sac_model: str = typer.Option("./logs/sac_deeplob", help="SAC model path"),
+    num_candles: int = typer.Option(30, help="Number of candles to simulate"),
+    initial_balance: float = typer.Option(1000.0, help="Initial balance"),
+    aggressive: bool = typer.Option(True, help="Use aggressive mode (trade on Up/Down diff)"),
+):
+    """Paper trade DeepLOB + SAC with random Binance data.
+    
+    Fetches random intervals of historical data from Binance and simulates
+    trading decisions using the trained DeepLOB + SAC two-layer system.
+    
+    Use --aggressive to force more trades based on Up vs Down probability
+    difference instead of waiting for predicted class.
+    """
+    import asyncio
+    from .paper_trade_deeplob import run_paper_trade
+    
+    asyncio.run(run_paper_trade(
+        num_candles=num_candles,
+        deep_lob_path=deep_lob_model,
+        sac_path=sac_model,
+        initial_balance=initial_balance,
+        aggressive=aggressive,
+    ))
 
 
 @app.command("paper-trade-polymarket")

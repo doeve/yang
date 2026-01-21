@@ -1,13 +1,12 @@
 """
-Multi-resolution feature engineering for probability model.
+Enhanced multi-resolution feature engineering for probability model.
 
-Builds feature tensors at multiple time resolutions (15s, 1m, 5m, 15m)
-for LSTM probability prediction. Designed for 15-minute crypto Polymarket
-prediction markets.
+V2: Optimized with proper financial features for crypto prediction.
+Includes order flow, multi-timeframe momentum, volatility regimes, and FX correlation.
 """
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -17,340 +16,418 @@ logger = structlog.get_logger(__name__)
 
 
 @dataclass
-class MultiResolutionConfig:
-    """Configuration for multi-resolution feature builder."""
+class EnhancedFeatureConfig:
+    """Configuration for enhanced feature builder."""
     
-    # Base data resolution (seconds)
-    base_resolution_seconds: int = 1
-    
-    # Target resolutions to compute features for
-    target_resolutions_seconds: list[int] = field(
-        default_factory=lambda: [15, 60, 300, 900]  # 15s, 1m, 5m, 15m
+    # Resolutions (in seconds)
+    resolutions: list[int] = field(
+        default_factory=lambda: [60, 300, 900, 3600]  # 1m, 5m, 15m, 1h
     )
     
-    # Lookback windows for each resolution (in that resolution's units)
-    lookback_windows: list[int] = field(
-        default_factory=lambda: [60, 60, 36, 12]  # 15min, 1h, 3h, 3h
+    # Lookback windows (in each resolution's units)
+    momentum_windows: list[int] = field(
+        default_factory=lambda: [5, 10, 20, 60]  # Short, medium, long, trend
     )
     
-    # Feature computation parameters
-    volatility_window: int = 20
-    ema_fast_period: int = 5
-    ema_slow_period: int = 20
+    # Volatility windows
+    volatility_windows: list[int] = field(default_factory=lambda: [10, 20, 60])
     
-    # Forex feature weights (lower than BTC)
-    forex_weight: float = 0.3
+    # Order flow settings
+    large_trade_threshold: float = 0.01  # Top 1% of trades
+    volume_spike_threshold: float = 2.0  # 2x average volume
+    
+    # Forex weight (they're secondary signals)
+    forex_weight: float = 0.5
 
 
-class MultiResolutionFeatureBuilder:
+class EnhancedFeatureBuilder:
     """
-    Builds feature tensors at multiple time resolutions.
+    Enhanced feature engineering with predictive financial features.
     
-    For each resolution, computes:
-    - Log returns
-    - Rolling volatility (std of returns)
-    - Momentum (EMA fast - EMA slow slope)
-    
-    Plus cross-asset features:
-    - BTC-DXY divergence
-    - BTC-DXY correlation flag
-    - Sign disagreement flags
-    
-    Output shape: (sequence_length, feature_dim)
-    where feature_dim = 24 by default.
+    Feature groups:
+    1. PRICE ACTION (12 features)
+       - Multi-timeframe returns (1m, 5m, 15m, 1h)
+       - Multi-timeframe momentum (EMA slopes)
+       - Price vs VWAP
+       
+    2. VOLATILITY (8 features)
+       - Rolling volatility at multiple windows
+       - ATR ratios
+       - Volatility acceleration
+       - High-low range
+       
+    3. ORDER FLOW (10 features)
+       - Buy pressure (buyer-initiated volume %)
+       - Volume delta (buy - sell)
+       - Trade imbalance
+       - Large trade detection
+       - Volume momentum
+       
+    4. MICROSTRUCTURE (6 features)
+       - Price acceleration
+       - Volume profile skew
+       - VWAP distance
+       - Price efficiency
+       
+    5. FX CORRELATION (6 features)
+       - DXY momentum
+       - EUR/USD momentum
+       - BTC-DXY divergence
+       - Correlation regime
+       
+    6. TIME CONTEXT (4 features)
+       - Time remaining in candle
+       - Hour of day (cyclic)
+       - Day of week effect
+       
+    Total: 46 features
     """
     
-    def __init__(self, config: Optional[MultiResolutionConfig] = None):
-        self.config = config or MultiResolutionConfig()
+    def __init__(self, config: Optional[EnhancedFeatureConfig] = None):
+        self.config = config or EnhancedFeatureConfig()
         
-        # Calculate feature dimension
-        # Per resolution: 3 features (return, vol, momentum)
-        # Resolutions: 4
-        # Time features: 3 (time_remaining, hour_sin, hour_cos)
-        # DXY: 3 (return, momentum, vol)
-        # EURUSD: 3 (return, momentum, vol)
-        # Relative: 3 (divergence, correlation, sign_disagree)
-        self.btc_features_per_res = 3
-        self.num_resolutions = len(self.config.target_resolutions_seconds)
-        self.time_features = 3
-        self.dxy_features = 3
-        self.eurusd_features = 3
-        self.relative_features = 3
+        # Feature dimensions
+        self.price_features = 12
+        self.volatility_features = 8
+        self.orderflow_features = 10
+        self.microstructure_features = 6
+        self.fx_features = 6
+        self.time_features = 4
         
         self.feature_dim = (
-            self.btc_features_per_res * self.num_resolutions +  # BTC
-            self.time_features +
-            self.dxy_features +
-            self.eurusd_features +
-            self.relative_features
+            self.price_features +
+            self.volatility_features +
+            self.orderflow_features +
+            self.microstructure_features +
+            self.fx_features +
+            self.time_features
         )
         
         logger.info(
-            "MultiResolutionFeatureBuilder initialized",
+            "EnhancedFeatureBuilder initialized",
             feature_dim=self.feature_dim,
-            resolutions=self.config.target_resolutions_seconds,
         )
     
-    def _resample_to_resolution(
-        self,
-        data: pd.DataFrame,
-        resolution_seconds: int,
-        price_col: str = "price",
-        volume_col: str = "volume",
-    ) -> pd.DataFrame:
-        """Resample data to target resolution."""
-        if "timestamp" not in data.columns:
-            raise ValueError("Data must have 'timestamp' column")
-        
-        df = data.copy()
-        if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
-            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-        
-        df = df.set_index("timestamp")
-        
-        # Resample
-        rule = f"{resolution_seconds}s"
-        resampled = df.resample(rule).agg({
-            price_col: ["first", "last", "max", "min"],
-            volume_col: "sum" if volume_col in df.columns else "first",
-        })
-        
-        # Flatten multi-level columns
-        resampled.columns = ["open", "close", "high", "low", "volume"]
-        resampled = resampled.dropna().reset_index()
-        
-        return resampled
-    
-    def _compute_features_for_resolution(
-        self,
-        prices: np.ndarray,
-        volumes: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Compute log returns, volatility, and momentum for a price series.
-        
-        Returns:
-            Tuple of (log_returns, volatility, momentum)
-        """
+    def _compute_returns(self, prices: np.ndarray, windows: list[int]) -> np.ndarray:
+        """Compute returns at multiple windows."""
         n = len(prices)
+        returns = np.zeros((n, len(windows)), dtype=np.float32)
         
-        # Log returns
-        log_returns = np.zeros(n, dtype=np.float32)
-        log_returns[1:] = np.log(prices[1:] / (prices[:-1] + 1e-10))
+        for i, w in enumerate(windows):
+            if w < n:
+                returns[w:, i] = (prices[w:] - prices[:-w]) / (prices[:-w] + 1e-10)
         
-        # Clip extreme returns
-        log_returns = np.clip(log_returns, -0.1, 0.1)
-        
-        # Rolling volatility
-        volatility = np.zeros(n, dtype=np.float32)
-        window = self.config.volatility_window
-        for i in range(window, n):
-            volatility[i] = np.std(log_returns[i-window:i]) * 100  # Scale up
-        volatility[:window] = volatility[window] if window < n else 0
-        
-        # Momentum: EMA fast - EMA slow
-        ema_fast = self._compute_ema(prices, self.config.ema_fast_period)
-        ema_slow = self._compute_ema(prices, self.config.ema_slow_period)
-        
-        # Normalize momentum to percentage
-        momentum = (ema_fast - ema_slow) / (ema_slow + 1e-10) * 100
-        momentum = np.clip(momentum, -5, 5).astype(np.float32)
-        
-        return log_returns, volatility, momentum
+        return np.clip(returns, -0.1, 0.1) * 100  # Percentage
     
-    def _compute_ema(self, data: np.ndarray, period: int) -> np.ndarray:
-        """Compute exponential moving average."""
-        ema = np.zeros_like(data, dtype=np.float64)
-        alpha = 2.0 / (period + 1)
-        
-        ema[0] = data[0]
-        for i in range(1, len(data)):
-            ema[i] = alpha * data[i] + (1 - alpha) * ema[i-1]
-        
-        return ema
+    def _compute_ema(self, data: np.ndarray, span: int) -> np.ndarray:
+        """Fast EMA computation."""
+        return pd.Series(data).ewm(span=span, adjust=False).mean().values
     
-    def build_features(
+    def _compute_volatility(self, returns: np.ndarray, windows: list[int]) -> np.ndarray:
+        """Compute rolling volatility at multiple windows."""
+        n = len(returns)
+        vol = np.zeros((n, len(windows)), dtype=np.float32)
+        
+        for i, w in enumerate(windows):
+            vol[:, i] = pd.Series(returns).rolling(w, min_periods=1).std().fillna(0).values
+        
+        return vol * 100  # Scale up
+    
+    def _compute_atr(self, high: np.ndarray, low: np.ndarray, close: np.ndarray, window: int = 14) -> np.ndarray:
+        """Compute Average True Range."""
+        n = len(close)
+        tr = np.zeros(n, dtype=np.float32)
+        
+        # True Range
+        tr[1:] = np.maximum(
+            high[1:] - low[1:],
+            np.maximum(
+                np.abs(high[1:] - close[:-1]),
+                np.abs(low[1:] - close[:-1])
+            )
+        )
+        
+        return pd.Series(tr).rolling(window, min_periods=1).mean().values
+    
+    def _compute_vwap(self, prices: np.ndarray, volumes: np.ndarray, window: int = 60) -> np.ndarray:
+        """Compute VWAP."""
+        pv = prices * volumes
+        cum_pv = pd.Series(pv).rolling(window, min_periods=1).sum().values
+        cum_v = pd.Series(volumes).rolling(window, min_periods=1).sum().values
+        return cum_pv / (cum_v + 1e-10)
+    
+    def precompute_all_features(
         self,
         btc_data: pd.DataFrame,
         dxy_data: Optional[pd.DataFrame] = None,
         eurusd_data: Optional[pd.DataFrame] = None,
-        candle_end_timestamp: Optional[pd.Timestamp] = None,
-        candle_minutes: int = 15,
     ) -> np.ndarray:
         """
-        Build multi-resolution feature tensor.
+        Precompute all features for the entire dataset.
         
         Args:
-            btc_data: BTC price/volume data with 'timestamp', 'price', 'volume'
-            dxy_data: Optional DXY data with 'timestamp', 'price'
-            eurusd_data: Optional EUR/USD data with 'timestamp', 'price'
-            candle_end_timestamp: End time of current candle (for time features)
-            candle_minutes: Duration of candle in minutes
+            btc_data: Must have columns: timestamp, price, volume, and optionally 
+                      buy_pressure, high, low, open, close
+            dxy_data: Optional DXY hourly data
+            eurusd_data: Optional EUR/USD hourly data
             
         Returns:
-            Feature array of shape (sequence_length, feature_dim)
+            Feature array of shape (n_samples, feature_dim)
         """
-        features_list = []
-        
-        # Process each resolution
-        btc_features_all = []
-        for res_seconds in self.config.target_resolutions_seconds:
-            resampled = self._resample_to_resolution(
-                btc_data, res_seconds, "price", "volume"
-            )
-            
-            prices = resampled["close"].values
-            volumes = resampled["volume"].values
-            
-            log_ret, vol, mom = self._compute_features_for_resolution(prices, volumes)
-            
-            # Take most recent value for each feature
-            btc_features_all.extend([
-                log_ret[-1] * 100,  # Scale log returns
-                vol[-1],
-                mom[-1],
-            ])
-        
-        features_list.extend(btc_features_all)
-        
-        # Time features
-        if candle_end_timestamp is not None:
-            current_time = btc_data["timestamp"].iloc[-1]
-            if not isinstance(current_time, pd.Timestamp):
-                current_time = pd.Timestamp(current_time)
-            if not isinstance(candle_end_timestamp, pd.Timestamp):
-                candle_end_timestamp = pd.Timestamp(candle_end_timestamp)
-            
-            time_remaining = (candle_end_timestamp - current_time).total_seconds()
-            time_remaining = max(0, time_remaining) / (candle_minutes * 60)
-            
-            hour = current_time.hour
-            hour_sin = np.sin(2 * np.pi * hour / 24)
-            hour_cos = np.cos(2 * np.pi * hour / 24)
-        else:
-            time_remaining = 0.5
-            hour_sin = 0.0
-            hour_cos = 1.0
-        
-        features_list.extend([time_remaining, hour_sin, hour_cos])
-        
-        # DXY features
-        if dxy_data is not None and len(dxy_data) > 0:
-            dxy_prices = dxy_data["price"].values
-            dxy_ret, dxy_vol, dxy_mom = self._compute_features_for_resolution(
-                dxy_prices, np.ones(len(dxy_prices))
-            )
-            features_list.extend([
-                dxy_ret[-1] * 100 * self.config.forex_weight,
-                dxy_mom[-1] * self.config.forex_weight,
-                dxy_vol[-1] * self.config.forex_weight,
-            ])
-        else:
-            features_list.extend([0.0, 0.0, 0.0])
-        
-        # EUR/USD features
-        if eurusd_data is not None and len(eurusd_data) > 0:
-            eurusd_prices = eurusd_data["price"].values
-            eur_ret, eur_vol, eur_mom = self._compute_features_for_resolution(
-                eurusd_prices, np.ones(len(eurusd_prices))
-            )
-            features_list.extend([
-                eur_ret[-1] * 100 * self.config.forex_weight,
-                eur_mom[-1] * self.config.forex_weight,
-                eur_vol[-1] * self.config.forex_weight,
-            ])
-        else:
-            features_list.extend([0.0, 0.0, 0.0])
-        
-        # Relative pressure features (BTC vs DXY)
-        btc_return = btc_features_all[0] if len(btc_features_all) > 0 else 0
-        dxy_return = features_list[15] if len(features_list) > 15 else 0  # After time features
-        
-        # Divergence: BTC up + DXY down = bullish confirmation
-        divergence = btc_return - dxy_return
-        
-        # Sign disagreement: warning signal
-        btc_sign = np.sign(btc_return)
-        dxy_sign = np.sign(dxy_return) if dxy_data is not None else 0
-        sign_disagree = float(btc_sign != -dxy_sign)  # They should be inverse
-        
-        # Correlation flag (simplified)
-        correlation_flag = 1.0 if btc_sign == -dxy_sign else -1.0
-        
-        features_list.extend([
-            np.clip(divergence, -5, 5),
-            correlation_flag,
-            sign_disagree,
-        ])
-        
-        return np.array(features_list, dtype=np.float32)
-    
-    def build_sequence(
-        self,
-        btc_data: pd.DataFrame,
-        dxy_data: Optional[pd.DataFrame] = None,
-        eurusd_data: Optional[pd.DataFrame] = None,
-        sequence_length: int = 180,
-        candle_end_timestamp: Optional[pd.Timestamp] = None,
-        candle_minutes: int = 15,
-    ) -> np.ndarray:
-        """
-        Build a sequence of features for LSTM input.
-        
-        Returns shape (sequence_length, feature_dim).
-        """
-        # For each timestep in the sequence, compute features
-        # using data up to that point
-        
         n = len(btc_data)
-        if n < sequence_length:
-            # Pad with zeros
-            pad_length = sequence_length - n
-            features_seq = np.zeros((sequence_length, self.feature_dim), dtype=np.float32)
-            
-            for i in range(n):
-                end_idx = i + 1
-                btc_slice = btc_data.iloc[:end_idx]
-                
-                dxy_slice = None
-                if dxy_data is not None and len(dxy_data) > 0:
-                    dxy_slice = dxy_data.iloc[:min(end_idx, len(dxy_data))]
-                
-                eurusd_slice = None
-                if eurusd_data is not None and len(eurusd_data) > 0:
-                    eurusd_slice = eurusd_data.iloc[:min(end_idx, len(eurusd_data))]
-                
-                features_seq[pad_length + i] = self.build_features(
-                    btc_slice, dxy_slice, eurusd_slice,
-                    candle_end_timestamp, candle_minutes
-                )
-            
-            return features_seq
+        features = np.zeros((n, self.feature_dim), dtype=np.float32)
         
-        # Full sequence
-        features_seq = np.zeros((sequence_length, self.feature_dim), dtype=np.float32)
-        start_idx = n - sequence_length
+        # Extract price data
+        if 'close' in btc_data.columns:
+            prices = btc_data['close'].values.astype(np.float64)
+            high = btc_data.get('high', btc_data['close']).values.astype(np.float64)
+            low = btc_data.get('low', btc_data['close']).values.astype(np.float64)
+        else:
+            prices = btc_data['price'].values.astype(np.float64)
+            high = prices
+            low = prices
         
-        for i in range(sequence_length):
-            end_idx = start_idx + i + 1
-            btc_slice = btc_data.iloc[:end_idx]
-            
-            dxy_slice = None
-            if dxy_data is not None and len(dxy_data) > 0:
-                dxy_end = min(end_idx, len(dxy_data))
-                dxy_slice = dxy_data.iloc[:dxy_end]
-            
-            eurusd_slice = None
-            if eurusd_data is not None and len(eurusd_data) > 0:
-                eur_end = min(end_idx, len(eurusd_data))
-                eurusd_slice = eurusd_data.iloc[:eur_end]
-            
-            features_seq[i] = self.build_features(
-                btc_slice, dxy_slice, eurusd_slice,
-                candle_end_timestamp, candle_minutes
-            )
+        volumes = btc_data.get('volume', pd.Series(np.ones(n))).values.astype(np.float64)
+        buy_pressure = btc_data.get('buy_pressure', pd.Series(np.ones(n) * 0.5)).values.astype(np.float64)
         
-        return features_seq
+        col = 0
+        
+        # ===== 1. PRICE ACTION (12 features) =====
+        # Multi-timeframe returns
+        returns_1m = self._compute_returns(prices, [60])[:, 0]
+        returns_5m = self._compute_returns(prices, [300])[:, 0]
+        returns_15m = self._compute_returns(prices, [900])[:, 0]
+        returns_1h = self._compute_returns(prices, [3600])[:, 0]
+        
+        features[:, col:col+4] = np.column_stack([returns_1m, returns_5m, returns_15m, returns_1h])
+        col += 4
+        
+        # Momentum (EMA slope)
+        ema_fast = self._compute_ema(prices, 10)
+        ema_slow = self._compute_ema(prices, 50)
+        ema_trend = self._compute_ema(prices, 200)
+        
+        momentum_short = (ema_fast - ema_slow) / (ema_slow + 1e-10) * 100
+        momentum_long = (ema_slow - ema_trend) / (ema_trend + 1e-10) * 100
+        momentum_acceleration = np.gradient(momentum_short)
+        
+        features[:, col:col+3] = np.column_stack([
+            np.clip(momentum_short, -5, 5),
+            np.clip(momentum_long, -5, 5),
+            np.clip(momentum_acceleration, -1, 1),
+        ])
+        col += 3
+        
+        # Price vs VWAP
+        vwap = self._compute_vwap(prices, volumes, 60)
+        vwap_distance = (prices - vwap) / (vwap + 1e-10) * 100
+        
+        vwap_1h = self._compute_vwap(prices, volumes, 3600)
+        vwap_distance_1h = (prices - vwap_1h) / (vwap_1h + 1e-10) * 100
+        
+        features[:, col:col+2] = np.column_stack([
+            np.clip(vwap_distance, -5, 5),
+            np.clip(vwap_distance_1h, -5, 5),
+        ])
+        col += 2
+        
+        # Price efficiency (trend strength)
+        price_change = np.abs(prices - np.roll(prices, 60))
+        price_path = pd.Series(np.abs(np.diff(prices, prepend=prices[0]))).rolling(60, min_periods=1).sum().values
+        efficiency = price_change / (price_path + 1e-10)
+        
+        features[:, col:col+1] = np.clip(efficiency, 0, 2).reshape(-1, 1)
+        col += 1
+        
+        # RSI-like feature
+        returns = np.diff(prices, prepend=prices[0])
+        gains = np.where(returns > 0, returns, 0)
+        losses = np.where(returns < 0, -returns, 0)
+        avg_gain = pd.Series(gains).rolling(14, min_periods=1).mean().values
+        avg_loss = pd.Series(losses).rolling(14, min_periods=1).mean().values
+        rsi = 100 - (100 / (1 + avg_gain / (avg_loss + 1e-10)))
+        
+        features[:, col:col+2] = np.column_stack([
+            (rsi - 50) / 50,  # Normalize to [-1, 1]
+            np.gradient(rsi) / 10,  # RSI momentum
+        ])
+        col += 2
+        
+        # ===== 2. VOLATILITY (8 features) =====
+        log_returns = np.log(prices[1:] / prices[:-1])
+        log_returns = np.concatenate([[0], log_returns])
+        
+        vol_10 = pd.Series(log_returns).rolling(10, min_periods=1).std().values * 100
+        vol_60 = pd.Series(log_returns).rolling(60, min_periods=1).std().values * 100
+        vol_300 = pd.Series(log_returns).rolling(300, min_periods=1).std().values * 100
+        
+        features[:, col:col+3] = np.column_stack([vol_10, vol_60, vol_300])
+        col += 3
+        
+        # Volatility ratio (short vs long)
+        vol_ratio = vol_10 / (vol_60 + 1e-10)
+        vol_regime = np.where(vol_ratio > 1.5, 1, np.where(vol_ratio < 0.5, -1, 0))
+        
+        features[:, col:col+2] = np.column_stack([
+            np.clip(vol_ratio, 0, 3),
+            vol_regime,
+        ])
+        col += 2
+        
+        # ATR features
+        atr_14 = self._compute_atr(high, low, prices, 14)
+        atr_ratio = atr_14 / (prices + 1e-10) * 100  # ATR as % of price
+        
+        features[:, col:col+1] = np.clip(atr_ratio, 0, 5).reshape(-1, 1)
+        col += 1
+        
+        # Range features
+        range_60 = pd.Series(high).rolling(60, min_periods=1).max().values - pd.Series(low).rolling(60, min_periods=1).min().values
+        range_pct = range_60 / (prices + 1e-10) * 100
+        
+        features[:, col:col+2] = np.column_stack([
+            np.clip(range_pct, 0, 10),
+            np.gradient(vol_60),  # Volatility acceleration
+        ])
+        col += 2
+        
+        # ===== 3. ORDER FLOW (10 features) =====
+        # Buy pressure (direct from data or compute)
+        bp = buy_pressure
+        bp_ma = pd.Series(bp).rolling(60, min_periods=1).mean().values
+        bp_deviation = bp - bp_ma
+        
+        features[:, col:col+3] = np.column_stack([
+            bp - 0.5,  # Centered around 0
+            bp_ma - 0.5,
+            bp_deviation,
+        ])
+        col += 3
+        
+        # Volume delta
+        buy_vol = volumes * bp
+        sell_vol = volumes * (1 - bp)
+        volume_delta = (buy_vol - sell_vol) / (volumes + 1e-10)
+        volume_delta_ma = pd.Series(volume_delta).rolling(60, min_periods=1).mean().values
+        
+        features[:, col:col+2] = np.column_stack([
+            volume_delta,
+            volume_delta_ma,
+        ])
+        col += 2
+        
+        # Volume momentum
+        vol_ma_short = pd.Series(volumes).rolling(10, min_periods=1).mean().values
+        vol_ma_long = pd.Series(volumes).rolling(60, min_periods=1).mean().values
+        volume_momentum = (vol_ma_short - vol_ma_long) / (vol_ma_long + 1e-10)
+        
+        features[:, col:col+1] = np.clip(volume_momentum, -3, 3).reshape(-1, 1)
+        col += 1
+        
+        # Volume spikes
+        vol_zscore = (volumes - vol_ma_long) / (pd.Series(volumes).rolling(60, min_periods=1).std().values + 1e-10)
+        is_spike = (vol_zscore > 2).astype(np.float32)
+        
+        features[:, col:col+2] = np.column_stack([
+            np.clip(vol_zscore, -3, 5),
+            is_spike,
+        ])
+        col += 2
+        
+        # Large trade detection (approximated from volume)
+        vol_pct = volumes / (pd.Series(volumes).rolling(1000, min_periods=1).quantile(0.99).values + 1e-10)
+        is_large_trade = (vol_pct > 1).astype(np.float32)
+        
+        features[:, col:col+2] = np.column_stack([
+            np.clip(vol_pct, 0, 3),
+            is_large_trade,
+        ])
+        col += 2
+        
+        # ===== 4. MICROSTRUCTURE (6 features) =====
+        # Price acceleration
+        price_vel = np.gradient(prices)
+        price_acc = np.gradient(price_vel)
+        
+        features[:, col:col+2] = np.column_stack([
+            np.clip(price_vel / (prices + 1e-10) * 10000, -10, 10),
+            np.clip(price_acc / (prices + 1e-10) * 10000, -10, 10),
+        ])
+        col += 2
+        
+        # Price-volume correlation
+        pv_corr = pd.Series(price_vel).rolling(60, min_periods=10).corr(pd.Series(volumes)).fillna(0).values
+        
+        features[:, col:col+1] = np.clip(pv_corr, -1, 1).reshape(-1, 1)
+        col += 1
+        
+        # Trend consistency
+        returns_sign = np.sign(np.diff(prices, prepend=prices[0]))
+        trend_consistency = pd.Series(returns_sign).rolling(20, min_periods=1).mean().values
+        
+        features[:, col:col+1] = trend_consistency.reshape(-1, 1)
+        col += 1
+        
+        # Mean reversion signal
+        price_zscore = (prices - pd.Series(prices).rolling(60, min_periods=1).mean().values) / (pd.Series(prices).rolling(60, min_periods=1).std().values + 1e-10)
+        
+        features[:, col:col+2] = np.column_stack([
+            np.clip(price_zscore, -3, 3),
+            np.gradient(price_zscore),
+        ])
+        col += 2
+        
+        # ===== 5. FX CORRELATION (6 features) =====
+        if dxy_data is not None and len(dxy_data) > 0:
+            dxy_prices = dxy_data['close'].values if 'close' in dxy_data.columns else dxy_data['price'].values
+            dxy_returns = np.diff(dxy_prices, prepend=dxy_prices[0]) / (dxy_prices + 1e-10)
+            dxy_momentum = self._compute_ema(dxy_prices, 10) - self._compute_ema(dxy_prices, 50)
+            dxy_momentum = dxy_momentum / (dxy_prices + 1e-10) * 100
+            
+            # Use last value for now (hourly data)
+            features[:, col] = dxy_returns[-1] * 100 * self.config.forex_weight
+            features[:, col+1] = np.clip(dxy_momentum[-1], -5, 5) * self.config.forex_weight
+        col += 2
+        
+        if eurusd_data is not None and len(eurusd_data) > 0:
+            eur_prices = eurusd_data['close'].values if 'close' in eurusd_data.columns else eurusd_data['price'].values
+            eur_returns = np.diff(eur_prices, prepend=eur_prices[0]) / (eur_prices + 1e-10)
+            eur_momentum = self._compute_ema(eur_prices, 10) - self._compute_ema(eur_prices, 50)
+            eur_momentum = eur_momentum / (eur_prices + 1e-10) * 100
+            
+            features[:, col] = eur_returns[-1] * 100 * self.config.forex_weight
+            features[:, col+1] = np.clip(eur_momentum[-1], -5, 5) * self.config.forex_weight
+        col += 2
+        
+        # BTC-FX divergence
+        btc_return = returns_1m
+        dxy_ret = features[:, col-4] if dxy_data is not None else np.zeros(n)
+        divergence = btc_return - dxy_ret
+        correlation_sign = np.sign(btc_return) * np.sign(-dxy_ret)  # Should be positive if inverse corr
+        
+        features[:, col:col+2] = np.column_stack([
+            np.clip(divergence, -5, 5),
+            correlation_sign,
+        ])
+        col += 2
+        
+        # ===== 6. TIME CONTEXT (4 features) =====
+        if 'timestamp' in btc_data.columns:
+            ts = pd.to_datetime(btc_data['timestamp'])
+            hours = ts.dt.hour.values
+            dow = ts.dt.dayofweek.values
+            
+            # Cyclical encoding
+            features[:, col] = np.sin(2 * np.pi * hours / 24)
+            features[:, col+1] = np.cos(2 * np.pi * hours / 24)
+            features[:, col+2] = np.sin(2 * np.pi * dow / 7)
+            features[:, col+3] = 0.5  # Time remaining placeholder
+        col += 4
+        
+        # Replace NaN with 0
+        features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        return features
 
 
 def create_training_dataset(
@@ -358,58 +435,73 @@ def create_training_dataset(
     dxy_data: Optional[pd.DataFrame] = None,
     eurusd_data: Optional[pd.DataFrame] = None,
     candle_minutes: int = 15,
-    sequence_length: int = 180,
-) -> tuple[np.ndarray, np.ndarray]:
+    sequence_length: int = 120,  # 2 hours of 1-minute features
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Create training dataset from historical data.
+    Create training dataset with enhanced features.
     
     Returns:
         X: Feature sequences, shape (num_samples, sequence_length, feature_dim)
         y: Binary outcomes (1 = candle closed up, 0 = down)
     """
-    builder = MultiResolutionFeatureBuilder()
+    logger.info("Creating training dataset with enhanced features...")
+    
+    builder = EnhancedFeatureBuilder()
+    
+    # Ensure timestamps
+    btc = btc_data.copy()
+    if 'timestamp' in btc.columns and not pd.api.types.is_datetime64_any_dtype(btc['timestamp']):
+        btc['timestamp'] = pd.to_datetime(btc['timestamp'], utc=True)
+    
+    logger.info(f"Precomputing features for {len(btc):,} data points...")
+    
+    # Precompute all features
+    all_features = builder.precompute_all_features(btc, dxy_data, eurusd_data)
+    
+    logger.info("Features precomputed. Creating candles...")
     
     # Group by candles
-    btc = btc_data.copy()
-    if not pd.api.types.is_datetime64_any_dtype(btc["timestamp"]):
-        btc["timestamp"] = pd.to_datetime(btc["timestamp"], utc=True)
-    
     candle_seconds = candle_minutes * 60
-    btc["candle_idx"] = (btc["timestamp"].astype(np.int64) // 10**9 // candle_seconds).astype(int)
+    btc['candle_idx'] = (btc['timestamp'].astype(np.int64) // 10**9 // candle_seconds).astype(int)
     
+    # Get candle info
+    candle_groups = btc.groupby('candle_idx')
+    
+    # Use close if available, else price
+    price_col = 'close' if 'close' in btc.columns else 'price'
+    
+    candle_info = candle_groups.agg({
+        price_col: ['first', 'last'],
+    }).reset_index()
+    candle_info.columns = ['candle_idx', 'open', 'close']
+    candle_info['outcome'] = (candle_info['close'] > candle_info['open']).astype(int)
+    
+    # Get start indices
+    candle_starts = candle_groups.apply(lambda x: x.index[0], include_groups=False).values
+    
+    logger.info(f"Found {len(candle_info)} candles. Extracting sequences...")
+    
+    # Extract sequences
     X_list = []
     y_list = []
     
-    for candle_id, group in btc.groupby("candle_idx"):
-        if len(group) < 10:
+    min_idx = sequence_length + 100
+    
+    for start_idx, row in zip(candle_starts, candle_info.itertuples()):
+        if start_idx < min_idx:
             continue
         
-        # Get data up to candle start
-        candle_start_idx = group.index[0]
-        if candle_start_idx < sequence_length:
+        seq_start = start_idx - sequence_length
+        seq_end = start_idx
+        
+        if seq_start < 0 or seq_end > len(all_features):
             continue
         
-        # Features: use data leading up to the candle
-        feature_data = btc.iloc[candle_start_idx - sequence_length:candle_start_idx]
+        features = all_features[seq_start:seq_end]
         
-        # Outcome: did price go up or down?
-        candle_open = group["price"].iloc[0]
-        candle_close = group["price"].iloc[-1]
-        outcome = 1 if candle_close > candle_open else 0
-        
-        # Build features
-        candle_end = group["timestamp"].iloc[-1]
-        features = builder.build_sequence(
-            feature_data,
-            dxy_data=dxy_data,
-            eurusd_data=eurusd_data,
-            sequence_length=sequence_length,
-            candle_end_timestamp=candle_end,
-            candle_minutes=candle_minutes,
-        )
-        
-        X_list.append(features)
-        y_list.append(outcome)
+        if len(features) == sequence_length:
+            X_list.append(features)
+            y_list.append(row.outcome)
     
     logger.info(
         "Created training dataset",
@@ -417,5 +509,8 @@ def create_training_dataset(
         feature_dim=builder.feature_dim,
         sequence_length=sequence_length,
     )
+    
+    if len(X_list) == 0:
+        raise ValueError("No valid training samples. Check data length.")
     
     return np.array(X_list), np.array(y_list)
