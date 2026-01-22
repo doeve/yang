@@ -1285,6 +1285,132 @@ def paper_trade_live_cmd(
     ))
 
 
+@app.command("fetch-polymarket-data")
+def fetch_polymarket_data_cmd(
+    days_back: int = typer.Option(30, help="Days of history to fetch"),
+    output_dir: str = typer.Option("./data/polymarket", help="Output directory"),
+):
+    """Fetch historical YES/NO prices from Polymarket CLOB API.
+    
+    Fetches 15-minute fidelity price data for crypto prediction markets.
+    This data includes real market prices for training with realistic PnL.
+    """
+    import asyncio
+    from .data.polymarket_data_fetcher import fetch_polymarket_data
+    
+    console.print("[bold blue]Fetching Polymarket Historical Data[/bold blue]")
+    console.print(f"  Days back: {days_back}")
+    console.print(f"  Output: {output_dir}")
+    console.print()
+    
+    output_file = asyncio.run(fetch_polymarket_data(
+        output_dir=output_dir,
+        days_back=days_back,
+    ))
+    
+    if output_file:
+        console.print(f"\n[bold green]✓ Data saved to {output_file}[/bold green]")
+
+
+@app.command("fetch-btc-candles")
+def fetch_btc_candles_cmd(
+    hours_back: int = typer.Option(24, help="Hours of history to fetch"),
+    output_dir: str = typer.Option("./data/polymarket", help="Output directory"),
+    include_prices: bool = typer.Option(False, help="Also fetch price history for each candle"),
+):
+    """Fetch 15-minute BTC Up/Down candle markets from Polymarket.
+    
+    Uses the slug pattern btc-updown-15m-{timestamp} to iterate through
+    all 15-minute boundaries and fetch market data including outcomes.
+    """
+    import asyncio
+    import json
+    from pathlib import Path
+    from .data.polymarket_data_fetcher import PolymarketDataFetcher
+    
+    async def fetch():
+        fetcher = PolymarketDataFetcher()
+        
+        try:
+            candles = await fetcher.fetch_btc_15min_candles(hours_back=hours_back)
+            
+            if not candles:
+                console.print("[red]No candles found[/red]")
+                return
+            
+            # Convert to DataFrame
+            import pandas as pd
+            df = pd.DataFrame(candles)
+            
+            # Save
+            output_path = Path(output_dir)
+            output_path.mkdir(parents=True, exist_ok=True)
+            
+            output_file = output_path / "btc_15min_candles.parquet"
+            df.to_parquet(output_file)
+            
+            # Also save JSON metadata
+            metadata = {
+                "n_candles": len(candles),
+                "hours_back": hours_back,
+                "up_count": sum(1 for c in candles if c["up_won"]),
+                "down_count": sum(1 for c in candles if c["up_won"] is False),
+                "avg_volume": sum(c["volume"] for c in candles) / len(candles),
+                "fetched_at": datetime.utcnow().isoformat(),
+            }
+            
+            with open(output_path / "btc_candles_metadata.json", "w") as f:
+                json.dump(metadata, f, indent=2)
+            
+            console.print(f"[bold green]✓ Saved {len(candles)} candles to {output_file}[/bold green]")
+            console.print(f"  Up: {metadata['up_count']} | Down: {metadata['down_count']}")
+            console.print(f"  Avg Volume: ${metadata['avg_volume']:,.0f}")
+            
+        finally:
+            await fetcher.close()
+    
+    console.print("[bold blue]Fetching 15-min BTC Candle Markets[/bold blue]")
+    console.print(f"  Hours back: {hours_back}")
+    console.print()
+    
+    from datetime import datetime
+    asyncio.run(fetch())
+
+
+@app.command("collect-sync-data")
+def collect_synchronized_data_cmd(
+    hours_back: int = typer.Option(168, help="Hours of history to fetch (168 = 7 days)"),
+    output_dir: str = typer.Option("./data", help="Output directory"),
+    with_predictions: bool = typer.Option(False, help="Generate DeepLOB predictions"),
+):
+    """Collect synchronized Polymarket + BTC data for training.
+    
+    This pipeline:
+    1. Fetches Polymarket 15-min BTC candles with outcomes
+    2. Fetches corresponding BTC 1s price data from Binance
+    3. Computes features (returns, volatility, momentum)
+    4. Optionally generates DeepLOB predictions
+    
+    Output: synchronized_training_data.parquet
+    """
+    import asyncio
+    from scripts.collect_synchronized_data import main as collect_main
+    
+    console.print("[bold magenta]Synchronized Data Collection[/bold magenta]")
+    console.print(f"  Hours: {hours_back} ({hours_back // 24} days)")
+    console.print(f"  Output: {output_dir}")
+    console.print(f"  With predictions: {with_predictions}")
+    console.print()
+    
+    asyncio.run(collect_main(
+        output_dir=output_dir,
+        hours_back=hours_back,
+        with_predictions=with_predictions,
+    ))
+
+
 if __name__ == "__main__":
     app()
+
+
 

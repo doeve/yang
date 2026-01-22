@@ -841,6 +841,7 @@ class HistoricalBacktester:
         num_candles: int = 100,
         days_back_min: int = 30,
         days_back_max: int = 365,
+        use_polymarket_outcomes: bool = False,
     ):
         self.model_path = Path(model_path)
         self.data_dir = Path(data_dir)
@@ -850,6 +851,19 @@ class HistoricalBacktester:
         self.num_candles = num_candles
         self.days_back_min = days_back_min
         self.days_back_max = days_back_max
+        self.use_polymarket_outcomes = use_polymarket_outcomes
+        
+        # Polymarket candle data
+        self.polymarket_candles = None
+        if use_polymarket_outcomes:
+            polymarket_path = self.data_dir / "polymarket" / "btc_15min_candles.parquet"
+            if polymarket_path.exists():
+                self.polymarket_candles = pd.read_parquet(polymarket_path)
+                console.print(f"[green]✓ Loaded {len(self.polymarket_candles)} Polymarket candles[/green]")
+            else:
+                console.print(f"[yellow]⚠ Polymarket candles not found at {polymarket_path}[/yellow]")
+                console.print("[yellow]  Run: yang fetch-btc-candles --hours-back 168[/yellow]")
+                self.use_polymarket_outcomes = False
         
         # Model state
         self.model = None
@@ -873,6 +887,7 @@ class HistoricalBacktester:
         self.total_trades = 0
         self.correct_trades = 0
         self.skipped_candles = 0
+
     
     async def _load_model(self):
         """Load trained model and VecNormalize."""
@@ -1180,9 +1195,40 @@ class HistoricalBacktester:
             candle_open = group["price"].iloc[0]
             candle_close = group["price"].iloc[-1]
             candle_return = (candle_close - candle_open) / candle_open * 100
-            actual_direction = "UP" if candle_return > 0 else "DOWN"
             candle_time = group["timestamp"].iloc[0]
             hour = candle_time.hour
+            
+            # Determine actual outcome - use Polymarket if available
+            if self.use_polymarket_outcomes and self.polymarket_candles is not None:
+                # Find matching Polymarket candle by timestamp
+                candle_ts = int(candle_time.timestamp())
+                # Round to 15-min boundary
+                candle_ts_rounded = (candle_ts // 900) * 900
+                
+                # Handle both int and datetime timestamp columns
+                def get_ts(x):
+                    if isinstance(x, (int, float)):
+                        return int(x)
+                    else:
+                        return int(x.timestamp())
+                
+                polymarket_ts = self.polymarket_candles["timestamp"].apply(get_ts) // 900 * 900
+                matching = self.polymarket_candles[polymarket_ts == candle_ts_rounded]
+                
+                if len(matching) > 0:
+                    polymarket_outcome = matching.iloc[0]["up_won"]
+                    actual_direction = "UP" if polymarket_outcome else "DOWN"
+                    # Also note if Polymarket disagrees with BTC move
+                    btc_direction = "UP" if candle_return > 0 else "DOWN"
+                    if actual_direction != btc_direction:
+                        console.print(f"[dim]Note: Polymarket={actual_direction} vs BTC={btc_direction}[/dim]")
+                else:
+                    # Fall back to BTC direction
+                    actual_direction = "UP" if candle_return > 0 else "DOWN"
+            else:
+                actual_direction = "UP" if candle_return > 0 else "DOWN"
+
+
             
             # Reset episode for new candle
             self.episode_starts[0] = True
@@ -1329,20 +1375,27 @@ Examples:
     parser.add_argument("--num-candles", "-n", type=int, default=100, help="Number of candles to backtest")
     parser.add_argument("--days-back-min", type=int, default=30, help="Minimum days back for random period")
     parser.add_argument("--days-back-max", type=int, default=365, help="Maximum days back for random period")
+    parser.add_argument("--polymarket", action="store_true", help="Use real Polymarket outcomes instead of BTC direction")
+    parser.add_argument("--sac-model", type=str, default=None, help="Path to SAC model (alternative to --model)")
     
     args = parser.parse_args()
     
+    # Use SAC model if specified
+    model_path = args.sac_model if args.sac_model else args.model
+    
     if args.backtest:
         backtester = HistoricalBacktester(
-            model_path=args.model,
+            model_path=model_path,
             data_dir=args.data,
             initial_balance=args.balance,
             candle_minutes=args.candle_minutes,
             num_candles=args.num_candles,
             days_back_min=args.days_back_min,
             days_back_max=args.days_back_max,
+            use_polymarket_outcomes=args.polymarket,
         )
         await backtester.run()
+
     else:
         trader = EnhancedLivePaperTrader(
             model_path=args.model,

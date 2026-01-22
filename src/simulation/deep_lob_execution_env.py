@@ -32,7 +32,18 @@ class DeepLOBExecutionConfig:
     min_confidence_to_trade: float = 0.35  # Lower threshold to encourage trading
     high_confidence_threshold: float = 0.55  # Lower for more trading
     
-    # Reward shaping (adjusted to encourage trading on clear signals)
+    # === DSR Reward (Trade-R1 Paper) ===
+    # Amplify logical wins, reduce noise-loss penalty
+    use_dsr_reward: bool = True
+    dsr_profit_multiplier_base: float = 0.5  # reward = pnl × (0.5 + quality)
+    dsr_loss_multiplier_base: float = 2.0    # reward = pnl × (2.0 - quality)
+    
+    # === Cost Model (Almgren-Chriss inspired) ===
+    spread_cost: float = 0.002      # 0.2% bid-ask spread
+    slippage_linear: float = 0.001  # Linear slippage
+    slippage_quadratic: float = 0.0005  # Quadratic impact for large orders
+    
+    # === Reward shaping (adjusted to encourage trading on clear signals) ===
     pnl_scale: float = 10.0
     correct_abstention_bonus: float = 0.02  # Lower bonus for holding
     overtrading_penalty: float = 0.01  # Lower penalty
@@ -42,6 +53,7 @@ class DeepLOBExecutionConfig:
     # Episode parameters
     initial_balance: float = 1000.0
     max_trades_per_candle: int = 1
+
 
 
 class DeepLOBExecutionEnv(gym.Env):
@@ -236,34 +248,78 @@ class DeepLOBExecutionEnv(gym.Env):
         return self._get_observation(), reward, terminated, False, self._get_info()
     
     def _compute_trade_reward(self) -> float:
-        """Compute reward based on trade outcome."""
+        """
+        Compute reward based on trade outcome using DSR (Dynamic Semantic Reward).
+        
+        From Trade-R1 paper:
+        - If profit > 0: reward = pnl × (0.5 + quality)
+        - If profit <= 0: reward = pnl × (2.0 - quality)
+        
+        This amplifies logical wins and reduces penalty for noise-caused losses.
+        """
         if self._outcome is None:
             return 0.0
         
         position_direction = 1.0 if self._position > 0 else -1.0
         position_size = abs(self._position)
         
-        # Map outcome to price movement
+        # === Calculate base PnL (entry vs settlement price) ===
         if self._outcome == 2:  # Up
-            target_price = 1.0
-            pnl_yes = target_price - self._position_entry_price
+            settlement_price = 1.0
         elif self._outcome == 0:  # Down
-            target_price = 0.0
-            pnl_yes = target_price - self._position_entry_price
-        else:  # Hold - small random movement
-            target_price = 0.5 + np.random.uniform(-0.05, 0.05)
-            pnl_yes = target_price - self._position_entry_price
+            settlement_price = 0.0
+        else:  # Hold - small movement
+            settlement_price = 0.5 + np.random.uniform(-0.05, 0.05)
         
         if position_direction > 0:  # Long YES
-            pnl = pnl_yes * position_size
+            raw_pnl = (settlement_price - self._position_entry_price) * position_size
         else:  # Short YES (Long NO)
-            pnl = -pnl_yes * position_size
+            raw_pnl = (self._position_entry_price - settlement_price) * position_size
         
-        self._trade_outcomes.append(pnl > 0)
+        # === Apply Cost Model (Almgren-Chriss) ===
+        spread_cost = self.config.spread_cost * position_size
+        slippage = (self.config.slippage_linear * position_size + 
+                    self.config.slippage_quadratic * position_size ** 2)
+        total_costs = spread_cost + slippage
+        
+        net_pnl = raw_pnl - total_costs
+        
+        # === Calculate Quality Score (action alignment with prediction) ===
+        predicted_class = np.argmax([self._prob_down, self._prob_hold, self._prob_up])
+        confidence = max(self._prob_down, self._prob_hold, self._prob_up)
+        
+        # Quality = alignment × confidence
+        if position_direction > 0 and predicted_class == 2:  # Long YES when Up predicted
+            alignment = 1.0
+        elif position_direction < 0 and predicted_class == 0:  # Long NO when Down predicted
+            alignment = 1.0
+        elif predicted_class == 1:  # Model predicted Hold
+            alignment = 0.3  # Went against Hold signal
+        else:
+            alignment = 0.5  # Partial alignment
+        
+        quality = alignment * confidence
+        
+        # === Apply DSR Formula ===
+        if self.config.use_dsr_reward:
+            if net_pnl > 0:
+                # Amplify logical wins
+                multiplier = self.config.dsr_profit_multiplier_base + quality
+            else:
+                # Reduce penalty for logical losses (noise), amplify illogical losses
+                multiplier = self.config.dsr_loss_multiplier_base - quality
+            
+            reward = net_pnl * multiplier
+        else:
+            reward = net_pnl
+        
+        # Track outcomes
+        self._trade_outcomes.append(raw_pnl > 0)
         if len(self._trade_outcomes) > 100:
             self._trade_outcomes.pop(0)
         
-        return pnl * self.config.pnl_scale
+        return reward * self.config.pnl_scale
+
     
     def _compute_settlement_reward(self) -> float:
         """Reward at candle end without trading."""
