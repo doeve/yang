@@ -75,6 +75,7 @@ class Position:
     entry_step: int
     max_pnl: float = 0.0  # For trailing stop
     min_pnl: float = 0.0
+    prev_pnl: float = 0.0  # For tracking PnL improvement
 
 
 class DeepLOBDynamicEnv(gym.Env):
@@ -253,7 +254,31 @@ class DeepLOBDynamicEnv(gym.Env):
             if should_exit:
                 reward += self._execute_exit(exit_reason)
                 self._trades_this_candle += 1
-        
+            else:
+                # Agent is holding the position - scale reward by profit amplitude
+                if unrealized_pnl > 0:
+                    # Base reward scaled by profit magnitude (capped at take_profit level)
+                    profit_ratio = min(unrealized_pnl / self.config.take_profit_pct, 1.0)
+                    scaled_reward = self.config.hold_reward * profit_ratio
+
+                    # Bonus for improving position (trending towards profitability)
+                    pnl_improvement = unrealized_pnl - self._position.prev_pnl
+                    if pnl_improvement > 0:
+                        # Extra reward for positive momentum, scaled by improvement
+                        improvement_bonus = self.config.hold_reward * 0.5 * min(pnl_improvement * 10, 1.0)
+                        scaled_reward += improvement_bonus
+
+                    reward += scaled_reward
+                elif unrealized_pnl > self._position.prev_pnl:
+                    # Small reward for improving even if not yet profitable
+                    # Encourages holding through fluctuations towards profitability
+                    improvement = unrealized_pnl - self._position.prev_pnl
+                    if improvement > 0:
+                        reward += self.config.hold_reward * 0.25 * min(improvement * 10, 1.0)
+
+                # Update previous PnL for next step
+                self._position.prev_pnl = unrealized_pnl
+
         # === Check for Entry or Hold ===
         if self._position is None:
             if hold_prob > 0.5:
