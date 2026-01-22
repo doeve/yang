@@ -47,13 +47,15 @@ class DynamicTradingConfig:
     stop_loss_pct: float = 0.10  # 10% stop loss
     take_profit_pct: float = 0.15  # 15% take profit
     
-    # === Reward Shaping ===
-    pnl_scale: float = 10.0
-    sharpe_weight: float = 0.3
-    drawdown_penalty_weight: float = 0.2
-    use_dsr_reward: bool = True
-    dsr_profit_multiplier_base: float = 0.5
-    dsr_loss_multiplier_base: float = 2.0
+    # === Reward Shaping (NORMALIZED) ===
+    # Rewards are now normalized to [-1, 1] range
+    win_reward: float = 1.0
+    loss_penalty: float = -1.0
+    hold_reward: float = 0.0
+    sharpe_weight: float = 0.1  # Reduced for normalized rewards
+    drawdown_penalty_weight: float = 0.1
+    use_dsr_reward: bool = False  # Disable DSR for simpler rewards
+    confidence_bonus: float = 0.2  # Bonus for high-confidence correct trades
     
     # === Episode Structure ===
     steps_per_candle: int = 60  # Multiple decision points per candle
@@ -256,7 +258,7 @@ class DeepLOBDynamicEnv(gym.Env):
                 # Agent chooses to wait
                 predicted_class = np.argmax([self._prob_down, self._prob_hold, self._prob_up])
                 if predicted_class == 1:  # Correct to hold when Hold predicted
-                    reward += 0.001 * self.config.pnl_scale
+                    reward += 0.01  # Small bonus for correct hold
             elif self._trades_this_candle < self.config.max_trades_per_candle:
                 # Agent wants to enter
                 if abs(direction) > 0.1 and size > 0.05:
@@ -306,21 +308,19 @@ class DeepLOBDynamicEnv(gym.Env):
             entry_step=self._candle_step,
         )
         
-        # Trading fee
-        fee = trade_size * self.config.fee_percent * 0.01
-        
-        # Alignment bonus
+        # Entry reward: small penalty for trading costs
         predicted_class = np.argmax([self._prob_down, self._prob_hold, self._prob_up])
         confidence = max(self._prob_down, self._prob_hold, self._prob_up)
         
+        # Small alignment bonus/penalty for entry
         if (side == "long" and predicted_class == 2) or (side == "short" and predicted_class == 0):
-            alignment_bonus = confidence * 0.01
+            alignment_bonus = 0.05  # Good entry
         elif predicted_class == 1:
-            alignment_bonus = -0.02  # Penalty for trading against Hold
+            alignment_bonus = -0.1  # Penalty for trading against Hold
         else:
-            alignment_bonus = -0.01
+            alignment_bonus = -0.05  # Wrong direction
         
-        return (alignment_bonus - fee) * self.config.pnl_scale
+        return np.clip(alignment_bonus, -0.2, 0.2)  # Normalized entry reward
     
     def _execute_exit(self, reason: str) -> float:
         """Execute position exit before settlement."""
@@ -363,23 +363,31 @@ class DeepLOBDynamicEnv(gym.Env):
         
         # Bonus for good exit reasons
         if reason == "take_profit":
-            pnl += 0.01 * self.config.pnl_scale
+            pnl += 0.1
         elif reason == "trailing_stop" and pnl > 0:
-            pnl += 0.005 * self.config.pnl_scale
+            pnl += 0.05
         elif reason == "stop_loss":
-            # Encourage using stop loss to limit losses
-            pnl += 0.002 * self.config.pnl_scale
+            pnl += 0.02  # Small bonus for using stop loss
         
         # Update balance and track outcome
-        self._balance += pnl
-        self._episode_pnl += pnl
-        self._episode_max_balance = max(self._episode_max_balance, self._balance)
         self._trade_outcomes.append(pnl > 0)
         
         # Clear position
         self._position = None
         
-        return pnl * self.config.pnl_scale
+        # Normalized exit reward based on win/loss
+        if pnl > 0:
+            reward = self.config.win_reward * min(1.0, pnl * 2)  # Scale small wins
+        else:
+            reward = self.config.loss_penalty * min(1.0, abs(pnl) * 2)
+        
+        # Bonus for good exit reasons
+        if reason == "take_profit":
+            reward += 0.1
+        elif reason == "trailing_stop" and pnl > 0:
+            reward += 0.05
+        
+        return np.clip(reward, -1.5, 1.5)  # Allow some bonus range
     
     def _execute_settlement(self) -> float:
         """Settle position at candle end."""
@@ -416,14 +424,19 @@ class DeepLOBDynamicEnv(gym.Env):
             else:
                 multiplier = self.config.dsr_loss_multiplier_base - quality
             
-            pnl = pnl * multiplier
-        
-        self._balance += pnl
-        self._episode_pnl += pnl
         self._trade_outcomes.append(pnl > 0)
         self._position = None
         
-        return pnl * self.config.pnl_scale
+        # Normalized settlement reward
+        if pnl > 0:
+            reward = self.config.win_reward
+            # Confidence bonus if prediction was correct
+            if (self._position is None):  # Already cleared
+                pass
+        else:
+            reward = self.config.loss_penalty
+        
+        return np.clip(reward, -1.5, 1.5)
     
     def _compute_unrealized_pnl(self) -> float:
         """Calculate unrealized PnL percentage."""
@@ -451,7 +464,7 @@ class DeepLOBDynamicEnv(gym.Env):
         # Differential Sharpe (annualized approximation)
         sharpe = mean_ret / std_ret
         
-        return sharpe * self.config.sharpe_weight * self.config.pnl_scale
+        return np.clip(sharpe * self.config.sharpe_weight, -0.2, 0.2)  # Bounded Sharpe reward
     
     def _compute_drawdown_penalty(self) -> float:
         """Compute drawdown penalty."""
@@ -462,7 +475,7 @@ class DeepLOBDynamicEnv(gym.Env):
         
         if drawdown > self.config.max_drawdown_pct:
             penalty = (drawdown - self.config.max_drawdown_pct) * 2.0
-            return -penalty * self.config.drawdown_penalty_weight * self.config.pnl_scale
+            return np.clip(-penalty * self.config.drawdown_penalty_weight, -0.2, 0.0)
         
         return 0.0
     
