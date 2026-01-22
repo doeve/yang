@@ -59,8 +59,8 @@ class PaperTradeConfig:
     """Configuration for paper trading with Polymarket CLOB."""
     
     # Model paths
-    sac_model: str = "./logs/sac_dynamic_v2/final_model.zip"
-    vec_normalize: str = "./logs/sac_dynamic_v2/vecnormalize.pkl"
+    sac_model: str = "./logs/sac_dynamic_v5/final_model.zip"
+    vec_normalize: str = "./logs/sac_dynamic_v5/vecnormalize.pkl"
     deep_lob_model: str = "./logs/deep_lob_balanced"
     
     # Trading settings
@@ -812,8 +812,8 @@ async def main():
     import argparse
     
     parser = argparse.ArgumentParser(description="Paper trade with SAC Dynamic + Polymarket CLOB")
-    parser.add_argument("--sac-model", default="./logs/sac_dynamic_v2/final_model.zip")
-    parser.add_argument("--vec-normalize", default="./logs/sac_dynamic_v2/vecnormalize.pkl")
+    parser.add_argument("--sac-model", default="./logs/sac_dynamic_v5/final_model.zip")
+    parser.add_argument("--vec-normalize", default="./logs/sac_dynamic_v5/vecnormalize.pkl")
     parser.add_argument("--deep-lob", default="./logs/deep_lob_balanced")
     parser.add_argument("--balance", type=float, default=1000.0)
     

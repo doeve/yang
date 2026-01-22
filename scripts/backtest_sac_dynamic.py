@@ -38,10 +38,10 @@ console = Console()
 class SACDynamicBacktester:
     """
     Backtester for SAC Dynamic model with complete BTC + Polymarket data.
-    
+
     Uses VecNormalize to properly normalize observations matching training.
     """
-    
+
     def __init__(
         self,
         sac_model: str,
@@ -55,16 +55,16 @@ class SACDynamicBacktester:
         self.vec_normalize_path = Path(vec_normalize)
         self.deep_lob_path = Path(deep_lob_model)
         self.polymarket_path = Path(polymarket_data)
-        
+
         self.initial_balance = initial_balance
         self.balance = initial_balance
         self.max_candles = max_candles
-        
+
         # Models
         self.sac_model: Optional[SAC] = None
         self.vec_normalize: Optional[VecNormalize] = None
         self.bot: Optional[DeepLOBTwoLayerBot] = None
-        
+
         # Stats
         self.trades: List[Dict] = []
         self.wins = 0
@@ -72,6 +72,11 @@ class SACDynamicBacktester:
         self.skipped = 0
         self.max_balance = initial_balance
         self.min_balance = initial_balance
+
+        # Price history for momentum calculation
+        self.yes_price_history: List[float] = []
+        self.no_price_history: List[float] = []
+        self.trades_this_candle = 0
         
     def load_models(self):
         """Load SAC model, VecNormalize, and DeepLOB."""
@@ -159,37 +164,73 @@ class SACDynamicBacktester:
     def build_observation(
         self,
         deeplob_probs: np.ndarray,
-        market_price: float = 0.5,
+        yes_price: float = 0.5,
+        no_price: float = 0.5,
         time_remaining: float = 0.5,
     ) -> np.ndarray:
-        """Build 20-dim observation matching DeepLOBDynamicEnv."""
+        """Build 26-dim observation matching DeepLOBDynamicEnv with momentum features."""
         prob_down, prob_hold, prob_up = deeplob_probs
         predicted_class = np.argmax(deeplob_probs)
         confidence = max(deeplob_probs)
-        
+
+        time_in_candle = 1.0 - time_remaining
+
         # Market state
-        spread = 0.02
+        spread = abs(yes_price + no_price - 1.0)
         steps_since_entry = 0.0
-        
+
         # Position state (no position for new candle)
         position_size = 0.0
         unrealized_pnl = 0.0
         max_pnl = 0.0
         drawdown = 0.0
-        
+
         # History
-        trades_this_candle = 0.0
         win_rate = self.wins / max(1, self.wins + self.losses)
         balance_norm = self.balance / self.initial_balance - 1.0
-        
+
         # Volatility (estimate)
         volatility = 0.5
-        
+
         # Edge calculations
         model_implied = 0.5 + (prob_up - prob_down) * 0.5
-        edge_up = model_implied - market_price
-        edge_down = (1 - model_implied) - (1 - market_price)
-        
+        edge_up = model_implied - yes_price
+        edge_down = (1 - model_implied) - no_price
+
+        # Update price history
+        self.yes_price_history.append(yes_price)
+        self.no_price_history.append(no_price)
+        if len(self.yes_price_history) > 20:
+            self.yes_price_history = self.yes_price_history[-20:]
+            self.no_price_history = self.no_price_history[-20:]
+
+        # === NEW FEATURES ===
+
+        # 1. Token momentum (rate of change over 5 steps)
+        momentum_window = 5
+        if len(self.yes_price_history) >= momentum_window:
+            yes_momentum = (self.yes_price_history[-1] - self.yes_price_history[-momentum_window]) / momentum_window
+            no_momentum = (self.no_price_history[-1] - self.no_price_history[-momentum_window]) / momentum_window
+        else:
+            yes_momentum = 0.0
+            no_momentum = 0.0
+
+        # 2. Convergence velocity
+        if yes_price > 0.5:
+            convergence_velocity = yes_momentum * 10
+        else:
+            convergence_velocity = -yes_momentum * 10
+
+        # 3. Price distance to settlement
+        price_distance_to_settlement = 0.5 - abs(yes_price - 0.5)
+
+        # 4. YES/NO sum deviation (arbitrage signal)
+        yes_no_sum_deviation = (yes_price + no_price) - 1.0
+
+        # 5. Time urgency
+        time_urgency_multiplier = 2.0
+        time_urgency = 1.0 + (time_urgency_multiplier - 1.0) * (time_in_candle ** 2)
+
         obs = np.array([
             # DeepLOB predictions (3)
             prob_down, prob_hold, prob_up,
@@ -197,8 +238,8 @@ class SACDynamicBacktester:
             predicted_class / 2.0,
             confidence,
             # Market (3)
-            market_price,
-            1.0 - market_price,
+            yes_price,
+            no_price,
             spread,
             # Time (2)
             time_remaining,
@@ -209,7 +250,7 @@ class SACDynamicBacktester:
             max_pnl,
             drawdown,
             # History (3)
-            trades_this_candle,
+            self.trades_this_candle / 5.0,
             win_rate,
             balance_norm,
             # Volatility (1)
@@ -217,8 +258,18 @@ class SACDynamicBacktester:
             # Edge (2)
             edge_up,
             edge_down,
+            # === NEW: Momentum (2) ===
+            yes_momentum * 100,
+            no_momentum * 100,
+            # === NEW: Convergence (2) ===
+            convergence_velocity,
+            price_distance_to_settlement,
+            # === NEW: Arbitrage (1) ===
+            yes_no_sum_deviation * 10,
+            # === NEW: Time urgency (1) ===
+            time_urgency / time_urgency_multiplier,
         ], dtype=np.float32)
-        
+
         return obs
     
     def get_sac_action(self, obs: np.ndarray, probs: np.ndarray) -> Dict[str, Any]:
@@ -300,17 +351,22 @@ class SACDynamicBacktester:
                 task = progress.add_task("Backtesting...", total=len(test_candles))
                 
                 for idx, (_, candle) in enumerate(test_candles.iterrows()):
+                    # Reset per-candle state
+                    self.yes_price_history = []
+                    self.no_price_history = []
+                    self.trades_this_candle = 0
+
                     # Get candle timestamp
                     ts = candle["timestamp"]
                     if isinstance(ts, (int, float)):
                         candle_time = datetime.fromtimestamp(ts, tz=timezone.utc)
                     else:
                         candle_time = ts.to_pydatetime()
-                    
+
                     # Polymarket outcome
                     up_won = candle["up_won"]
                     actual_direction = "UP" if up_won else "DOWN"
-                    
+
                     progress.update(task, description=f"Candle {idx+1}/{len(test_candles)} @ {candle_time.strftime('%Y-%m-%d %H:%M')}")
                     
                     # Fetch BTC data for this period
@@ -342,7 +398,7 @@ class SACDynamicBacktester:
                     ])
                     
                     # Build observation and get SAC action
-                    obs = self.build_observation(probs, market_price=0.5, time_remaining=0.5)
+                    obs = self.build_observation(probs, yes_price=0.5, no_price=0.5, time_remaining=0.5)
                     trade_decision = self.get_sac_action(obs, probs)
                     
                     if trade_decision["action"] == "hold":
@@ -447,8 +503,8 @@ class SACDynamicBacktester:
 async def main():
     parser = argparse.ArgumentParser(description="Backtest SAC Dynamic with complete data")
     
-    parser.add_argument("--sac-model", "-s", default="./logs/sac_dynamic_v2/final_model.zip")
-    parser.add_argument("--vec-normalize", "-v", default="./logs/sac_dynamic_v2/vecnormalize.pkl")
+    parser.add_argument("--sac-model", "-s", default="./logs/sac_dynamic_v5/final_model.zip")
+    parser.add_argument("--vec-normalize", "-v", default="./logs/sac_dynamic_v5/vecnormalize.pkl")
     parser.add_argument("--deep-lob", "-d", default="./logs/deep_lob_balanced")
     parser.add_argument("--polymarket", "-p", default="./data/polymarket/btc_15min_candles.parquet")
     parser.add_argument("--balance", "-b", type=float, default=10000.0)
