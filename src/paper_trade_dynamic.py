@@ -391,18 +391,23 @@ class DynamicPaperTrader:
         direction = float(action[0][0])
         size = float(np.clip(action[0][1], 0.0, 1.0))
         hold_prob = float(action[0][2])
+        exit_signal = float(action[0][3]) if len(action[0]) > 3 else 0.0
         
         # Use rule-based fallback if SAC is too conservative
         if hold_prob > 0.7 or size < 0.02:
-            return self._rule_based_action(probs)
+            result = self._rule_based_action(probs)
+            result["exit_signal"] = exit_signal
+            return result
         
         if abs(direction) > 0.05:
             if direction > 0:
-                return {"action": "buy_yes", "size": max(size * 0.25, 0.10)}
+                return {"action": "buy_yes", "size": max(size * 0.25, 0.10), "exit_signal": exit_signal}
             else:
-                return {"action": "buy_no", "size": max(size * 0.25, 0.10)}
+                return {"action": "buy_no", "size": max(size * 0.25, 0.10), "exit_signal": exit_signal}
         
-        return self._rule_based_action(probs)
+        result = self._rule_based_action(probs)
+        result["exit_signal"] = exit_signal
+        return result
     
     def _rule_based_action(self, probs: np.ndarray) -> Dict[str, Any]:
         """Rule-based fallback."""
@@ -417,7 +422,44 @@ class DynamicPaperTrader:
         elif prob_down > prob_up and prob_down > 0.4:
             return {"action": "buy_no", "size": min(confidence * 0.4, 0.20)}
         
-        return {"action": "hold", "size": 0.0}
+        return {"action": "hold", "size": 0.0, "exit_signal": 0.0}
+    
+    async def early_exit(self, yes_price: float, no_price: float, reason: str = "signal"):
+        """Exit position early at current market prices."""
+        if not self.state.position_side:
+            return
+        
+        # Calculate PnL based on current market prices
+        if self.state.position_side == "yes":
+            exit_price = yes_price
+        else:
+            exit_price = no_price
+        
+        pnl = (exit_price - self.state.entry_price) * self.state.position_size
+        pnl_dollars = pnl * self.state.balance
+        
+        self.state.balance += pnl_dollars
+        self.state.total_pnl += pnl_dollars
+        
+        if pnl > 0:
+            self.state.wins += 1
+        else:
+            self.state.losses += 1
+        
+        self.state.trades.append({
+            "time": datetime.now(timezone.utc),
+            "side": self.state.position_side,
+            "pnl": pnl_dollars,
+            "exit_reason": reason,
+        })
+        
+        self.file_logger.info(f"EARLY EXIT ({reason}): {self.state.position_side} @ {exit_price:.3f} | PnL=${pnl_dollars:.2f}")
+        console.print(f"\n[{'green' if pnl > 0 else 'red'}]Early Exit ({reason}): {self.state.position_side.upper()} @ {exit_price:.3f} | PnL=${pnl_dollars:+.2f}[/]")
+        
+        # Clear position
+        self.state.position_side = None
+        self.state.position_size = 0.0
+        self.state.entry_price = 0.0
     
     async def execute_trade(self, decision: Dict, yes_price: float, no_price: float):
         """Execute a trade."""
@@ -534,6 +576,8 @@ class DynamicPaperTrader:
             table.add_row("", "")
             color = "green" if self.state.position_side == "yes" else "red"
             table.add_row("Position", f"[{color}]{self.state.position_side.upper()}[/] @ {self.state.entry_price:.3f}")
+            bet_dollars = self.state.position_size * self.state.balance
+            table.add_row("Bet Amount", f"${bet_dollars:.2f} ({self.state.position_size:.0%})")
         
         if self.state.last_probs:
             table.add_row("", "")
@@ -625,8 +669,14 @@ class DynamicPaperTrader:
                             obs = self.build_observation(probs, yes_price)
                             sac_decision = self.get_sac_action(obs, probs)
                             
+                            exit_signal = sac_decision.get("exit_signal", 0.0)
+                            
+                            # Check for early exit if we have a position
+                            if self.state.position_side and exit_signal > 0.5:
+                                await self.early_exit(yes_price, no_price, reason="SAC exit_signal")
+                            
                             # Execute trade if no position
-                            if not self.state.position_side and sac_decision["action"] != "hold":
+                            elif not self.state.position_side and sac_decision["action"] != "hold":
                                 await self.execute_trade(sac_decision, yes_price, no_price)
                         
                         except Exception as e:
