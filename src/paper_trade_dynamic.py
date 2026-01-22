@@ -14,7 +14,7 @@ import os
 import signal
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -103,6 +103,10 @@ class TradingState:
     last_yes_price: float = 0.5
     last_no_price: float = 0.5
     last_probs: Dict[str, float] = field(default_factory=dict)
+    
+    # BTC prices for display
+    btc_open_price: Optional[float] = None
+    btc_current_price: Optional[float] = None
 
 
 class DynamicPaperTrader:
@@ -194,7 +198,7 @@ class DynamicPaperTrader:
     
     async def get_current_candle_timestamp(self) -> int:
         """Get current 15-min candle timestamp."""
-        now = int(datetime.utcnow().timestamp())
+        now = int(datetime.now(timezone.utc).timestamp())
         return (now // 900) * 900
     
     async def fetch_polymarket_candle(self, timestamp: int) -> Optional[Dict]:
@@ -222,19 +226,28 @@ class DynamicPaperTrader:
             if isinstance(clob_tokens, str):
                 clob_tokens = json.loads(clob_tokens)
             
-            # Parse outcome prices (for current implied probability)
+            # outcomePrices only has valid prices for resolved markets
+            # For active markets, we'll need to fetch from CLOB orderbook
             outcome_prices = market.get("outcomePrices", "[]")
             if isinstance(outcome_prices, str):
                 outcome_prices = json.loads(outcome_prices)
             
-            yes_price = float(outcome_prices[0]) if outcome_prices else 0.5
-            no_price = float(outcome_prices[1]) if len(outcome_prices) > 1 else 0.5
+            # Check if market is active (not resolved)
+            is_closed = market.get("closed", False)
+            
+            # For active markets, prices will be fetched separately
+            if not is_closed:
+                yes_price = 0.5  # Placeholder, will be updated by fetch_live_prices
+                no_price = 0.5
+            else:
+                yes_price = float(outcome_prices[0]) if outcome_prices else 0.5
+                no_price = float(outcome_prices[1]) if len(outcome_prices) > 1 else 0.5
             
             return {
                 "timestamp": timestamp,
                 "slug": slug,
                 "title": data.get("title", ""),
-                "closed": market.get("closed", False),
+                "closed": is_closed,
                 "yes_token_id": clob_tokens[0] if clob_tokens else None,
                 "no_token_id": clob_tokens[1] if len(clob_tokens) > 1 else None,
                 "yes_price": yes_price,
@@ -245,6 +258,51 @@ class DynamicPaperTrader:
         except Exception as e:
             logger.debug(f"Error fetching Polymarket candle: {e}")
             return None
+    
+    async def fetch_live_prices(self, market: Dict) -> tuple[float, float]:
+        """Fetch live YES/NO prices from Polymarket CLOB orderbook."""
+        yes_token_id = market.get("yes_token_id")
+        no_token_id = market.get("no_token_id")
+        
+        if not yes_token_id:
+            return 0.5, 0.5
+        
+        try:
+            # Fetch YES token prices from CLOB
+            # The midprice endpoint gives us the best bid/ask
+            response = await self.polymarket_client.get(
+                f"{self.config.polymarket_clob_url}/midpoint",
+                params={"token_id": yes_token_id}
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                yes_price = float(data.get("mid", 0.5))
+                no_price = 1.0 - yes_price  # NO price is complement
+                return yes_price, no_price
+            else:
+                # Fallback: try to get price from book
+                response = await self.polymarket_client.get(
+                    f"{self.config.polymarket_clob_url}/book",
+                    params={"token_id": yes_token_id}
+                )
+                
+                if response.status_code == 200:
+                    book = response.json()
+                    bids = book.get("bids", [])
+                    asks = book.get("asks", [])
+                    
+                    best_bid = float(bids[0].get("price", 0.5)) if bids else 0.5
+                    best_ask = float(asks[0].get("price", 0.5)) if asks else 0.5
+                    
+                    yes_price = (best_bid + best_ask) / 2
+                    no_price = 1.0 - yes_price
+                    return yes_price, no_price
+                    
+        except Exception as e:
+            logger.debug(f"Error fetching live prices: {e}")
+        
+        return 0.5, 0.5
     
     async def fetch_btc_data(self, limit: int = 300) -> pd.DataFrame:
         """Fetch BTC 1s klines from Binance (direct connection)."""
@@ -274,7 +332,7 @@ class DynamicPaperTrader:
     
     def get_time_remaining(self) -> float:
         """Get fraction of time remaining in current candle."""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         minutes = (now.minute // self.config.candle_minutes) * self.config.candle_minutes
         candle_end = now.replace(minute=minutes, second=0, microsecond=0) + timedelta(minutes=self.config.candle_minutes)
         
@@ -414,7 +472,7 @@ class DynamicPaperTrader:
             self.state.losses += 1
         
         self.state.trades.append({
-            "time": datetime.utcnow(),
+            "time": datetime.now(timezone.utc),
             "side": self.state.position_side,
             "pnl": pnl_dollars,
         })
@@ -441,6 +499,15 @@ class DynamicPaperTrader:
         
         table.add_row("", "")
         table.add_row("Time Remaining", f"{int(self.get_time_remaining() * 15)}m")
+        
+        # BTC prices
+        if self.state.btc_open_price and self.state.btc_current_price:
+            btc_change = (self.state.btc_current_price - self.state.btc_open_price) / self.state.btc_open_price * 100
+            btc_color = "green" if btc_change >= 0 else "red"
+            table.add_row("BTC Open", f"${self.state.btc_open_price:,.2f}")
+            table.add_row("BTC Current", f"${self.state.btc_current_price:,.2f} [{btc_color}]{btc_change:+.3f}%[/]")
+        
+        table.add_row("", "")
         table.add_row("YES Price", f"{self.state.last_yes_price:.3f}")
         table.add_row("NO Price", f"{self.state.last_no_price:.3f}")
         
@@ -491,14 +558,26 @@ class DynamicPaperTrader:
                         if self.state.candle_market:
                             console.print(f"\n[blue]New candle: {self.state.candle_market.get('slug')}[/blue]")
                             self.file_logger.info(f"NEW CANDLE: {self.state.candle_market.get('slug')}")
+                            
+                            # Reset BTC open price for new candle
+                            self.state.btc_open_price = None
                     
                     # Fetch BTC data
                     btc_data = await self.fetch_btc_data()
                     
+                    # Track BTC prices
+                    if len(btc_data) > 0:
+                        self.state.btc_current_price = btc_data["price"].iloc[-1]
+                        if self.state.btc_open_price is None:
+                            self.state.btc_open_price = btc_data["price"].iloc[0]
+                    
                     if len(btc_data) > 50 and self.state.candle_market:
-                        # Get DeepLOB prediction
-                        yes_price = self.state.candle_market.get("yes_price", 0.5)
-                        no_price = self.state.candle_market.get("no_price", 0.5)
+                        # Fetch live prices from CLOB on each iteration
+                        if not self.state.candle_market.get("closed"):
+                            yes_price, no_price = await self.fetch_live_prices(self.state.candle_market)
+                        else:
+                            yes_price = self.state.candle_market.get("yes_price", 0.5)
+                            no_price = self.state.candle_market.get("no_price", 0.5)
                         
                         self.state.last_yes_price = yes_price
                         self.state.last_no_price = no_price
