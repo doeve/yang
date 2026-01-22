@@ -590,7 +590,7 @@ class LivePaperTrader:
 
 async def main():
     parser = argparse.ArgumentParser(description="Live paper trading")
-    parser.add_argument("--model", "-m", default="logs/recurrent_multi_asset/multi_asset_model")
+    parser.add_argument("--model", "-m", default="logs/recurrent_multi_asset_500000/multi_asset_model")
     parser.add_argument("--data", "-d", default="./data")
     parser.add_argument("--balance", "-b", type=float, default=10000.0)
     

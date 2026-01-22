@@ -338,7 +338,7 @@ class PnLSimulator:
 
 
 def evaluate_multi_model(
-    model_path: str = "logs/recurrent_multi_asset/multi_asset_model",
+    model_path: str = "logs/recurrent_multi_asset_500000/multi_asset_model",
     data_dir: str = "data",
     n_episodes: int = 500,
     initial_balance: float = 10000.0,
