@@ -56,6 +56,8 @@ class DynamicTradingConfig:
     drawdown_penalty_weight: float = 0.1
     use_dsr_reward: bool = False  # Disable DSR for simpler rewards
     confidence_bonus: float = 0.2  # Bonus for high-confidence correct trades
+    dsr_profit_multiplier_base: float = 0.5  # reward = pnl × (0.5 + quality)
+    dsr_loss_multiplier_base: float = 1.5  # loss = pnl × (1.5 - quality)
     
     # === Episode Structure ===
     steps_per_candle: int = 60  # Multiple decision points per candle
