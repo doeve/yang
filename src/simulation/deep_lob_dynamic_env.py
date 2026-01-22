@@ -51,7 +51,7 @@ class DynamicTradingConfig:
     # Rewards are now normalized to [-1, 1] range
     win_reward: float = 1.0
     loss_penalty: float = -1.0
-    hold_reward: float = 0.0
+    hold_reward: float = 0.1
     sharpe_weight: float = 0.1  # Reduced for normalized rewards
     drawdown_penalty_weight: float = 0.1
     use_dsr_reward: bool = False  # Disable DSR for simpler rewards
