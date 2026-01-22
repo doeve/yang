@@ -81,29 +81,34 @@ class PaperTradeConfig:
 @dataclass
 class TradingState:
     """Current trading state."""
-    
+
     balance: float = 1000.0
     total_pnl: float = 0.0
-    
+
     # Current candle
     candle_timestamp: Optional[int] = None
     candle_market: Optional[Dict] = None
-    
+
     # Position
     position_side: Optional[str] = None  # "yes" or "no"
     position_size: float = 0.0
     entry_price: float = 0.0
-    
+
     # Stats
     trades: List[Dict] = field(default_factory=list)
+    trades_this_candle: int = 0
     wins: int = 0
     losses: int = 0
-    
+
     # Last update
     last_yes_price: float = 0.5
     last_no_price: float = 0.5
     last_probs: Dict[str, float] = field(default_factory=dict)
-    
+
+    # Price history for momentum calculation
+    yes_price_history: List[float] = field(default_factory=list)
+    no_price_history: List[float] = field(default_factory=list)
+
     # BTC prices for display
     btc_open_price: Optional[float] = None
     btc_current_price: Optional[float] = None
@@ -341,42 +346,103 @@ class DynamicPaperTrader:
         
         return max(0.0, min(1.0, remaining / total_seconds))
     
-    def build_observation(self, probs: np.ndarray, yes_price: float) -> np.ndarray:
-        """Build 20-dim observation for SAC."""
+    def build_observation(self, probs: np.ndarray, yes_price: float, no_price: float) -> np.ndarray:
+        """Build 26-dim observation for SAC with momentum and convergence features."""
         prob_down, prob_hold, prob_up = probs
         predicted_class = np.argmax(probs)
         confidence = max(probs)
-        
+
         time_remaining = self.get_time_remaining()
+        time_in_candle = 1.0 - time_remaining
         win_rate = self.state.wins / max(1, self.state.wins + self.state.losses)
         balance_norm = self.state.balance / self.config.initial_balance - 1.0
-        
+
         # Edge calculations
         model_implied = 0.5 + (prob_up - prob_down) * 0.5
         edge_up = model_implied - yes_price
-        edge_down = (1 - model_implied) - (1 - yes_price)
-        
+        edge_down = (1 - model_implied) - no_price
+
+        # Update price history
+        self.state.yes_price_history.append(yes_price)
+        self.state.no_price_history.append(no_price)
+        # Keep bounded
+        if len(self.state.yes_price_history) > 20:
+            self.state.yes_price_history = self.state.yes_price_history[-20:]
+            self.state.no_price_history = self.state.no_price_history[-20:]
+
+        # === NEW FEATURES ===
+
+        # 1. Token momentum (rate of change over 5 steps)
+        momentum_window = 5
+        if len(self.state.yes_price_history) >= momentum_window:
+            yes_momentum = (self.state.yes_price_history[-1] - self.state.yes_price_history[-momentum_window]) / momentum_window
+            no_momentum = (self.state.no_price_history[-1] - self.state.no_price_history[-momentum_window]) / momentum_window
+        else:
+            yes_momentum = 0.0
+            no_momentum = 0.0
+
+        # 2. Convergence velocity
+        if yes_price > 0.5:
+            convergence_velocity = yes_momentum * 10
+        else:
+            convergence_velocity = -yes_momentum * 10
+
+        # 3. Price distance to settlement
+        price_distance_to_settlement = 0.5 - abs(yes_price - 0.5)
+
+        # 4. YES/NO sum deviation (arbitrage signal)
+        yes_no_sum_deviation = (yes_price + no_price) - 1.0
+
+        # 5. Time urgency
+        time_urgency_multiplier = 2.0
+        time_urgency = 1.0 + (time_urgency_multiplier - 1.0) * (time_in_candle ** 2)
+
+        # Position state
+        if self.state.position_side:
+            position_sign = 1.0 if self.state.position_side == "yes" else -1.0
+            position_size = self.state.position_size * position_sign
+        else:
+            position_size = 0.0
+
         obs = np.array([
+            # DeepLOB predictions (3)
             prob_down, prob_hold, prob_up,
+            # Prediction (2)
             predicted_class / 2.0,
             confidence,
+            # Market (3)
             yes_price,
-            1.0 - yes_price,
-            0.02,  # spread
+            no_price,
+            abs(yes_price + no_price - 1.0),  # Actual spread from sum deviation
+            # Time (2)
             time_remaining,
-            0.0,  # steps_since_entry
-            self.state.position_size if self.state.position_side else 0.0,
-            0.0,  # unrealized_pnl
+            0.0,  # steps_since_entry (not tracked in paper trading)
+            # Position (4)
+            position_size,
+            0.0,  # unrealized_pnl (computed separately)
             0.0,  # max_pnl
             0.0,  # drawdown
-            0.0,  # trades_this_candle
+            # History (3)
+            self.state.trades_this_candle / 5.0,  # max_trades_per_candle = 5
             win_rate,
             balance_norm,
-            0.5,  # volatility
+            # Volatility (1)
+            0.5,  # volatility estimate
+            # Edge (2)
             edge_up,
             edge_down,
+            # === NEW: Momentum (2) ===
+            yes_momentum * 100,
+            no_momentum * 100,
+            # === NEW: Convergence (2) ===
+            convergence_velocity,
+            price_distance_to_settlement,
+            # === NEW: Arbitrage (1) ===
+            yes_no_sum_deviation * 10,
+            # === NEW: Time urgency (1) ===
+            time_urgency / time_urgency_multiplier,
         ], dtype=np.float32)
-        
+
         return obs
     
     def get_sac_action(self, obs: np.ndarray, probs: np.ndarray) -> Dict[str, Any]:
@@ -452,7 +518,8 @@ class DynamicPaperTrader:
             "pnl": pnl_dollars,
             "exit_reason": reason,
         })
-        
+
+        self.state.trades_this_candle += 1
         self.file_logger.info(f"EARLY EXIT ({reason}): {self.state.position_side} @ {exit_price:.3f} | PnL=${pnl_dollars:.2f}")
         console.print(f"\n[{'green' if pnl > 0 else 'red'}]Early Exit ({reason}): {self.state.position_side.upper()} @ {exit_price:.3f} | PnL=${pnl_dollars:+.2f}[/]")
         
@@ -465,13 +532,13 @@ class DynamicPaperTrader:
         """Execute a trade."""
         if self.state.position_side:
             return  # Already have position
-        
+
         action = decision.get("action", "hold")
         if action == "hold":
             return
-        
+
         size = decision.get("size", 0.20)
-        
+
         if action == "buy_yes":
             self.state.position_side = "yes"
             self.state.position_size = size
@@ -480,7 +547,8 @@ class DynamicPaperTrader:
             self.state.position_side = "no"
             self.state.position_size = size
             self.state.entry_price = no_price
-        
+
+        self.state.trades_this_candle += 1
         self.file_logger.info(f"TRADE: {action} size={size:.2f} price={self.state.entry_price:.3f}")
         console.print(f"[green]Trade executed: {action.upper()} @ {self.state.entry_price:.3f}[/green]")
     
@@ -621,9 +689,12 @@ class DynamicPaperTrader:
                         if self.state.candle_market:
                             console.print(f"\n[blue]New candle: {self.state.candle_market.get('slug')}[/blue]")
                             self.file_logger.info(f"NEW CANDLE: {self.state.candle_market.get('slug')}")
-                            
-                            # Reset BTC open price for new candle
+
+                            # Reset state for new candle
                             self.state.btc_open_price = None
+                            self.state.trades_this_candle = 0
+                            self.state.yes_price_history = []
+                            self.state.no_price_history = []
                     
                     # Fetch BTC data
                     btc_data = await self.fetch_btc_data()
@@ -666,15 +737,46 @@ class DynamicPaperTrader:
                             }
                             
                             # Get SAC action
-                            obs = self.build_observation(probs, yes_price)
+                            obs = self.build_observation(probs, yes_price, no_price)
                             sac_decision = self.get_sac_action(obs, probs)
                             
                             exit_signal = sac_decision.get("exit_signal", 0.0)
-                            
+
                             # Check for early exit if we have a position
-                            if self.state.position_side and exit_signal > 0.5:
-                                await self.early_exit(yes_price, no_price, reason="SAC exit_signal")
-                            
+                            if self.state.position_side:
+                                # === DYNAMIC EXIT THRESHOLD ===
+                                time_remaining = self.get_time_remaining()
+
+                                # Get current token price for our position
+                                if self.state.position_side == "yes":
+                                    current_token_price = yes_price
+                                else:
+                                    current_token_price = no_price
+
+                                # Base threshold
+                                dynamic_threshold = 0.5
+
+                                # In convergence zone (price > 0.85), raise exit threshold
+                                convergence_zone = 0.85
+                                if current_token_price > convergence_zone:
+                                    price_factor = (current_token_price - convergence_zone) / (1.0 - convergence_zone)
+                                    dynamic_threshold += 0.4 * price_factor
+                                elif current_token_price < (1.0 - convergence_zone):
+                                    dynamic_threshold -= 0.1
+
+                                # Near settlement with profit, lock exits
+                                # (simplified: assume profitable if price moved in our favor)
+                                if time_remaining < 0.2:
+                                    if self.state.position_side == "yes" and yes_price > self.state.entry_price:
+                                        time_lock = (0.2 - time_remaining) / 0.2
+                                        dynamic_threshold += 0.3 * time_lock
+                                    elif self.state.position_side == "no" and no_price > self.state.entry_price:
+                                        time_lock = (0.2 - time_remaining) / 0.2
+                                        dynamic_threshold += 0.3 * time_lock
+
+                                if exit_signal > dynamic_threshold:
+                                    await self.early_exit(yes_price, no_price, reason="SAC exit_signal")
+
                             # Execute trade if no position
                             elif not self.state.position_side and sac_decision["action"] != "hold":
                                 await self.execute_trade(sac_decision, yes_price, no_price)
