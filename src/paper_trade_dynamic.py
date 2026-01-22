@@ -4,12 +4,13 @@ Paper Trading with SAC Dynamic Model + Polymarket CLOB API.
 
 Uses:
 - Real-time BTC data from Binance
-- Real Polymarket YES/NO token prices from CLOB API
+- Real Polymarket YES/NO token prices from CLOB API (via SOCKS5 proxy)
 - SAC Dynamic model with VecNormalize
 """
 
 import asyncio
 import json
+import os
 import signal
 import sys
 from dataclasses import dataclass, field
@@ -28,6 +29,14 @@ from rich.table import Table
 from stable_baselines3 import SAC
 from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
 
+# Try to import SOCKS support
+try:
+    import httpx_socks
+    SOCKS_AVAILABLE = True
+except ImportError:
+    SOCKS_AVAILABLE = False
+    httpx_socks = None
+
 from src.simulation.deep_lob_dynamic_env import (
     DynamicTradingConfig,
     DeepLOBDynamicEnv,
@@ -39,6 +48,10 @@ from src.inference.deep_lob_inference import (
 
 logger = structlog.get_logger(__name__)
 console = Console()
+
+# SOCKS5 proxy configuration (via SSH tunnel)
+# To create the tunnel: ssh -D 1080 -N -f root@72.62.114.55
+SOCKS5_PROXY_URL = os.environ.get("SOCKS5_PROXY", "socks5://127.0.0.1:1080")
 
 
 @dataclass
@@ -93,19 +106,45 @@ class TradingState:
 
 
 class DynamicPaperTrader:
-    """Paper trader with Polymarket CLOB API integration."""
+    """Paper trader with Polymarket CLOB API integration via SOCKS5 proxy."""
     
     def __init__(self, config: Optional[PaperTradeConfig] = None):
         self.config = config or PaperTradeConfig()
         self.state = TradingState(balance=self.config.initial_balance)
         
-        self.client = httpx.AsyncClient(timeout=30)
+        # Binance client (direct connection)
+        self.binance_client = httpx.AsyncClient(timeout=30)
+        
+        # Polymarket client (via SOCKS5 proxy if available)
+        self.polymarket_client: Optional[httpx.AsyncClient] = None
+        
         self.sac_model: Optional[SAC] = None
         self.vec_normalize: Optional[VecNormalize] = None
         self.bot: Optional[DeepLOBTwoLayerBot] = None
         
         self._running = False
         self._setup_logging()
+    
+    async def _setup_polymarket_client(self):
+        """Setup Polymarket client with SOCKS5 proxy if available."""
+        if SOCKS_AVAILABLE and httpx_socks:
+            console.print(f"[green]Using SOCKS5 proxy: {SOCKS5_PROXY_URL}[/green]")
+            self.file_logger.info(f"Using SOCKS5 proxy: {SOCKS5_PROXY_URL}")
+            
+            transport = httpx_socks.AsyncProxyTransport.from_url(
+                SOCKS5_PROXY_URL,
+                rdns=True,  # Resolve DNS through proxy
+            )
+            self.polymarket_client = httpx.AsyncClient(
+                transport=transport,
+                timeout=httpx.Timeout(60.0),
+                follow_redirects=True,
+                verify=False,  # Skip SSL verification (proxy may have issues)
+            )
+        else:
+            console.print("[yellow]⚠ SOCKS5 proxy not available, using direct connection for Polymarket[/yellow]")
+            self.file_logger.warning("SOCKS5 proxy not available, using direct connection")
+            self.polymarket_client = httpx.AsyncClient(timeout=30)
     
     def _setup_logging(self):
         """Setup file logging."""
@@ -159,11 +198,11 @@ class DynamicPaperTrader:
         return (now // 900) * 900
     
     async def fetch_polymarket_candle(self, timestamp: int) -> Optional[Dict]:
-        """Fetch current BTC 15-min market from Polymarket."""
+        """Fetch current BTC 15-min market from Polymarket via SOCKS5 proxy."""
         slug = f"btc-updown-15m-{timestamp}"
         
         try:
-            response = await self.client.get(
+            response = await self.polymarket_client.get(
                 f"{self.config.polymarket_gamma_url}/events/slug/{slug}"
             )
             
@@ -208,9 +247,9 @@ class DynamicPaperTrader:
             return None
     
     async def fetch_btc_data(self, limit: int = 300) -> pd.DataFrame:
-        """Fetch BTC 1s klines from Binance."""
+        """Fetch BTC 1s klines from Binance (direct connection)."""
         try:
-            response = await self.client.get(
+            response = await self.binance_client.get(
                 f"{self.config.binance_url}/klines",
                 params={"symbol": "BTCUSDT", "interval": "1s", "limit": limit}
             )
@@ -419,6 +458,10 @@ class DynamicPaperTrader:
     async def run(self):
         """Main trading loop."""
         self._running = True
+        
+        # Setup Polymarket client with SOCKS5 proxy
+        await self._setup_polymarket_client()
+        
         self.load_models()
         
         console.print("\n[bold blue]Starting SAC Dynamic Paper Trading[/bold blue]")
@@ -497,7 +540,9 @@ class DynamicPaperTrader:
         except KeyboardInterrupt:
             console.print("\n[yellow]Stopping...[/yellow]")
         finally:
-            await self.client.aclose()
+            await self.binance_client.aclose()
+            if self.polymarket_client:
+                await self.polymarket_client.aclose()
             self._print_summary()
     
     def _print_summary(self):
