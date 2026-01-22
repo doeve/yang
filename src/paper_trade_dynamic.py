@@ -443,23 +443,39 @@ class DynamicPaperTrader:
         console.print(f"[green]Trade executed: {action.upper()} @ {self.state.entry_price:.3f}[/green]")
     
     async def settle_position(self, market: Dict):
-        """Settle position at candle end."""
+        """Settle position at candle end based on BTC price movement."""
         if not self.state.position_side:
             return
         
-        # Check if market is resolved
-        if not market.get("closed"):
+        if not self.state.btc_open_price or not self.state.btc_current_price:
+            console.print("[yellow]No BTC price data for settlement[/yellow]")
             return
         
-        # Get final prices
-        yes_price = market.get("yes_price", 0.5)
+        # Determine outcome based on BTC price movement
+        btc_move = self.state.btc_current_price - self.state.btc_open_price
+        up_won = btc_move > 0
         
         # Calculate PnL
+        # If we bought YES and Up won, we win (settle at 1.0)
+        # If we bought YES and Down won, we lose (settle at 0.0)
+        # If we bought NO and Down won, we win (settle at 1.0)
+        # If we bought NO and Up won, we lose (settle at 0.0)
+        
         if self.state.position_side == "yes":
-            settlement = yes_price
+            if up_won:
+                # YES wins - settle at 1.0
+                settlement = 1.0
+            else:
+                # YES loses - settle at 0.0
+                settlement = 0.0
             pnl = (settlement - self.state.entry_price) * self.state.position_size
-        else:
-            settlement = 1 - yes_price
+        else:  # NO position
+            if not up_won:
+                # NO wins - settle at 1.0
+                settlement = 1.0
+            else:
+                # NO loses - settle at 0.0
+                settlement = 0.0
             pnl = (settlement - self.state.entry_price) * self.state.position_size
         
         pnl_dollars = pnl * self.state.balance
@@ -475,10 +491,13 @@ class DynamicPaperTrader:
             "time": datetime.now(timezone.utc),
             "side": self.state.position_side,
             "pnl": pnl_dollars,
+            "btc_move": btc_move,
+            "up_won": up_won,
         })
         
-        self.file_logger.info(f"SETTLE: {self.state.position_side} PnL=${pnl_dollars:.2f}")
-        console.print(f"[{'green' if pnl > 0 else 'red'}]Settlement: ${pnl_dollars:+.2f}[/]")
+        outcome = "UP" if up_won else "DOWN"
+        self.file_logger.info(f"SETTLE: {self.state.position_side} -> {outcome} | BTC move: ${btc_move:.2f} | PnL=${pnl_dollars:.2f}")
+        console.print(f"\n[{'green' if pnl > 0 else 'red'}]Settlement: {self.state.position_side.upper()} -> {outcome} | PnL=${pnl_dollars:+.2f}[/]")
         
         # Clear position
         self.state.position_side = None
