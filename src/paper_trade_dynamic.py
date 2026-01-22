@@ -8,9 +8,15 @@ Uses:
 - SAC Dynamic model with VecNormalize
 """
 
+# Suppress NNPACK warning (must be before torch import)
+import os
+os.environ["PYTORCH_NNPACK_ENABLED"] = "0"
+
+import warnings
+warnings.filterwarnings("ignore", message=".*NNPACK.*")
+
 import asyncio
 import json
-import os
 import signal
 import sys
 from dataclasses import dataclass, field
