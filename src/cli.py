@@ -1409,6 +1409,48 @@ def collect_synchronized_data_cmd(
     ))
 
 
+@app.command("analyze-log")
+def analyze_log_cmd(
+    log_path: Optional[str] = typer.Argument(None, help="Path to log file (or directory)"),
+    log_dir: str = typer.Option("./logs/paper_trade", help="Directory to scan if no path given"),
+    latest: bool = typer.Option(True, help="Analyze only the latest log file"),
+):
+    """Analyze paper trade logs to identify inefficiencies.
+
+    Scans JSONL logs from paper trading sessions and identifies:
+    - High confidence trades that lose money
+    - Position churning (rapid entry/exit)
+    - Poor edge detection accuracy
+    - Missed opportunities
+    - SAC action analysis
+    """
+    from .log_analyzer import analyze_log, analyze_directory
+
+    if log_path:
+        # Analyze specific file
+        path = Path(log_path)
+        if path.is_dir():
+            analyze_directory(str(path))
+        else:
+            analyze_log(str(path))
+    elif latest:
+        # Find and analyze latest log
+        log_dir_path = Path(log_dir)
+        if not log_dir_path.exists():
+            console.print(f"[red]Directory not found: {log_dir}[/red]")
+            raise typer.Exit(1)
+
+        log_files = sorted(log_dir_path.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not log_files:
+            console.print(f"[yellow]No log files found in {log_dir}[/yellow]")
+            raise typer.Exit(1)
+
+        console.print(f"[blue]Analyzing latest log: {log_files[0].name}[/blue]")
+        analyze_log(str(log_files[0]))
+    else:
+        analyze_directory(log_dir)
+
+
 if __name__ == "__main__":
     app()
 
