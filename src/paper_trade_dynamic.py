@@ -15,6 +15,43 @@ os.environ["PYTORCH_NNPACK_ENABLED"] = "0"
 import warnings
 warnings.filterwarnings("ignore", message=".*NNPACK.*")
 
+# Context manager to suppress C-level stderr (for NNPACK warning)
+from contextlib import contextmanager
+import os
+import sys
+
+@contextmanager
+def suppress_stderr():
+    """Suppress stderr at the file descriptor level."""
+    try:
+        # Save original stderr fd
+        original_stderr_fd = sys.stderr.fileno()
+        saved_stderr_fd = os.dup(original_stderr_fd)
+        
+        # Open devnull
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        
+        # Replace stderr with devnull
+        os.dup2(devnull, original_stderr_fd)
+        os.close(devnull)
+        
+        yield
+    except Exception:
+        yield
+    finally:
+        # Restore stderr
+        try:
+            os.dup2(saved_stderr_fd, original_stderr_fd)
+            os.close(saved_stderr_fd)
+        except Exception:
+            pass
+
+# Import torch-dependent libraries with stderr suppressed
+with suppress_stderr():
+    import torch
+    # Re-apply env var just in case
+    os.environ["PYTORCH_NNPACK_ENABLED"] = "0"
+
 import asyncio
 import json
 import signal
@@ -32,8 +69,9 @@ from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
-from stable_baselines3 import SAC
-from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
+with suppress_stderr():
+    from stable_baselines3 import SAC
+    from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
 
 # Try to import SOCKS support
 try:
@@ -162,12 +200,13 @@ class DynamicPaperTrader:
             self.polymarket_client = httpx.AsyncClient(timeout=30)
     
     def _setup_logging(self):
-        """Setup file logging."""
+        """Setup file logging and suppress console output."""
         import logging
         import os
         
         os.makedirs(os.path.dirname(self.config.log_file), exist_ok=True)
         
+        # Configure standard logging to file only
         self.file_logger = logging.getLogger("paper_trade_dynamic")
         self.file_logger.setLevel(logging.DEBUG)
         self.file_logger.handlers.clear()
@@ -178,6 +217,22 @@ class DynamicPaperTrader:
         fh.setFormatter(formatter)
         self.file_logger.addHandler(fh)
         
+        # Suppress external libraries printing to console
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
+        
+        # Redirect structlog to file/null to prevent console interference
+        # We'll use the stanard logger we just removed handlers from? No.
+        # We need to configure structlog to NOT print to stdout.
+        import structlog
+        structlog.configure(
+            processors=[
+                structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S"),
+                structlog.processors.JSONRenderer()
+            ],
+            logger_factory=structlog.PrintLoggerFactory(file=open(self.config.log_file, "a")),
+        )
+
         self.file_logger.info("=" * 60)
         self.file_logger.info("PAPER TRADING SESSION STARTED")
         self.file_logger.info(f"SAC Model: {self.config.sac_model}")
@@ -621,43 +676,88 @@ class DynamicPaperTrader:
         self.state.entry_price = 0.0
     
     def build_display(self) -> Panel:
-        """Build display panel."""
-        table = Table(show_header=False, box=None)
-        table.add_column("Key", style="dim")
-        table.add_column("Value", style="bold")
+        """Build display panel with status and trades."""
+        # Main Grid: Left = Status, Right = Trades
+        grid = Table.grid(expand=True, padding=(0, 2))
+        grid.add_column(ratio=1)
+        grid.add_column(ratio=1)
+
+        # === LEFT PANEL: STATUS ===
+        status_table = Table(show_header=False, box=None, padding=(0, 1))
+        status_table.add_column("Key", style="dim")
+        status_table.add_column("Value", style="bold")
         
-        table.add_row("Balance", f"${self.state.balance:.2f}")
-        table.add_row("Total PnL", f"${self.state.total_pnl:+.2f}")
+        # Model Info
+        model_name = Path(self.config.sac_model).parent.name
+        status_table.add_row("Model", f"[cyan]{model_name}[/]")
+        status_table.add_row("", "")
+
+        status_table.add_row("Balance", f"${self.state.balance:.2f}")
+        status_table.add_row("Total PnL", f"${self.state.total_pnl:+.2f}")
         
         win_rate = self.state.wins / max(1, self.state.wins + self.state.losses)
-        table.add_row("Win Rate", f"{win_rate:.1%} ({self.state.wins}/{self.state.wins + self.state.losses})")
+        status_table.add_row("Win Rate", f"{win_rate:.1%} ({self.state.wins}/{self.state.wins + self.state.losses})")
         
-        table.add_row("", "")
-        table.add_row("Time Remaining", f"{int(self.get_time_remaining() * 15)}m")
+        status_table.add_row("", "")
+        status_table.add_row("Time Remaining", f"{int(self.get_time_remaining() * 15)}m")
         
         # BTC prices
         if self.state.btc_open_price and self.state.btc_current_price:
             btc_change = (self.state.btc_current_price - self.state.btc_open_price) / self.state.btc_open_price * 100
             btc_color = "green" if btc_change >= 0 else "red"
-            table.add_row("BTC Open", f"${self.state.btc_open_price:,.2f}")
-            table.add_row("BTC Current", f"${self.state.btc_current_price:,.2f} [{btc_color}]{btc_change:+.3f}%[/]")
+            status_table.add_row("BTC Open", f"${self.state.btc_open_price:,.2f}")
+            status_table.add_row("BTC Current", f"${self.state.btc_current_price:,.2f} [{btc_color}]{btc_change:+.3f}%[/]")
         
-        table.add_row("", "")
-        table.add_row("YES Price", f"{self.state.last_yes_price:.3f}")
-        table.add_row("NO Price", f"{self.state.last_no_price:.3f}")
+        status_table.add_row("", "")
+        status_table.add_row("YES Price", f"{self.state.last_yes_price:.3f}")
+        status_table.add_row("NO Price", f"{self.state.last_no_price:.3f}")
         
         if self.state.position_side:
-            table.add_row("", "")
+            status_table.add_row("", "")
             color = "green" if self.state.position_side == "yes" else "red"
-            table.add_row("Position", f"[{color}]{self.state.position_side.upper()}[/] @ {self.state.entry_price:.3f}")
-            bet_dollars = self.state.position_size * self.state.balance
-            table.add_row("Bet Amount", f"${bet_dollars:.2f} ({self.state.position_size:.0%})")
+            
+            # Position calculations
+            invested = self.state.position_size * self.state.balance
+            current_price = self.state.last_yes_price if self.state.position_side == "yes" else self.state.last_no_price
+            shares = invested / max(0.001, self.state.entry_price)
+            current_value = shares * current_price
+            unrealized_pnl = current_value - invested
+            unrealized_pnl_pct = (current_value / invested - 1.0) * 100
+            
+            status_table.add_row("Position", f"[{color}]{self.state.position_side.upper()}[/] @ {self.state.entry_price:.3f}")
+            status_table.add_row("Invested", f"${invested:.2f} ({self.state.position_size:.0%})")
+            status_table.add_row("Current Val", f"${current_value:.2f}")
+            
+            pnl_color = "green" if unrealized_pnl >= 0 else "red"
+            status_table.add_row("Unrealized PnL", f"[{pnl_color}]${unrealized_pnl:+.2f} ({unrealized_pnl_pct:+.1f}%)[/]")
         
         if self.state.last_probs:
-            table.add_row("", "")
-            table.add_row("Probs", f"↑{self.state.last_probs.get('up', 0):.0%} ↓{self.state.last_probs.get('down', 0):.0%}")
+            status_table.add_row("", "")
+            status_table.add_row("Probs", f"↑{self.state.last_probs.get('up', 0):.0%} ↓{self.state.last_probs.get('down', 0):.0%}")
         
-        return Panel(table, title="[bold blue]SAC Dynamic Paper Trading[/bold blue]", border_style="blue")
+        # === RIGHT PANEL: TRADES ===
+        trades_table = Table(title="Last Trades", box=None, padding=(0, 1))
+        trades_table.add_column("Time", style="dim", no_wrap=True)
+        trades_table.add_column("Side", justify="center")
+        trades_table.add_column("PnL", justify="right")
+        
+        # Show last 10 trades reverse order
+        for trade in reversed(self.state.trades[-10:]):
+            time_str = trade["time"].strftime("%H:%M")
+            side = trade["side"].upper()
+            side_color = "green" if side == "YES" else "red"
+            pnl = trade["pnl"]
+            pnl_color = "green" if pnl >= 0 else "red"
+            
+            trades_table.add_row(
+                time_str,
+                f"[{side_color}]{side}[/]",
+                f"[{pnl_color}]${pnl:+.2f}[/]"
+            )
+
+        grid.add_row(status_table, trades_table)
+        
+        return Panel(grid, title="[bold blue]SAC Dynamic Paper Trading[/bold blue]", border_style="blue")
     
     async def run(self):
         """Main trading loop."""
