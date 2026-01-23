@@ -75,8 +75,8 @@ class TokenTradingEnv(gym.Env):
     """
     Gymnasium environment for token-centric trading.
 
-    Observation Space (49 + 4 = 53 dimensions):
-    - Token features from TokenFeatureBuilder (49 dims)
+    Observation Space (51 + 4 = 55 dimensions):
+    - Token features from TokenFeatureBuilder (51 dims, includes EMA-smoothed momentum + non-linear BTC)
     - Position state (4 dims): has_position, position_side, position_pnl, steps_in_position
 
     Action Space (4 dimensions, continuous):

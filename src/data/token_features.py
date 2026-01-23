@@ -49,6 +49,9 @@ class TokenFeatureConfig:
     # Feature normalization
     clip_value: float = 5.0  # Clip normalized features
 
+    # EMA smoothing for momentum (reduces noise)
+    momentum_ema_alpha: float = 0.3  # Lower = more smoothing
+
 
 class TokenFeatureBuilder:
     """
@@ -71,6 +74,16 @@ class TokenFeatureBuilder:
             feature_dim=self.feature_dim,
             momentum_windows=self.config.momentum_windows,
         )
+
+    def _ema_smooth(self, prices: np.ndarray, alpha: float) -> np.ndarray:
+        """Apply exponential moving average smoothing to reduce noise."""
+        if len(prices) == 0:
+            return prices
+        ema = np.zeros_like(prices, dtype=np.float64)
+        ema[0] = prices[0]
+        for i in range(1, len(prices)):
+            ema[i] = alpha * prices[i] + (1 - alpha) * ema[i - 1]
+        return ema
 
     def _calculate_feature_dim(self):
         """Calculate total feature dimension."""
@@ -97,8 +110,8 @@ class TokenFeatureBuilder:
         # Relative value features (4)
         dim += 4  # edge_proxy, mispricing_signal, mean_reversion_signal, trend_strength
 
-        # BTC guidance features (6)
-        dim += 6  # btc_return, btc_momentum, btc_volatility, btc_direction, correlation_proxy, divergence
+        # BTC guidance features (8) - now includes regime_signal and btc_token_interaction
+        dim += 8  # btc_return, btc_momentum, btc_volatility, btc_direction, correlation_proxy, divergence, regime_signal, btc_token_interaction
 
         self.feature_dim = dim
 
@@ -139,10 +152,11 @@ class TokenFeatureBuilder:
         # Relative value
         names.extend(['edge_proxy', 'mispricing_signal', 'mean_reversion_signal', 'trend_strength'])
 
-        # BTC guidance
+        # BTC guidance (non-linear)
         names.extend([
             'btc_return', 'btc_momentum', 'btc_volatility',
-            'btc_direction', 'correlation_proxy', 'divergence'
+            'btc_direction', 'correlation_proxy', 'divergence',
+            'regime_signal', 'btc_token_interaction'
         ])
 
         return names
@@ -194,26 +208,36 @@ class TokenFeatureBuilder:
             yes_distance_0, yes_distance_1, price_sum_deviation
         ])
 
-        # === MOMENTUM FEATURES ===
+        # === MOMENTUM FEATURES (EMA-smoothed to reduce noise) ===
         for window in self.config.momentum_windows:
             if len(yes_prices) > window:
-                yes_momentum = (yes_prices[-1] - yes_prices[-window-1]) / (yes_prices[-window-1] + 1e-8)
-                no_momentum = (no_prices[-1] - no_prices[-window-1]) / (no_prices[-window-1] + 1e-8)
+                # Use EMA-smoothed prices for momentum calculation
+                alpha = self.config.momentum_ema_alpha
+                yes_ema = self._ema_smooth(yes_prices[-window-1:], alpha)
+                no_ema = self._ema_smooth(no_prices[-window-1:], alpha)
+
+                yes_momentum = (yes_ema[-1] - yes_ema[0]) / (yes_ema[0] + 1e-8)
+                no_momentum = (no_ema[-1] - no_ema[0]) / (no_ema[0] + 1e-8)
             else:
                 yes_momentum = 0.0
                 no_momentum = 0.0
             features.extend([yes_momentum * 100, no_momentum * 100])  # Scale for visibility
 
-        # === ACCELERATION FEATURES ===
+        # === ACCELERATION FEATURES (EMA-smoothed) ===
         for window in self.config.momentum_windows:
             half_window = window // 2
             if len(yes_prices) > window + half_window:
-                # Recent momentum
-                yes_mom_recent = yes_prices[-1] - yes_prices[-half_window-1]
-                no_mom_recent = no_prices[-1] - no_prices[-half_window-1]
+                # Use EMA-smoothed prices
+                alpha = self.config.momentum_ema_alpha
+                yes_ema = self._ema_smooth(yes_prices[-window-half_window-1:], alpha)
+                no_ema = self._ema_smooth(no_prices[-window-half_window-1:], alpha)
+
+                # Recent momentum (on smoothed data)
+                yes_mom_recent = yes_ema[-1] - yes_ema[-half_window-1]
+                no_mom_recent = no_ema[-1] - no_ema[-half_window-1]
                 # Previous momentum
-                yes_mom_prev = yes_prices[-half_window-1] - yes_prices[-window-1]
-                no_mom_prev = no_prices[-half_window-1] - no_prices[-window-1]
+                yes_mom_prev = yes_ema[-half_window-1] - yes_ema[0]
+                no_mom_prev = no_ema[-half_window-1] - no_ema[0]
                 # Acceleration = change in momentum
                 yes_accel = yes_mom_recent - yes_mom_prev
                 no_accel = no_mom_recent - no_mom_prev
@@ -308,14 +332,15 @@ class TokenFeatureBuilder:
 
         features.extend([edge_proxy, mispricing_signal, mean_reversion_signal, trend_strength * 2])
 
-        # === BTC GUIDANCE FEATURES ===
+        # === BTC GUIDANCE FEATURES (Non-linear) ===
         if btc_prices is not None and len(btc_prices) > 0 and btc_open is not None:
             btc_current = btc_prices[-1]
             btc_return = (btc_current - btc_open) / btc_open * 100  # Percentage
 
-            # BTC momentum
+            # BTC momentum (EMA-smoothed)
             if len(btc_prices) > 60:
-                btc_momentum = (btc_prices[-1] - btc_prices[-60]) / btc_prices[-60] * 100
+                btc_ema = self._ema_smooth(btc_prices[-61:], self.config.momentum_ema_alpha)
+                btc_momentum = (btc_ema[-1] - btc_ema[0]) / btc_ema[0] * 100
             else:
                 btc_momentum = 0.0
 
@@ -326,24 +351,47 @@ class TokenFeatureBuilder:
             else:
                 btc_volatility = 0.0
 
-            # BTC direction signal
-            btc_direction = 1.0 if btc_return > 0.05 else -1.0 if btc_return < -0.05 else 0.0
+            # NON-LINEAR BTC direction signal using tanh for smooth transitions
+            # This avoids the harsh 0.05% threshold and creates gradual signal
+            btc_direction = np.tanh(btc_return * 2)  # Smooth: -1 to +1
 
-            # Correlation proxy: does YES price track BTC?
+            # Non-linear correlation: Spearman rank correlation (more robust)
             if len(btc_prices) > 30 and len(yes_prices) > 30:
-                btc_norm = (btc_prices[-30:] - btc_prices[-30]) / (btc_prices[-30] + 1e-8)
-                yes_norm = (yes_prices[-30:] - yes_prices[-30]) / (yes_prices[-30] + 1e-8)
-                if np.std(btc_norm) > 0 and np.std(yes_norm) > 0:
-                    correlation_proxy = np.corrcoef(btc_norm, yes_norm)[0, 1]
-                else:
-                    correlation_proxy = 0.0
+                from scipy.stats import spearmanr
+                try:
+                    # Rank-based correlation is more robust to outliers
+                    correlation_proxy, _ = spearmanr(btc_prices[-30:], yes_prices[-30:])
+                    if np.isnan(correlation_proxy):
+                        correlation_proxy = 0.0
+                except:
+                    # Fallback to simple normalized correlation
+                    btc_norm = (btc_prices[-30:] - btc_prices[-30]) / (btc_prices[-30] + 1e-8)
+                    yes_norm = (yes_prices[-30:] - yes_prices[-30]) / (yes_prices[-30] + 1e-8)
+                    if np.std(btc_norm) > 0 and np.std(yes_norm) > 0:
+                        correlation_proxy = np.corrcoef(btc_norm, yes_norm)[0, 1]
+                    else:
+                        correlation_proxy = 0.0
             else:
                 correlation_proxy = 0.0
 
-            # Divergence: BTC says one thing, price says another
-            btc_implied = 0.5 + btc_return / 10  # Simple mapping
-            btc_implied = np.clip(btc_implied, 0.1, 0.9)
+            # Non-linear divergence using sigmoid mapping
+            # Maps BTC return to expected YES price with non-linear saturation
+            # Large BTC moves saturate near 0 or 1
+            btc_implied = 1.0 / (1.0 + np.exp(-btc_return * 0.5))  # Sigmoid mapping
             divergence = yes_price - btc_implied
+
+            # ADDITIONAL: Regime detection - is BTC trending or mean-reverting?
+            if len(btc_prices) > 60:
+                # Hurst-like metric: ratio of long-term to short-term volatility
+                short_vol = np.std(np.diff(btc_prices[-15:])) if len(btc_prices) > 15 else 0.001
+                long_vol = np.std(np.diff(btc_prices[-60:])) if len(btc_prices) > 60 else 0.001
+                regime_signal = np.tanh((long_vol / (short_vol + 1e-8) - 2) * 0.5)  # >0 = trending
+            else:
+                regime_signal = 0.0
+
+            # ADDITIONAL: BTC-Token interaction term
+            # Captures non-linear relationship between BTC move and token sensitivity
+            btc_token_interaction = btc_direction * (yes_price - 0.5) * 2
         else:
             btc_return = 0.0
             btc_momentum = 0.0
@@ -351,10 +399,13 @@ class TokenFeatureBuilder:
             btc_direction = 0.0
             correlation_proxy = 0.0
             divergence = 0.0
+            regime_signal = 0.0
+            btc_token_interaction = 0.0
 
         features.extend([
             btc_return, btc_momentum, btc_volatility,
-            btc_direction, correlation_proxy, divergence
+            btc_direction, correlation_proxy, divergence,
+            regime_signal, btc_token_interaction  # 2 new features
         ])
 
         # Convert to numpy and clip

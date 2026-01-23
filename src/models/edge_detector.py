@@ -40,7 +40,7 @@ class EdgeDetectorConfig:
     """Configuration for edge detector model."""
 
     # Architecture
-    input_dim: int = 49  # From TokenFeatureBuilder
+    input_dim: int = 51  # From TokenFeatureBuilder (49 + 2 new BTC features)
     hidden_dims: Tuple[int, ...] = (128, 64, 32)
     dropout: float = 0.3
     use_batch_norm: bool = True
@@ -53,6 +53,10 @@ class EdgeDetectorConfig:
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     focal_gamma: float = 2.0  # Focal loss focusing parameter
+
+    # Calibration
+    use_temperature_scaling: bool = True
+    initial_temperature: float = 1.5  # >1 reduces overconfidence
 
 
 class ResidualBlock(nn.Module):
@@ -119,6 +123,14 @@ class EdgeDetectorModel(nn.Module):
         self.classifier = nn.Linear(in_dim, self.config.num_classes)
         self.confidence = nn.Linear(in_dim, 1)  # Confidence estimation
 
+        # Temperature scaling for calibration (learnable)
+        if self.config.use_temperature_scaling:
+            self.temperature = nn.Parameter(
+                torch.tensor(self.config.initial_temperature)
+            )
+        else:
+            self.register_buffer('temperature', torch.tensor(1.0))
+
         # Initialize weights
         self._init_weights()
 
@@ -152,25 +164,38 @@ class EdgeDetectorModel(nn.Module):
                 - probs: Softmax probabilities (batch, 2)
                 - p_yes: P(YES wins) (batch,)
                 - confidence: Confidence score (batch,)
+                - calibrated_p_yes: Temperature-scaled P(YES wins)
         """
         # Encode features
         h = self.encoder(x)
 
         # Classification logits
         logits = self.classifier(h)
-        probs = F.softmax(logits, dim=-1)
+
+        # Apply temperature scaling for calibration
+        # Higher temperature -> softer probabilities (less overconfident)
+        temp = torch.clamp(self.temperature, min=0.1)  # Prevent division by near-zero
+        calibrated_logits = logits / temp
+
+        probs = F.softmax(calibrated_logits, dim=-1)
 
         # P(YES wins) = probability of class 1
         p_yes = probs[:, 1]
 
-        # Confidence (separate from probability)
-        confidence = torch.sigmoid(self.confidence(h)).squeeze(-1)
+        # Confidence: combine prediction certainty with learned confidence head
+        # Use calibrated probability distance from 0.5 as base
+        pred_certainty = torch.abs(p_yes - 0.5) * 2  # 0 at 0.5, 1 at 0 or 1
+        learned_conf = torch.sigmoid(self.confidence(h)).squeeze(-1)
+        # Blend: confidence should be LOW when prediction is uncertain
+        confidence = pred_certainty * learned_conf
 
         return {
             'logits': logits,
+            'calibrated_logits': calibrated_logits,
             'probs': probs,
             'p_yes': p_yes,
             'confidence': confidence,
+            'temperature': temp,
         }
 
     def predict_edge(

@@ -101,6 +101,9 @@ class TokenTradingState:
     position_side: Optional[str] = None  # "yes" or "no"
     position_size: float = 0.0
     entry_price: float = 0.0
+    entry_tick: int = 0  # Tick when position was entered (for min hold time)
+    highest_price_since_entry: float = 0.0  # For trailing stop
+    lowest_price_since_entry: float = 1.0  # For trailing stop
 
     # Market state
     last_yes_price: float = 0.5
@@ -113,8 +116,9 @@ class TokenTradingState:
     no_price_history: List[float] = field(default_factory=list)
     btc_price_history: List[float] = field(default_factory=list)
 
-    # Edge metrics
+    # Edge metrics (with EMA smoothing)
     current_edge: float = 0.0
+    ema_edge: float = 0.0  # EMA-smoothed edge for stable signals
     p_yes_estimate: float = 0.5
     confidence: float = 0.0
 
@@ -130,11 +134,21 @@ class TokenPaperTradeConfig:
     vec_normalize_path: str = "./logs/token_sac_v1/vecnormalize.pkl"
 
     initial_balance: float = 1000.0
-    position_size: float = 0.15  # 15% of balance per trade
+    base_position_size: float = 0.10  # Base 10% of balance per trade
+    max_position_size: float = 0.30  # Max 30% for high-edge opportunistic trades
 
     # Edge thresholds
     min_edge_to_trade: float = 0.05  # Only trade if |edge| > 5%
     min_confidence: float = 0.6  # Minimum confidence to trade
+    opportunistic_edge: float = 0.15  # Edge threshold for larger positions
+
+    # Risk management
+    stop_loss_pct: float = 0.20  # Exit if price drops 20% from entry
+    take_profit_pct: float = 0.40  # Exit if price rises 40% from entry
+    min_hold_ticks: int = 3  # Minimum ticks before allowing exit (prevents churning)
+
+    # EMA smoothing for edge signal
+    edge_ema_alpha: float = 0.4  # Smoothing factor (0.4 = moderate smoothing)
 
     # Polymarket API
     polymarket_api: str = "https://clob.polymarket.com"
@@ -255,6 +269,7 @@ class TokenPaperTrader:
             "edge_detector": {
                 "p_yes": edge_result.get("p_yes", 0.5),
                 "edge": edge_result.get("edge", 0.0),
+                "ema_edge": edge_result.get("ema_edge", 0.0),
                 "confidence": edge_result.get("confidence", 0.0),
             },
 
@@ -486,7 +501,7 @@ class TokenPaperTrader:
         return max(0.0, min(1.0, remaining_seconds / duration.total_seconds()))
 
     def compute_edge(self) -> tuple[Dict[str, float], np.ndarray]:
-        """Compute edge using edge detector.
+        """Compute edge using edge detector with EMA smoothing.
 
         Returns:
             Tuple of (edge_result_dict, features_array)
@@ -502,7 +517,7 @@ class TokenPaperTrader:
         )
 
         if self.edge_detector is None:
-            return {"edge": 0.0, "p_yes": 0.5, "confidence": 0.0}, features
+            return {"edge": 0.0, "ema_edge": 0.0, "p_yes": 0.5, "confidence": 0.0}, features
 
         # Get edge prediction
         features_tensor = torch.FloatTensor(features).unsqueeze(0)
@@ -511,8 +526,22 @@ class TokenPaperTrader:
             current_yes_price=self.state.last_yes_price,
         )
 
+        raw_edge = float(edge_result["edge"][0])
+
+        # Apply EMA smoothing to edge signal to reduce noise/reversals
+        alpha = self.config.edge_ema_alpha
+        if self.state.ema_edge == 0.0:
+            # Initialize EMA with first value
+            ema_edge = raw_edge
+        else:
+            ema_edge = alpha * raw_edge + (1 - alpha) * self.state.ema_edge
+
+        # Update state
+        self.state.ema_edge = ema_edge
+
         return {
-            "edge": float(edge_result["edge"][0]),
+            "edge": raw_edge,
+            "ema_edge": ema_edge,
             "p_yes": float(edge_result["p_yes"][0]),
             "confidence": float(edge_result["confidence"][0]),
         }, features
@@ -639,72 +668,176 @@ class TokenPaperTrader:
                 await asyncio.sleep(5)
 
     async def execute_trading_logic(self, edge: Dict, action: Dict):
-        """Execute trading based on edge and SAC action."""
+        """Execute trading based on edge and SAC action with risk management."""
         # Check for position exit
         if self.state.position_side:
+            current_price = (
+                self.state.last_yes_price if self.state.position_side == "yes"
+                else self.state.last_no_price
+            )
+
+            # Update price extremes for tracking
+            self.state.highest_price_since_entry = max(
+                self.state.highest_price_since_entry, current_price
+            )
+            self.state.lowest_price_since_entry = min(
+                self.state.lowest_price_since_entry, current_price
+            )
+
             should_exit = False
+            exit_reason = ""
 
-            # SAC exit signal
-            if action["exit_signal"] > 0.5:
-                should_exit = True
+            # Check minimum hold time (prevents churning)
+            ticks_held = self._tick_count - self.state.entry_tick
+            can_exit = ticks_held >= self.config.min_hold_ticks
 
-            # Time-based exit (near settlement)
+            if can_exit:
+                # STOP-LOSS: Exit if price dropped too much from entry
+                price_change = (current_price - self.state.entry_price) / self.state.entry_price
+                if price_change < -self.config.stop_loss_pct:
+                    should_exit = True
+                    exit_reason = "stop_loss"
+
+                # TAKE-PROFIT: Exit if price rose enough from entry
+                if price_change > self.config.take_profit_pct:
+                    should_exit = True
+                    exit_reason = "take_profit"
+
+                # EDGE REVERSAL: Exit if EMA edge flipped against our position
+                # If we're long YES and ema_edge is now significantly negative
+                if self.state.position_side == "yes" and edge["ema_edge"] < -0.05:
+                    should_exit = True
+                    exit_reason = "edge_reversal"
+                elif self.state.position_side == "no" and edge["ema_edge"] > 0.05:
+                    should_exit = True
+                    exit_reason = "edge_reversal"
+
+                # SAC exit signal (use smoothed edge confirmation)
+                if action["exit_signal"] > 0.5:
+                    should_exit = True
+                    exit_reason = "sac_signal"
+
+            # Time-based exit (near settlement) - override min hold time
             if self.get_time_remaining() < 0.05:
                 should_exit = True
+                exit_reason = "time_expiry"
 
             if should_exit:
-                self.execute_exit()
+                self.execute_exit(reason=exit_reason)
                 return
 
         # Check for entry
         if self.state.position_side is None:
-            # SAC says don't trade
-            if action["hold_prob"] > 0.5:
+            # SAC says don't trade (but respect high edge opportunities)
+            ema_edge_abs = abs(edge["ema_edge"])
+            is_opportunistic = ema_edge_abs >= self.config.opportunistic_edge
+
+            if action["hold_prob"] > 0.5 and not is_opportunistic:
                 return
 
-            # Check edge threshold
-            if abs(edge["edge"]) < self.config.min_edge_to_trade:
+            # Check edge threshold (use EMA-smoothed edge for stability)
+            if ema_edge_abs < self.config.min_edge_to_trade:
                 return
 
             # Check confidence
             if edge["confidence"] < self.config.min_confidence:
                 return
 
-            # Determine direction based on edge
-            if edge["edge"] > 0:
+            # Calculate position size based on edge magnitude and SAC size output
+            position_size = self._calculate_position_size(edge, action)
+
+            # Determine direction based on EMA-smoothed edge
+            if edge["ema_edge"] > 0:
                 # YES is underpriced, buy YES
-                self.execute_entry("yes")
+                self.execute_entry("yes", position_size, action)
             else:
                 # NO is underpriced, buy NO
-                self.execute_entry("no")
+                self.execute_entry("no", position_size, action)
 
-    def execute_entry(self, side: str):
-        """Execute position entry."""
+    def _calculate_position_size(self, edge: Dict, action: Dict) -> float:
+        """Calculate position size based on edge, confidence, and SAC output.
+
+        Uses Kelly-inspired sizing:
+        - Base size scales with edge magnitude
+        - SAC size output modulates the final size
+        - Opportunistic trades get larger allocations
+        """
+        ema_edge_abs = abs(edge["ema_edge"])
+        confidence = edge["confidence"]
+
+        # Base size from edge magnitude (linear scaling)
+        # At min_edge (0.05), use base_position_size
+        # At opportunistic_edge (0.15), use max_position_size
+        edge_range = self.config.opportunistic_edge - self.config.min_edge_to_trade
+        edge_normalized = (ema_edge_abs - self.config.min_edge_to_trade) / edge_range
+        edge_normalized = np.clip(edge_normalized, 0, 1)
+
+        base_size = (
+            self.config.base_position_size +
+            edge_normalized * (self.config.max_position_size - self.config.base_position_size)
+        )
+
+        # Modulate by confidence (higher confidence = fuller size)
+        confidence_factor = 0.5 + 0.5 * confidence  # Range: 0.5 to 1.0
+
+        # Use SAC size output as additional modulation
+        sac_size = np.clip(action["size"], 0.3, 1.0)  # Don't let SAC reduce too much
+
+        # Final position size
+        position_size = base_size * confidence_factor * sac_size
+
+        # Clamp to bounds
+        position_size = np.clip(
+            position_size,
+            self.config.base_position_size * 0.5,  # Min: half of base
+            self.config.max_position_size
+        )
+
+        return float(position_size)
+
+    def execute_entry(self, side: str, position_size: float = None, action: Dict = None):
+        """Execute position entry with dynamic position sizing."""
         price = self.state.last_yes_price if side == "yes" else self.state.last_no_price
-        size = self.config.position_size
+
+        # Use provided position size or fall back to base
+        size = position_size if position_size is not None else self.config.base_position_size
 
         self.state.position_side = side
         self.state.position_size = size
         self.state.entry_price = price
+        self.state.entry_tick = self._tick_count
+        self.state.highest_price_since_entry = price
+        self.state.lowest_price_since_entry = price
 
-        console.print(f"[green]ENTRY: {side.upper()} @ {price:.3f} (edge={self.state.current_edge:+.1%})[/green]")
+        # Calculate dollar amount for display
+        dollar_size = size * self.state.balance
+
+        console.print(
+            f"[green]ENTRY: {side.upper()} @ {price:.3f} | "
+            f"Size={size:.1%} (${dollar_size:.0f}) | "
+            f"Edge={self.state.ema_edge:+.1%}[/green]"
+        )
 
         # Log trade
         self._log_trade("entry", {
             "side": side,
             "price": price,
             "size": size,
+            "dollar_size": dollar_size,
             "edge": self.state.current_edge,
+            "ema_edge": self.state.ema_edge,
             "p_yes": self.state.p_yes_estimate,
             "confidence": self.state.confidence,
             "yes_price": self.state.last_yes_price,
             "no_price": self.state.last_no_price,
             "btc_price": self.state.btc_current_price,
             "time_remaining": self.get_time_remaining(),
+            "sac_size": action.get("size", 0) if action else 0,
+            "sac_direction": action.get("direction", 0) if action else 0,
         })
 
-    def execute_exit(self):
-        """Execute position exit."""
+    def execute_exit(self, reason: str = "manual"):
+        """Execute position exit with reason tracking."""
         if self.state.position_side is None:
             return
 
@@ -717,6 +850,9 @@ class TokenPaperTrader:
         shares = invested / entry_price
         exit_value = shares * current_price
         pnl = exit_value - invested
+
+        # Calculate hold duration
+        ticks_held = self._tick_count - self.state.entry_tick
 
         # Update state
         self.state.balance += pnl
@@ -734,9 +870,24 @@ class TokenPaperTrader:
             "entry": entry_price,
             "exit": current_price,
             "pnl": pnl,
+            "reason": reason,
+            "ticks_held": ticks_held,
         })
 
-        console.print(f"[{'green' if pnl > 0 else 'red'}]EXIT: {side.upper()} @ {current_price:.3f} | PnL=${pnl:+.2f}[/]")
+        # Color-coded output with reason
+        pnl_color = 'green' if pnl > 0 else 'red'
+        reason_emoji = {
+            "stop_loss": "[red]SL[/red]",
+            "take_profit": "[green]TP[/green]",
+            "edge_reversal": "[yellow]ER[/yellow]",
+            "sac_signal": "[blue]SAC[/blue]",
+            "time_expiry": "[magenta]TIME[/magenta]",
+        }.get(reason, reason)
+
+        console.print(
+            f"[{pnl_color}]EXIT: {side.upper()} @ {current_price:.3f} | "
+            f"PnL=${pnl:+.2f} | {reason_emoji} | Held {ticks_held} ticks[/]"
+        )
 
         # Log trade
         self._log_trade("exit", {
@@ -748,14 +899,22 @@ class TokenPaperTrader:
             "shares": shares,
             "exit_value": exit_value,
             "edge_at_exit": self.state.current_edge,
+            "ema_edge_at_exit": self.state.ema_edge,
             "time_remaining": self.get_time_remaining(),
             "balance_after": self.state.balance,
+            "reason": reason,
+            "ticks_held": ticks_held,
+            "highest_price": self.state.highest_price_since_entry,
+            "lowest_price": self.state.lowest_price_since_entry,
         })
 
         # Clear position
         self.state.position_side = None
         self.state.position_size = 0.0
         self.state.entry_price = 0.0
+        self.state.entry_tick = 0
+        self.state.highest_price_since_entry = 0.0
+        self.state.lowest_price_since_entry = 1.0
 
     def settle_position(self):
         """Settle position at candle end based on BTC price movement."""
@@ -825,7 +984,8 @@ class TokenPaperTrader:
         table.add_column("Value", style="bold")
 
         table.add_row("Balance", f"${self.state.balance:.2f}")
-        table.add_row("Total PnL", f"${self.state.total_pnl:+.2f}")
+        pnl_color = "green" if self.state.total_pnl >= 0 else "red"
+        table.add_row("Total PnL", f"[{pnl_color}]${self.state.total_pnl:+.2f}[/]")
 
         win_rate = self.state.wins / max(1, self.state.wins + self.state.losses)
         table.add_row("Win Rate", f"{win_rate:.1%} ({self.state.wins}/{self.state.wins + self.state.losses})")
@@ -833,19 +993,41 @@ class TokenPaperTrader:
         table.add_row("", "")
         table.add_row("YES Price", f"{self.state.last_yes_price:.3f}")
         table.add_row("NO Price", f"{self.state.last_no_price:.3f}")
+        table.add_row("Time Left", f"{self.get_time_remaining():.1%}")
 
         table.add_row("", "")
-        edge_color = "green" if self.state.current_edge > 0 else "red" if self.state.current_edge < 0 else "white"
-        table.add_row("Edge", f"[{edge_color}]{self.state.current_edge:+.1%}[/]")
+        edge_color = "green" if self.state.ema_edge > 0 else "red" if self.state.ema_edge < 0 else "white"
+        table.add_row("Raw Edge", f"{self.state.current_edge:+.1%}")
+        table.add_row("EMA Edge", f"[{edge_color}]{self.state.ema_edge:+.1%}[/]")
         table.add_row("P(YES wins)", f"{self.state.p_yes_estimate:.1%}")
         table.add_row("Confidence", f"{self.state.confidence:.1%}")
 
         if self.state.position_side:
             table.add_row("", "")
             color = "green" if self.state.position_side == "yes" else "red"
-            table.add_row("Position", f"[{color}]{self.state.position_side.upper()}[/] @ {self.state.entry_price:.3f}")
+            current_price = (
+                self.state.last_yes_price if self.state.position_side == "yes"
+                else self.state.last_no_price
+            )
+            unrealized_pnl = (current_price - self.state.entry_price) / self.state.entry_price
+            pnl_color = "green" if unrealized_pnl > 0 else "red"
 
-        return Panel(table, title="[bold blue]Token-Centric Paper Trading[/bold blue]", border_style="blue")
+            table.add_row(
+                "Position",
+                f"[{color}]{self.state.position_side.upper()}[/] @ {self.state.entry_price:.3f}"
+            )
+            table.add_row("Size", f"{self.state.position_size:.1%}")
+            table.add_row("Unrealized", f"[{pnl_color}]{unrealized_pnl:+.1%}[/]")
+            table.add_row("Ticks Held", f"{self._tick_count - self.state.entry_tick}")
+
+            # Show stop-loss/take-profit levels
+            table.add_row(
+                "SL/TP",
+                f"SL: {self.state.entry_price * (1 - self.config.stop_loss_pct):.3f} | "
+                f"TP: {self.state.entry_price * (1 + self.config.take_profit_pct):.3f}"
+            )
+
+        return Panel(table, title="[bold blue]Token-Centric Paper Trading v2[/bold blue]", border_style="blue")
 
     async def run(self):
         """Run paper trading with live display."""

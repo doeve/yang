@@ -191,7 +191,8 @@ def train_sac_policy(
 
     console.print("[bold green]Starting SAC training...[/bold green]")
     console.print(f"  Action Space: 4D [direction, size, hold, exit]")
-    console.print(f"  Observation Space: 53D (token features + position state)")
+    console.print(f"  Observation Space: 55D (51 token features + 4 position state)")
+    console.print(f"  Features: EMA-smoothed momentum, non-linear BTC correlation")
     console.print()
 
     # Train

@@ -32,12 +32,16 @@ class Trade:
     invested: float
     edge_at_entry: float
     edge_at_exit: float
-    p_yes_at_entry: float
-    confidence_at_entry: float
-    time_remaining_at_entry: float
-    time_remaining_at_exit: float
-    btc_price_entry: float
-    btc_price_exit: float
+    ema_edge_at_entry: float = 0.0
+    ema_edge_at_exit: float = 0.0
+    p_yes_at_entry: float = 0.5
+    confidence_at_entry: float = 0.0
+    time_remaining_at_entry: float = 0.5
+    time_remaining_at_exit: float = 0.0
+    btc_price_entry: float = 0.0
+    btc_price_exit: float = 0.0
+    exit_reason: str = "unknown"
+    position_size: float = 0.15
     hold_duration_ticks: int = field(init=False)
 
     def __post_init__(self):
@@ -109,14 +113,18 @@ def parse_log(log_path: Path) -> LogAnalysis:
                 exit_price=event["exit_price"],
                 pnl=event["pnl"],
                 invested=event["invested"],
-                edge_at_entry=pending_entry["edge"],
-                edge_at_exit=event["edge_at_exit"],
-                p_yes_at_entry=pending_entry["p_yes"],
-                confidence_at_entry=pending_entry["confidence"],
-                time_remaining_at_entry=pending_entry["time_remaining"],
-                time_remaining_at_exit=event["time_remaining"],
-                btc_price_entry=pending_entry["btc_price"],
+                edge_at_entry=pending_entry.get("edge", 0),
+                edge_at_exit=event.get("edge_at_exit", 0),
+                ema_edge_at_entry=pending_entry.get("ema_edge", pending_entry.get("edge", 0)),
+                ema_edge_at_exit=event.get("ema_edge_at_exit", event.get("edge_at_exit", 0)),
+                p_yes_at_entry=pending_entry.get("p_yes", 0.5),
+                confidence_at_entry=pending_entry.get("confidence", 0),
+                time_remaining_at_entry=pending_entry.get("time_remaining", 0.5),
+                time_remaining_at_exit=event.get("time_remaining", 0),
+                btc_price_entry=pending_entry.get("btc_price", 0),
                 btc_price_exit=entry_tick_data.get("market", {}).get("btc_price", 0) if entry_tick_data else 0,
+                exit_reason=event.get("reason", "unknown"),
+                position_size=pending_entry.get("size", 0.15),
             ))
             pending_entry = None
 
@@ -358,6 +366,44 @@ def analyze_inefficiencies(analysis: LogAnalysis) -> list[dict]:
             "recommendation": "Check min_edge_to_trade and min_confidence thresholds.",
         })
 
+    # 11. Exit reason analysis
+    exit_reasons = {}
+    for t in analysis.trades:
+        reason = t.exit_reason
+        if reason not in exit_reasons:
+            exit_reasons[reason] = {"count": 0, "total_pnl": 0.0}
+        exit_reasons[reason]["count"] += 1
+        exit_reasons[reason]["total_pnl"] += t.pnl
+
+    if exit_reasons:
+        inefficiencies.append({
+            "type": "EXIT_REASON_BREAKDOWN",
+            "severity": "info",
+            "description": "Trade exit reasons breakdown",
+            "details": [
+                {
+                    "reason": reason,
+                    "count": data["count"],
+                    "total_pnl": f"${data['total_pnl']:.2f}",
+                    "avg_pnl": f"${data['total_pnl'] / data['count']:.2f}",
+                }
+                for reason, data in sorted(exit_reasons.items(), key=lambda x: x[1]["count"], reverse=True)
+            ],
+        })
+
+    # 12. Position size utilization
+    if analysis.trades:
+        sizes = [t.position_size for t in analysis.trades]
+        avg_size = sum(sizes) / len(sizes)
+        if avg_size < 0.12:
+            inefficiencies.append({
+                "type": "UNDERUTILIZED_CAPITAL",
+                "severity": "medium",
+                "description": f"Average position size is only {avg_size:.1%}",
+                "impact": "Capital efficiency may be low",
+                "recommendation": "Consider increasing base_position_size for higher edge trades.",
+            })
+
     analysis.inefficiencies = inefficiencies
     return inefficiencies
 
@@ -435,26 +481,37 @@ def print_analysis(analysis: LogAnalysis, console: Console):
     if analysis.trades:
         console.print("[bold]Trade Details[/bold]")
         trade_table = Table(show_header=True)
-        trade_table.add_column("Entry Tick", style="cyan")
+        trade_table.add_column("Entry", style="cyan")
         trade_table.add_column("Side", style="blue")
         trade_table.add_column("Hold", style="dim")
+        trade_table.add_column("Size", style="dim")
         trade_table.add_column("Entry $", style="white")
         trade_table.add_column("Exit $", style="white")
         trade_table.add_column("PnL", style="white")
-        trade_table.add_column("Edge", style="dim")
-        trade_table.add_column("Conf", style="dim")
+        trade_table.add_column("EMA Edge", style="dim")
+        trade_table.add_column("Reason", style="yellow")
 
         for t in analysis.trades:
             pnl_color = "green" if t.pnl > 0 else ("red" if t.pnl < 0 else "white")
+            reason_short = {
+                "stop_loss": "SL",
+                "take_profit": "TP",
+                "edge_reversal": "ER",
+                "sac_signal": "SAC",
+                "time_expiry": "TIME",
+                "unknown": "?",
+            }.get(t.exit_reason, t.exit_reason[:4])
+
             trade_table.add_row(
                 str(t.entry_tick),
                 t.side.upper(),
                 str(t.hold_duration_ticks),
+                f"{t.position_size:.0%}",
                 f"{t.entry_price:.3f}",
                 f"{t.exit_price:.3f}",
                 f"[{pnl_color}]${t.pnl:.2f}[/{pnl_color}]",
-                f"{t.edge_at_entry:.3f}",
-                f"{t.confidence_at_entry:.1%}",
+                f"{t.ema_edge_at_entry:+.3f}",
+                reason_short,
             )
 
         console.print(trade_table)
