@@ -47,6 +47,7 @@ with suppress_stderr():
 
 import asyncio
 import argparse
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -142,6 +143,10 @@ class TokenPaperTradeConfig:
     # Refresh interval
     refresh_seconds: int = 5
 
+    # Logging
+    log_dir: str = "./logs/paper_trade"
+    enable_ml_logging: bool = True
+
 
 class TokenPaperTrader:
     """Paper trader using token-centric approach."""
@@ -163,6 +168,173 @@ class TokenPaperTrader:
         # Candle tracking
         self.current_candle_start: Optional[datetime] = None
         self._running = False
+
+        # ML logging
+        self.ml_log_file: Optional[Path] = None
+        self.ml_log_handle = None
+        self._tick_count = 0
+
+    def _get_model_name(self) -> str:
+        """Extract model name from config paths."""
+        # Try edge detector path first
+        edge_path = Path(self.config.edge_detector_path)
+        if edge_path.exists():
+            return edge_path.name
+
+        # Fallback to SAC model path
+        sac_path = Path(self.config.sac_model_path)
+        if sac_path.exists():
+            return sac_path.stem  # e.g. "final_model" from "final_model.zip"
+
+        # Default
+        return "unknown_model"
+
+    def _setup_ml_logging(self):
+        """Initialize ML logging file."""
+        if not self.config.enable_ml_logging:
+            return
+
+        log_dir = Path(self.config.log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        model_name = self._get_model_name()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.ml_log_file = log_dir / f"{model_name}_{timestamp}.jsonl"
+
+        self.ml_log_handle = open(self.ml_log_file, 'w')
+        console.print(f"[blue]ML logging to: {self.ml_log_file}[/blue]")
+
+        # Write header/metadata
+        metadata = {
+            "type": "metadata",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "model_name": model_name,
+            "edge_detector_path": self.config.edge_detector_path,
+            "sac_model_path": self.config.sac_model_path,
+            "config": {
+                "initial_balance": self.config.initial_balance,
+                "position_size": self.config.position_size,
+                "min_edge_to_trade": self.config.min_edge_to_trade,
+                "min_confidence": self.config.min_confidence,
+            }
+        }
+        self.ml_log_handle.write(json.dumps(metadata) + "\n")
+        self.ml_log_handle.flush()
+
+    def _log_ml_tick(
+        self,
+        features: np.ndarray,
+        edge_result: Dict[str, float],
+        sac_action: Dict[str, float],
+    ):
+        """Log ML predictions and features for a single tick."""
+        if not self.config.enable_ml_logging or self.ml_log_handle is None:
+            return
+
+        self._tick_count += 1
+
+        # Build comprehensive log entry
+        log_entry = {
+            "type": "tick",
+            "tick": self._tick_count,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "candle_ts": self.state.current_candle_ts,
+            "time_remaining": self.get_time_remaining(),
+
+            # Market State
+            "market": {
+                "yes_price": self.state.last_yes_price,
+                "no_price": self.state.last_no_price,
+                "btc_price": self.state.btc_current_price,
+                "btc_open": self.state.btc_open_price,
+                "yes_history_len": len(self.state.yes_price_history),
+                "no_history_len": len(self.state.no_price_history),
+            },
+
+            # Edge Detector Output
+            "edge_detector": {
+                "p_yes": edge_result.get("p_yes", 0.5),
+                "edge": edge_result.get("edge", 0.0),
+                "confidence": edge_result.get("confidence", 0.0),
+            },
+
+            # SAC Policy Output
+            "sac_action": {
+                "direction": sac_action.get("direction", 0.0),
+                "size": sac_action.get("size", 0.0),
+                "hold_prob": sac_action.get("hold_prob", 1.0),
+                "exit_signal": sac_action.get("exit_signal", 0.0),
+            },
+
+            # Position State
+            "position": {
+                "side": self.state.position_side,
+                "size": self.state.position_size,
+                "entry_price": self.state.entry_price,
+            },
+
+            # Account State
+            "account": {
+                "balance": self.state.balance,
+                "total_pnl": self.state.total_pnl,
+                "wins": self.state.wins,
+                "losses": self.state.losses,
+            },
+
+            # Feature Engineering (49-dim vector)
+            "features": {
+                "raw": features.tolist(),
+                "feature_dim": len(features),
+                # Named feature groups (based on TokenFeatureBuilder)
+                "price_state": features[:7].tolist() if len(features) >= 7 else [],
+                "momentum": features[7:23].tolist() if len(features) >= 23 else [],
+                "volatility": features[23:29].tolist() if len(features) >= 29 else [],
+                "convergence": features[29:35].tolist() if len(features) >= 35 else [],
+                "time_features": features[35:39].tolist() if len(features) >= 39 else [],
+                "relative_value": features[39:43].tolist() if len(features) >= 43 else [],
+                "btc_guidance": features[43:49].tolist() if len(features) >= 49 else [],
+            },
+        }
+
+        self.ml_log_handle.write(json.dumps(log_entry) + "\n")
+
+        # Flush periodically
+        if self._tick_count % 10 == 0:
+            self.ml_log_handle.flush()
+
+    def _log_trade(self, action: str, details: Dict[str, Any]):
+        """Log trade events."""
+        if not self.config.enable_ml_logging or self.ml_log_handle is None:
+            return
+
+        log_entry = {
+            "type": "trade",
+            "action": action,  # "entry", "exit", "settlement"
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "tick": self._tick_count,
+            **details
+        }
+
+        self.ml_log_handle.write(json.dumps(log_entry) + "\n")
+        self.ml_log_handle.flush()
+
+    def _close_ml_logging(self):
+        """Close ML logging file."""
+        if self.ml_log_handle:
+            # Write summary
+            summary = {
+                "type": "summary",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "total_ticks": self._tick_count,
+                "final_balance": self.state.balance,
+                "total_pnl": self.state.total_pnl,
+                "wins": self.state.wins,
+                "losses": self.state.losses,
+                "total_trades": len(self.state.trades),
+            }
+            self.ml_log_handle.write(json.dumps(summary) + "\n")
+            self.ml_log_handle.close()
+            console.print(f"[green]ML log saved: {self.ml_log_file}[/green]")
 
     def load_models(self):
         """Load edge detector and SAC models."""
@@ -313,11 +485,12 @@ class TokenPaperTrader:
         
         return max(0.0, min(1.0, remaining_seconds / duration.total_seconds()))
 
-    def compute_edge(self) -> Dict[str, float]:
-        """Compute edge using edge detector."""
-        if self.edge_detector is None:
-            return {"edge": 0.0, "p_yes": 0.5, "confidence": 0.0}
+    def compute_edge(self) -> tuple[Dict[str, float], np.ndarray]:
+        """Compute edge using edge detector.
 
+        Returns:
+            Tuple of (edge_result_dict, features_array)
+        """
         # Build features
         time_remaining = self.get_time_remaining()
         features = self.feature_builder.compute_features(
@@ -327,6 +500,9 @@ class TokenPaperTrader:
             btc_prices=np.array(self.state.btc_price_history[-300:] or [100000]),
             btc_open=self.state.btc_open_price,
         )
+
+        if self.edge_detector is None:
+            return {"edge": 0.0, "p_yes": 0.5, "confidence": 0.0}, features
 
         # Get edge prediction
         features_tensor = torch.FloatTensor(features).unsqueeze(0)
@@ -339,7 +515,7 @@ class TokenPaperTrader:
             "edge": float(edge_result["edge"][0]),
             "p_yes": float(edge_result["p_yes"][0]),
             "confidence": float(edge_result["confidence"][0]),
-        }
+        }, features
 
     def get_sac_action(self) -> Dict[str, float]:
         """Get action from SAC policy."""
@@ -435,13 +611,16 @@ class TokenPaperTrader:
                         self.current_candle_start = datetime.now(timezone.utc)
 
                 # Compute edge
-                edge_result = self.compute_edge()
+                edge_result, features = self.compute_edge()
                 self.state.current_edge = edge_result["edge"]
                 self.state.p_yes_estimate = edge_result["p_yes"]
                 self.state.confidence = edge_result["confidence"]
 
                 # Get SAC action
                 sac_action = self.get_sac_action()
+
+                # Log ML data
+                self._log_ml_tick(features, edge_result, sac_action)
 
                 # Execute trading logic
                 await self.execute_trading_logic(edge_result, sac_action)
@@ -510,6 +689,20 @@ class TokenPaperTrader:
 
         console.print(f"[green]ENTRY: {side.upper()} @ {price:.3f} (edge={self.state.current_edge:+.1%})[/green]")
 
+        # Log trade
+        self._log_trade("entry", {
+            "side": side,
+            "price": price,
+            "size": size,
+            "edge": self.state.current_edge,
+            "p_yes": self.state.p_yes_estimate,
+            "confidence": self.state.confidence,
+            "yes_price": self.state.last_yes_price,
+            "no_price": self.state.last_no_price,
+            "btc_price": self.state.btc_current_price,
+            "time_remaining": self.get_time_remaining(),
+        })
+
     def execute_exit(self):
         """Execute position exit."""
         if self.state.position_side is None:
@@ -545,6 +738,20 @@ class TokenPaperTrader:
 
         console.print(f"[{'green' if pnl > 0 else 'red'}]EXIT: {side.upper()} @ {current_price:.3f} | PnL=${pnl:+.2f}[/]")
 
+        # Log trade
+        self._log_trade("exit", {
+            "side": side,
+            "entry_price": entry_price,
+            "exit_price": current_price,
+            "pnl": pnl,
+            "invested": invested,
+            "shares": shares,
+            "exit_value": exit_value,
+            "edge_at_exit": self.state.current_edge,
+            "time_remaining": self.get_time_remaining(),
+            "balance_after": self.state.balance,
+        })
+
         # Clear position
         self.state.position_side = None
         self.state.position_size = 0.0
@@ -562,7 +769,7 @@ class TokenPaperTrader:
         # Determine if UP won or DOWN won
         btc_move = self.state.btc_current_price - self.state.btc_open_price
         up_won = btc_move > 0
-        
+
         # Calculate Payout (1.0 for win, 0.0 for loss)
         payout = 0.0
         if self.state.position_side == "yes":
@@ -574,7 +781,7 @@ class TokenPaperTrader:
         invested = self.state.position_size * self.state.balance
         # Shares = Invested / Entry Price
         shares = invested / self.state.entry_price
-        
+
         # Return = Shares * Payout
         returned_capital = shares * payout
         pnl = returned_capital - invested
@@ -589,6 +796,22 @@ class TokenPaperTrader:
             self.state.losses += 1
 
         console.print(f"[bold purple]SETTLEMENT:[/bold purple] {self.state.position_side.upper()} -> {'WIN' if pnl > 0 else 'LOSS'} | PnL=${pnl:+.2f}")
+
+        # Log settlement
+        self._log_trade("settlement", {
+            "side": self.state.position_side,
+            "entry_price": self.state.entry_price,
+            "payout": payout,
+            "btc_open": self.state.btc_open_price,
+            "btc_close": self.state.btc_current_price,
+            "btc_move": btc_move,
+            "up_won": up_won,
+            "pnl": pnl,
+            "invested": invested,
+            "shares": shares,
+            "returned_capital": returned_capital,
+            "balance_after": self.state.balance,
+        })
 
         # Clear position
         self.state.position_side = None
@@ -627,6 +850,7 @@ class TokenPaperTrader:
     async def run(self):
         """Run paper trading with live display."""
         self.load_models()
+        self._setup_ml_logging()
         await self._setup_clients()
 
         self._running = True
@@ -643,6 +867,8 @@ class TokenPaperTrader:
             console.print("\n[yellow]Shutting down...[/yellow]")
             self._running = False
             trading_task.cancel()
+        finally:
+            self._close_ml_logging()
 
 
 async def main():
@@ -651,6 +877,8 @@ async def main():
     parser.add_argument("--sac-model", type=str, default="./logs/token_sac_v1/final_model.zip")
     parser.add_argument("--balance", type=float, default=1000.0)
     parser.add_argument("--min-edge", type=float, default=0.05, help="Minimum edge to trade")
+    parser.add_argument("--log-dir", type=str, default="./logs/paper_trade", help="Directory for ML logs")
+    parser.add_argument("--no-ml-log", action="store_true", help="Disable ML logging")
 
     args = parser.parse_args()
 
@@ -659,6 +887,8 @@ async def main():
         sac_model_path=args.sac_model,
         initial_balance=args.balance,
         min_edge_to_trade=args.min_edge,
+        log_dir=args.log_dir,
+        enable_ml_logging=not args.no_ml_log,
     )
 
     trader = TokenPaperTrader(config)
