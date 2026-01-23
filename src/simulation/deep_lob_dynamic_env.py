@@ -53,13 +53,13 @@ class DynamicTradingConfig:
     # Rewards are now normalized to [-1, 1] range
     win_reward: float = 1.0
     loss_penalty: float = -1.0
-    hold_reward: float = 0.1
+    hold_reward: float = 0.15  # Increased to make waiting more viable
     sharpe_weight: float = 0.1  # Reduced for normalized rewards
     drawdown_penalty_weight: float = 0.1
-    use_dsr_reward: bool = False  # Disable DSR for simpler rewards
+    use_dsr_reward: bool = True  # Enable symmetric DSR for quality-weighted rewards
     confidence_bonus: float = 0.2  # Bonus for high-confidence correct trades
-    dsr_profit_multiplier_base: float = 0.5  # reward = pnl × (0.5 + quality)
-    dsr_loss_multiplier_base: float = 1.5  # loss = pnl × (1.5 - quality)
+    # Note: DSR multipliers now use symmetric formula: 0.5 + quality * 0.5
+    # This avoids amplifying losses which caused poor recovery behavior
 
     # === Churn Penalty ===
     churn_threshold: int = 3  # Penalize after this many trades per candle
@@ -221,11 +221,12 @@ class DeepLOBDynamicEnv(gym.Env):
         # Volatility regime
         self._volatility = self.np_random.uniform(0.0, 1.0)
 
-        # Generate outcome
+        # Generate outcome - UNBIASED mapping from probabilities
+        # FIX: Removed 0.8 multiplier that was causing UP bias in training
         outcome_rand = self.np_random.random()
-        if outcome_rand < self._prob_down * 0.8:
+        if outcome_rand < self._prob_down:
             self._outcome = 0  # Down
-        elif outcome_rand < (self._prob_down + self._prob_hold) * 0.8:
+        elif outcome_rand < self._prob_down + self._prob_hold:
             self._outcome = 1  # Hold
         else:
             self._outcome = 2  # Up
@@ -252,27 +253,46 @@ class DeepLOBDynamicEnv(gym.Env):
         time_in_candle = self._candle_step / self.config.steps_per_candle
         time_remaining = 1.0 - time_in_candle
 
-        # === REALISTIC CONVERGENCE PRICE SIMULATION ===
-        # Prices converge toward settlement value as time progresses
+        # === REALISTIC INTRA-CANDLE PRICE DYNAMICS ===
+        # Three phases: mean-reversion (early), trending (mid), convergence (late)
+        # This makes waiting potentially valuable - prices oscillate early
         if self._convergence_target is not None:
-            # Convergence strength increases as we approach settlement
-            # Early: mostly random walk, Late: strong pull toward target
-            convergence_strength = (time_in_candle ** 2) * 0.1  # Quadratic increase
+            # Phase 1: Early candle (0-30%) - Mean-reverting around 0.5
+            # Prices oscillate, creating opportunities for better entry timing
+            if time_in_candle < 0.3:
+                # Mean reversion toward 0.5 (uncertainty phase)
+                mean_reversion = (0.5 - self._market_yes_price) * 0.08
+                # Higher noise early - prices are uncertain
+                noise_scale = 0.025 + self._volatility * 0.02
+                noise = self.np_random.normal(0, noise_scale)
+                # Weak pull toward outcome (market has some information)
+                weak_trend = (self._convergence_target - self._market_yes_price) * 0.02
+                price_change = mean_reversion + noise + weak_trend
 
-            # Random noise decreases as settlement approaches
-            noise_scale = 0.02 * (1.0 - time_in_candle * 0.8)
-            noise = self.np_random.normal(0, noise_scale)
+            # Phase 2: Mid candle (30-70%) - Trending toward outcome
+            elif time_in_candle < 0.7:
+                # Moderate convergence toward outcome
+                convergence_strength = 0.05 + (time_in_candle - 0.3) * 0.1
+                target_pull = (self._convergence_target - self._market_yes_price) * convergence_strength
+                # Moderate noise
+                noise_scale = 0.015 * (1.0 - time_in_candle * 0.5)
+                noise = self.np_random.normal(0, noise_scale)
+                price_change = target_pull + noise
 
-            # Pull toward convergence target
-            target_pull = (self._convergence_target - self._market_yes_price) * convergence_strength
+            # Phase 3: Late candle (70-100%) - Strong convergence
+            else:
+                # Strong pull toward settlement price
+                convergence_strength = 0.1 + (time_in_candle - 0.7) * 0.4
+                target_pull = (self._convergence_target - self._market_yes_price) * convergence_strength
+                # Low noise near settlement
+                noise_scale = 0.008 * (1.0 - time_in_candle)
+                noise = self.np_random.normal(0, noise_scale)
+                price_change = target_pull + noise
 
-            # Combined price change
-            price_change = target_pull + noise
-
-            # In final 20% of candle, accelerate convergence
-            if time_remaining < 0.2:
-                acceleration = (0.2 - time_remaining) / 0.2 * 0.3
-                price_change += (self._convergence_target - self._market_yes_price) * acceleration
+                # In final 10% of candle, accelerate convergence
+                if time_remaining < 0.1:
+                    acceleration = (0.1 - time_remaining) / 0.1 * 0.4
+                    price_change += (self._convergence_target - self._market_yes_price) * acceleration
         else:
             # Fallback to random walk if no convergence target
             price_change = self.np_random.normal(0, 0.005)
@@ -359,7 +379,7 @@ class DeepLOBDynamicEnv(gym.Env):
                 reward += self._execute_exit(exit_reason)
                 self._trades_this_candle += 1
             else:
-                # === HOLD REWARD WITH TIME URGENCY ===
+                # === HOLD REWARD WITH TIME URGENCY AND RECOVERY ===
                 # Time urgency: reward holding more as settlement approaches
                 # Exponential increase: 1.0 at start, up to time_urgency_multiplier at end
                 time_urgency = 1.0 + (self.config.time_urgency_multiplier - 1.0) * (time_in_candle ** 2)
@@ -384,8 +404,36 @@ class DeepLOBDynamicEnv(gym.Env):
                         scaled_reward += convergence_bonus
 
                     reward += scaled_reward
-                elif unrealized_pnl > self._position.prev_pnl:
-                    # Small reward for improving even if not yet profitable
+
+                elif unrealized_pnl < 0:
+                    # === RECOVERY INCENTIVE FOR LOSING POSITIONS ===
+                    # Reward for holding if price is moving toward recovery
+                    pnl_improvement = unrealized_pnl - self._position.prev_pnl
+
+                    if pnl_improvement > 0:
+                        # Position is recovering - reward proportional to recovery rate
+                        recovery_rate = min(pnl_improvement * 20, 1.0)  # Scale improvement
+                        recovery_reward = self.config.hold_reward * 0.75 * recovery_rate * time_urgency
+                        reward += recovery_reward
+
+                    # Additional recovery signal: check if price is moving toward our side
+                    if self._position.side == "long":
+                        price_momentum = current_token_price - self._position.entry_token_price
+                    else:
+                        price_momentum = self._position.entry_token_price - current_token_price
+
+                    # If momentum is positive (price moving our way), small reward for patience
+                    if price_momentum > 0 and len(self._yes_price_history) >= 3:
+                        recent_momentum = self._yes_price_history[-1] - self._yes_price_history[-3]
+                        if self._position.side == "short":
+                            recent_momentum = -recent_momentum
+                        if recent_momentum > 0:
+                            # Price trending toward recovery
+                            momentum_bonus = self.config.hold_reward * 0.3 * min(recent_momentum * 50, 1.0)
+                            reward += momentum_bonus
+
+                else:
+                    # Breakeven position - small reward for improving
                     improvement = unrealized_pnl - self._position.prev_pnl
                     if improvement > 0:
                         reward += self.config.hold_reward * 0.25 * min(improvement * 10, 1.0) * time_urgency
@@ -396,10 +444,38 @@ class DeepLOBDynamicEnv(gym.Env):
         # === Check for Entry or Hold ===
         if self._position is None:
             if hold_prob > 0.5:
-                # Agent chooses to wait
+                # Agent chooses to wait - reward based on entry improvement potential
                 predicted_class = np.argmax([self._prob_down, self._prob_hold, self._prob_up])
-                if predicted_class == 1:  # Correct to hold when Hold predicted
-                    reward += 0.01  # Small bonus for correct hold
+
+                # Base reward for waiting
+                wait_reward = 0.02  # Increased from 0.01
+
+                # Bonus if Hold is predicted (model agrees with waiting)
+                if predicted_class == 1:
+                    wait_reward += 0.02
+
+                # Bonus for waiting during high volatility (more opportunity)
+                if len(self._yes_price_history) >= 5:
+                    recent_volatility = np.std(self._yes_price_history[-5:])
+                    # Higher volatility = more potential for better entry
+                    volatility_bonus = min(recent_volatility * 5, 0.05)
+                    wait_reward += volatility_bonus
+
+                # Bonus for waiting early in candle (more time for price discovery)
+                if time_in_candle < 0.3:
+                    early_bonus = 0.03 * (0.3 - time_in_candle) / 0.3
+                    wait_reward += early_bonus
+
+                # Bonus for waiting when price is unfavorable for our predicted direction
+                if predicted_class == 2 and self._market_yes_price > 0.55:
+                    # Want to go long but price is high - good to wait
+                    wait_reward += 0.02
+                elif predicted_class == 0 and self._market_no_price > 0.55:
+                    # Want to go short but NO price is high - good to wait
+                    wait_reward += 0.02
+
+                reward += wait_reward
+
             elif self._trades_this_candle < self.config.max_trades_per_candle:
                 # Agent wants to enter
                 if abs(direction) > 0.1 and size > 0.05:
@@ -454,6 +530,7 @@ class DeepLOBDynamicEnv(gym.Env):
             size=trade_size,
             entry_price=entry_price,
             entry_step=self._candle_step,
+            entry_token_price=self._market_yes_price if side == "long" else self._market_no_price,
         )
         
         # Entry reward: small penalty for trading costs
@@ -491,22 +568,22 @@ class DeepLOBDynamicEnv(gym.Env):
         else:
             pnl = (self._position.entry_price - exit_price) * self._position.size
         
-        # Apply DSR
+        # Apply DSR - SYMMETRIC quality weighting (no loss amplification)
         if self.config.use_dsr_reward:
             predicted_class = np.argmax([self._prob_down, self._prob_hold, self._prob_up])
             confidence = max(self._prob_down, self._prob_hold, self._prob_up)
-            
+
             if (self._position.side == "long" and predicted_class == 2) or \
                (self._position.side == "short" and predicted_class == 0):
                 quality = confidence
             else:
                 quality = 0.3
-            
-            if pnl > 0:
-                multiplier = self.config.dsr_profit_multiplier_base + quality
-            else:
-                multiplier = self.config.dsr_loss_multiplier_base - quality
-            
+
+            # SYMMETRIC multiplier: same scaling for wins and losses
+            # High quality = higher reward for wins, lower penalty for losses
+            # This encourages learning from mistakes rather than avoiding all risk
+            multiplier = 0.5 + quality * 0.5  # Range: 0.5 to 1.0
+
             pnl = pnl * multiplier
         
         # Bonus for good exit reasons
@@ -566,7 +643,7 @@ class DeepLOBDynamicEnv(gym.Env):
         # A move from 0.5 to 1.0 (0.5 profit) should reward more than 0.5 to 0.55
         magnitude_factor = min(abs(price_move) * self.config.settlement_magnitude_scale, 2.0)
 
-        # Apply DSR if enabled
+        # Apply DSR if enabled - SYMMETRIC quality weighting (no loss amplification)
         if self.config.use_dsr_reward:
             predicted_class = np.argmax([self._prob_down, self._prob_hold, self._prob_up])
             confidence = max(self._prob_down, self._prob_hold, self._prob_up)
@@ -577,10 +654,8 @@ class DeepLOBDynamicEnv(gym.Env):
             else:
                 quality = 0.3
 
-            if pnl > 0:
-                multiplier = self.config.dsr_profit_multiplier_base + quality
-            else:
-                multiplier = self.config.dsr_loss_multiplier_base - quality
+            # SYMMETRIC multiplier: same scaling for wins and losses
+            multiplier = 0.5 + quality * 0.5  # Range: 0.5 to 1.0
 
             magnitude_factor *= multiplier
 

@@ -70,8 +70,10 @@ class DeepLOBTrainingConfig:
     use_class_weights: bool = True
     
     # Labeling
-    prediction_horizon: int = 10
-    alpha_threshold: float = 0.001  # 0.1% threshold
+    prediction_horizon: int = 10  # Only used for legacy short-term labels
+    alpha_threshold: float = 0.001  # 0.1% threshold for short-term
+    use_candle_labels: bool = True  # Use candle close vs open labels (RECOMMENDED)
+    candle_alpha_threshold: float = 0.0003  # 0.03% threshold for candle-level
     
     # Saving
     save_every: int = 20
@@ -156,12 +158,17 @@ class DeepLOBTrainer:
     ) -> Tuple[DataLoader, DataLoader, DataLoader, torch.Tensor]:
         """
         Prepare data loaders with strict time-based splits.
-        
+
         Returns:
             (train_loader, val_loader, test_loader, class_weights)
         """
-        console.print("[bold blue]Preparing DeepLOB training data...[/bold blue]")
-        
+        label_mode = "candle-level" if self.config.use_candle_labels else "short-term"
+        console.print(f"[bold blue]Preparing DeepLOB training data ({label_mode} labels)...[/bold blue]")
+
+        if self.config.use_candle_labels:
+            console.print("[green]Using CANDLE-LEVEL labels (close vs open)[/green]")
+            console.print("  This is the correct semantic for Polymarket 15-min candle prediction")
+
         # Create dataset with 3-class labels
         X, y = create_training_dataset_v2(
             btc_data=btc_data,
@@ -170,6 +177,7 @@ class DeepLOBTrainer:
             sequence_length=self.config.sequence_length,
             prediction_horizon=self.config.prediction_horizon,
             alpha_threshold=self.config.alpha_threshold,
+            use_candle_labels=self.config.use_candle_labels,
         )
         
         n = len(X)
@@ -520,23 +528,27 @@ def train_deep_lob_model(
     output_dir: str = "./logs/deep_lob_model",
     epochs: int = 200,
     alpha_threshold: float = 0.001,
+    use_candle_labels: bool = True,
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """
     Convenience function to train DeepLOB model.
-    
+
     Args:
         btc_data: BTC data with timestamp, price, volume, buy_pressure
         trades_data: Optional trades data with is_buyer_maker
         output_dir: Output directory
         epochs: Training epochs
         alpha_threshold: Threshold for Up/Down classification
-        
+        use_candle_labels: If True (default), use candle close vs open labels.
+                          This is the correct semantic for Polymarket prediction.
+
     Returns:
         (trained_model, test_results)
     """
     config = DeepLOBTrainingConfig(
         epochs=epochs,
         alpha_threshold=alpha_threshold,
+        use_candle_labels=use_candle_labels,
     )
     
     trainer = DeepLOBTrainer(config)

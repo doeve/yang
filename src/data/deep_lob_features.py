@@ -395,35 +395,110 @@ class DeepLOBFeatureBuilder:
     ) -> np.ndarray:
         """
         Create 3-class labels: Down (0), Hold (1), Up (2)
-        
+
         Key insight: Don't predict tiny moves - use threshold α.
         """
         horizon = horizon or self.config.prediction_horizon
         alpha = alpha or self.config.alpha_threshold
-        
+
         n = len(prices)
         labels = np.ones(n, dtype=np.int64)  # Default: Hold
-        
+
         # Future returns
         future_returns = np.zeros(n)
         future_returns[:-horizon] = (prices[horizon:] - prices[:-horizon]) / (prices[:-horizon] + 1e-10)
-        
+
         # Classify
         labels[future_returns > alpha] = 2   # Up
         labels[future_returns < -alpha] = 0  # Down
         # Everything else stays 1 (Hold)
-        
+
         # Mark last `horizon` samples as invalid
         labels[-horizon:] = -1
-        
+
         logger.info(
             "Created 3-class labels",
             up_pct=f"{(labels == 2).sum() / (labels >= 0).sum() * 100:.1f}%",
             hold_pct=f"{(labels == 1).sum() / (labels >= 0).sum() * 100:.1f}%",
             down_pct=f"{(labels == 0).sum() / (labels >= 0).sum() * 100:.1f}%",
         )
-        
+
         return labels
+
+    def create_candle_labels(
+        self,
+        btc_data: pd.DataFrame,
+        candle_minutes: int = 15,
+        alpha: Optional[float] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Create candle-level labels based on candle close vs open.
+
+        This is the CORRECT labeling for Polymarket 15-min candle prediction.
+        Labels represent: "Will this candle close above or below its open?"
+
+        Args:
+            btc_data: DataFrame with timestamp, price columns
+            candle_minutes: Candle duration (default 15 for Polymarket)
+            alpha: Threshold for Up/Down classification (default 0.0003 = 0.03%)
+
+        Returns:
+            Tuple of (labels array aligned to btc_data, candle_indices)
+        """
+        alpha = alpha or 0.0003  # 0.03% threshold for 15-min candles (tighter than 10s)
+
+        btc = btc_data.copy()
+
+        # Convert timestamp to seconds for candle grouping
+        if not pd.api.types.is_datetime64_any_dtype(btc['timestamp']):
+            btc['timestamp'] = pd.to_datetime(btc['timestamp'], utc=True)
+
+        btc['timestamp_seconds'] = btc['timestamp'].astype(np.int64) // 10**9
+        btc['candle_idx'] = btc['timestamp_seconds'] // (candle_minutes * 60)
+
+        # Get candle open and close prices
+        candle_stats = btc.groupby('candle_idx').agg(
+            open_price=('price', 'first'),
+            close_price=('price', 'last'),
+            first_idx=('price', lambda x: x.index[0]),
+            last_idx=('price', lambda x: x.index[-1]),
+        )
+
+        # Calculate candle returns
+        candle_stats['return'] = (
+            (candle_stats['close_price'] - candle_stats['open_price'])
+            / candle_stats['open_price']
+        )
+
+        # Classify candles
+        candle_stats['label'] = 1  # Default: Hold
+        candle_stats.loc[candle_stats['return'] > alpha, 'label'] = 2   # Up
+        candle_stats.loc[candle_stats['return'] < -alpha, 'label'] = 0  # Down
+
+        # Map candle labels back to each data point
+        n = len(btc)
+        labels = np.ones(n, dtype=np.int64) * -1  # Default invalid
+
+        for candle_idx, row in candle_stats.iterrows():
+            # All points in this candle get the candle's label
+            mask = btc['candle_idx'] == candle_idx
+            labels[mask] = int(row['label'])
+
+        # Mark the last candle as invalid (incomplete)
+        last_candle = btc['candle_idx'].max()
+        labels[btc['candle_idx'] == last_candle] = -1
+
+        valid_mask = labels >= 0
+        logger.info(
+            "Created candle-level labels",
+            candle_minutes=candle_minutes,
+            total_candles=len(candle_stats),
+            up_pct=f"{(labels[valid_mask] == 2).sum() / valid_mask.sum() * 100:.1f}%",
+            hold_pct=f"{(labels[valid_mask] == 1).sum() / valid_mask.sum() * 100:.1f}%",
+            down_pct=f"{(labels[valid_mask] == 0).sum() / valid_mask.sum() * 100:.1f}%",
+        )
+
+        return labels, btc['candle_idx'].values
 
 
 def create_training_dataset_v2(
@@ -433,84 +508,113 @@ def create_training_dataset_v2(
     sequence_length: int = 120,
     prediction_horizon: int = 10,
     alpha_threshold: float = 0.001,
+    use_candle_labels: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Create training dataset with DeepLOB-style features and 3-class labels.
-    
+
+    Args:
+        btc_data: BTC price data with timestamp, price, volume, buy_pressure
+        trades_data: Optional aggregated trades data
+        candle_minutes: Candle duration for grouping (default 15)
+        sequence_length: Number of timesteps per sequence (default 120)
+        prediction_horizon: Steps ahead for short-term labels (only used if use_candle_labels=False)
+        alpha_threshold: Threshold for Up/Down classification
+        use_candle_labels: If True, use candle close vs open labels (RECOMMENDED).
+                          If False, use short-term return labels (legacy behavior).
+
     Returns:
         X: Feature sequences, shape (num_samples, sequence_length, 34)
         y: 3-class labels (0=Down, 1=Hold, 2=Up)
     """
-    logger.info("Creating DeepLOB-style training dataset...")
-    
+    logger.info(
+        "Creating DeepLOB-style training dataset...",
+        use_candle_labels=use_candle_labels,
+        candle_minutes=candle_minutes,
+    )
+
     config = DeepLOBConfig(
         prediction_horizon=prediction_horizon,
         alpha_threshold=alpha_threshold,
     )
     builder = DeepLOBFeatureBuilder(config)
-    
+
     # Ensure timestamp is datetime
     btc = btc_data.copy()
     if not pd.api.types.is_datetime64_any_dtype(btc['timestamp']):
         btc['timestamp'] = pd.to_datetime(btc['timestamp'], utc=True)
-    
+
     logger.info(f"Precomputing features for {len(btc):,} data points...")
-    
+
     # Precompute features
     all_features = builder.precompute_all_features(btc, trades_data)
-    
-    # Create 3-class labels
-    prices = btc['price'].values
-    all_labels = builder.create_3class_labels(prices, prediction_horizon, alpha_threshold)
-    
+
+    # Create labels based on mode
+    if use_candle_labels:
+        # CANDLE-LEVEL LABELS: Predict candle close vs open
+        # This is the correct semantic for Polymarket 15-min candle prediction
+        candle_alpha = 0.0003  # 0.03% threshold for candle-level
+        all_labels, candle_indices = builder.create_candle_labels(
+            btc, candle_minutes=candle_minutes, alpha=candle_alpha
+        )
+    else:
+        # LEGACY: Short-term return labels (10-second horizon)
+        # Warning: These don't match Polymarket candle semantics
+        logger.warning(
+            "Using short-term labels - these may not match Polymarket candle semantics!"
+        )
+        prices = btc['price'].values
+        all_labels = builder.create_3class_labels(prices, prediction_horizon, alpha_threshold)
+
     logger.info("Grouping by candles...")
-    
+
     # Group by candles
     candle_seconds = candle_minutes * 60
     btc['candle_idx'] = (btc['timestamp'].astype(np.int64) // 10**9 // candle_seconds).astype(int)
-    
+
     # Get candle start indices
     candle_groups = btc.groupby('candle_idx')
     candle_starts = candle_groups.apply(lambda x: x.index[0], include_groups=False).values
-    
+
     logger.info(f"Found {len(candle_starts)} candles. Extracting sequences...")
-    
+
     # Extract sequences
     X_list = []
     y_list = []
-    
+
     min_idx = sequence_length + 100
-    
+
     for start_idx in candle_starts:
         if start_idx < min_idx:
             continue
-        
+
         seq_start = start_idx - sequence_length
         seq_end = start_idx
-        
+
         if seq_start < 0 or seq_end > len(all_features):
             continue
-        
+
         # Get label at prediction point
         label = all_labels[start_idx]
         if label < 0:  # Invalid (near end of data)
             continue
-        
+
         features = all_features[seq_start:seq_end]
-        
+
         if len(features) == sequence_length:
             X_list.append(features)
             y_list.append(label)
-    
+
     X = np.array(X_list)
     y = np.array(y_list)
-    
+
     logger.info(
         "Created training dataset",
         num_samples=len(X),
         feature_dim=builder.feature_dim,
         sequence_length=sequence_length,
+        use_candle_labels=use_candle_labels,
         class_distribution=f"Down:{(y==0).sum()}, Hold:{(y==1).sum()}, Up:{(y==2).sum()}",
     )
-    
+
     return X, y
