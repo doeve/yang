@@ -91,6 +91,11 @@ class TokenTradingState:
     wins: int = 0
     losses: int = 0
 
+    # Current Market Info
+    current_candle_ts: Optional[int] = None
+    active_yes_id: Optional[str] = None
+    active_no_id: Optional[str] = None
+
     # Current position
     position_side: Optional[str] = None  # "yes" or "no"
     position_size: float = 0.0
@@ -132,7 +137,7 @@ class TokenPaperTradeConfig:
 
     # Polymarket API
     polymarket_api: str = "https://clob.polymarket.com"
-    btc_up_token_id: str = "21742633143463906290569050155826241533067272736897614950488156847949938836455"
+    polymarket_gamma_api: str = "https://gamma-api.polymarket.com"
 
     # Refresh interval
     refresh_seconds: int = 5
@@ -200,11 +205,60 @@ class TokenPaperTrader:
             console.print("[yellow]⚠ SOCKS5 not available, using direct connection[/yellow]")
             self.polymarket_client = httpx.AsyncClient(timeout=30)
 
+    def get_current_candle_timestamp(self) -> int:
+        """Get current 15-min candle timestamp."""
+        now = int(datetime.now(timezone.utc).timestamp())
+        return (now // 900) * 900
+
+    async def fetch_active_market(self, timestamp: int) -> bool:
+        """Fetch current active market IDs from Gamma API."""
+        slug = f"btc-updown-15m-{timestamp}"
+        try:
+            url = f"{self.config.polymarket_gamma_api}/events/slug/{slug}"
+            response = await self.polymarket_client.get(url)
+            
+            if response.status_code == 200:
+                data = response.json()
+                markets = data.get("markets", [])
+                if markets:
+                    import json
+                    market = markets[0]
+                    clob_tokens = market.get("clobTokenIds", "[]")
+                    if isinstance(clob_tokens, str):
+                        clob_tokens = json.loads(clob_tokens)
+                    
+                    if len(clob_tokens) >= 2:
+                        self.state.active_yes_id = clob_tokens[0]
+                        self.state.active_no_id = clob_tokens[1]
+                        self.state.current_candle_ts = timestamp
+                        console.print(f"[blue]Found new market: {slug}[/blue]")
+                        return True
+        except Exception as e:
+            logger.error(f"Market discovery error: {e}")
+        return False
+
     async def fetch_polymarket_prices(self) -> Optional[Dict[str, float]]:
         """Fetch current YES/NO prices from Polymarket."""
+        if not self.state.active_yes_id:
+            return None
+
         try:
+            # Try Midpoint first (cheaper/cleaner)
+            url = f"{self.config.polymarket_api}/midpoint"
+            params = {"token_id": self.state.active_yes_id}
+            response = await self.polymarket_client.get(url, params=params)
+
+            if response.status_code == 200:
+                data = response.json()
+                yes_price = float(data.get("mid", 0.5))
+                return {
+                    "yes_price": yes_price,
+                    "no_price": 1.0 - yes_price,
+                }
+            
+            # Fallback to Orderbook
             url = f"{self.config.polymarket_api}/book"
-            params = {"token_id": self.config.btc_up_token_id}
+            params = {"token_id": self.state.active_yes_id}
             response = await self.polymarket_client.get(url, params=params)
 
             if response.status_code == 200:
@@ -212,11 +266,16 @@ class TokenPaperTrader:
                 bids = data.get("bids", [])
                 asks = data.get("asks", [])
 
-                yes_price = 0.5
-                if asks:
+                if bids and asks:
+                    best_bid = float(bids[0]["price"])
+                    best_ask = float(asks[0]["price"])
+                    yes_price = (best_bid + best_ask) / 2
+                elif asks:
                     yes_price = float(asks[0]["price"])
                 elif bids:
                     yes_price = float(bids[0]["price"])
+                else:
+                    yes_price = 0.5
 
                 return {
                     "yes_price": yes_price,
@@ -241,15 +300,18 @@ class TokenPaperTrader:
         return None
 
     def get_time_remaining(self) -> float:
-        """Get fraction of candle remaining."""
-        if self.current_candle_start is None:
-            return 0.5
-
+        """Get fraction of 15-min candle remaining based on wall clock."""
         now = datetime.now(timezone.utc)
-        candle_duration = timedelta(minutes=15)
-        elapsed = now - self.current_candle_start
-        remaining = (candle_duration - elapsed).total_seconds() / candle_duration.total_seconds()
-        return max(0.0, min(1.0, remaining))
+        
+        minute_block = (now.minute // 15) * 15
+        start_of_candle = now.replace(minute=minute_block, second=0, microsecond=0)
+        
+        duration = timedelta(minutes=15)
+        
+        elapsed = now - start_of_candle
+        remaining_seconds = (duration - elapsed).total_seconds()
+        
+        return max(0.0, min(1.0, remaining_seconds / duration.total_seconds()))
 
     def compute_edge(self) -> Dict[str, float]:
         """Compute edge using edge detector."""
@@ -334,6 +396,26 @@ class TokenPaperTrader:
         while self._running:
             try:
                 # Fetch prices
+                # 1. Market Discovery Check
+                current_ts = self.get_current_candle_timestamp()
+                if self.state.current_candle_ts != current_ts:
+                    if self.state.current_candle_ts is not None:
+                        self.settle_position()
+
+                    found = await self.fetch_active_market(current_ts)
+                    if found:
+                        # Reset price history for new candle
+                        self.state.yes_price_history = []
+                        self.state.no_price_history = []
+                        self.state.btc_price_history = []
+                        self.state.btc_open_price = None
+                        self.current_candle_start = datetime.now(timezone.utc)
+                    else:
+                        console.print("[yellow]Waiting for new market...[/yellow]")
+                        await asyncio.sleep(5)
+                        continue
+
+                # 2. Fetch prices (using the IDs found above)
                 poly_prices = await self.fetch_polymarket_prices()
                 btc_price = await self.fetch_btc_price()
 
@@ -462,6 +544,51 @@ class TokenPaperTrader:
         })
 
         console.print(f"[{'green' if pnl > 0 else 'red'}]EXIT: {side.upper()} @ {current_price:.3f} | PnL=${pnl:+.2f}[/]")
+
+        # Clear position
+        self.state.position_side = None
+        self.state.position_size = 0.0
+        self.state.entry_price = 0.0
+
+    def settle_position(self):
+        """Settle position at candle end based on BTC price movement."""
+        if not self.state.position_side:
+            return
+
+        # We need the open price of the candle we just finished
+        if not self.state.btc_open_price or not self.state.btc_current_price:
+            return
+
+        # Determine if UP won or DOWN won
+        btc_move = self.state.btc_current_price - self.state.btc_open_price
+        up_won = btc_move > 0
+        
+        # Calculate Payout (1.0 for win, 0.0 for loss)
+        payout = 0.0
+        if self.state.position_side == "yes":
+            payout = 1.0 if up_won else 0.0
+        else: # "no"
+            payout = 1.0 if not up_won else 0.0
+
+        # Calculate PnL
+        invested = self.state.position_size * self.state.balance
+        # Shares = Invested / Entry Price
+        shares = invested / self.state.entry_price
+        
+        # Return = Shares * Payout
+        returned_capital = shares * payout
+        pnl = returned_capital - invested
+
+        # Update Balance
+        self.state.balance += pnl
+        self.state.total_pnl += pnl
+
+        if pnl > 0:
+            self.state.wins += 1
+        else:
+            self.state.losses += 1
+
+        console.print(f"[bold purple]SETTLEMENT:[/bold purple] {self.state.position_side.upper()} -> {'WIN' if pnl > 0 else 'LOSS'} | PnL=${pnl:+.2f}")
 
         # Clear position
         self.state.position_side = None
