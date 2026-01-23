@@ -81,14 +81,16 @@ except ImportError:
     SOCKS_AVAILABLE = False
     httpx_socks = None
 
-from src.simulation.deep_lob_dynamic_env import (
-    DynamicTradingConfig,
-    DeepLOBDynamicEnv,
-)
-from src.inference.deep_lob_inference import (
-    DeepLOBTwoLayerBot,
-    DeepLOBInferenceConfig,
-)
+# Import local modules with stderr suppressed (they import torch)
+with suppress_stderr():
+    from src.simulation.deep_lob_dynamic_env import (
+        DynamicTradingConfig,
+        DeepLOBDynamicEnv,
+    )
+    from src.inference.deep_lob_inference import (
+        DeepLOBTwoLayerBot,
+        DeepLOBInferenceConfig,
+    )
 
 logger = structlog.get_logger(__name__)
 console = Console()
