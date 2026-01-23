@@ -93,6 +93,11 @@ def main():
 
     console.print(f"  Loaded {len(btc_data):,} rows")
 
+    # Handle column naming variations
+    if "close" in btc_data.columns and "price" not in btc_data.columns:
+        console.print("[dim]Renaming 'close' column to 'price'[/dim]")
+        btc_data["price"] = btc_data["close"]
+
     # Check required columns
     required_cols = ["timestamp", "price", "volume"]
     missing = [c for c in required_cols if c not in btc_data.columns]
@@ -100,10 +105,14 @@ def main():
         console.print(f"[red]Missing columns: {missing}[/red]")
         return
 
-    # Add buy_pressure if not present
+    # Add buy_pressure if not present (use taker buy ratio if available)
     if "buy_pressure" not in btc_data.columns:
-        console.print("[yellow]buy_pressure column not found, using 0.5 default[/yellow]")
-        btc_data["buy_pressure"] = 0.5
+        if "taker_buy_volume" in btc_data.columns:
+            btc_data["buy_pressure"] = btc_data["taker_buy_volume"] / (btc_data["volume"] + 1e-10)
+            console.print("[dim]Computed buy_pressure from taker_buy_volume[/dim]")
+        else:
+            console.print("[yellow]buy_pressure column not found, using 0.5 default[/yellow]")
+            btc_data["buy_pressure"] = 0.5
 
     # Load trades data if provided
     trades_data = None
