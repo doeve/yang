@@ -129,18 +129,18 @@ class TokenTradingState:
 @dataclass
 class TokenPaperTradeConfig:
     """Configuration for token paper trading."""
-    edge_detector_path: str = "./logs/edge_detector_v1"
-    sac_model_path: str = "./logs/token_sac_v1/final_model.zip"
-    vec_normalize_path: str = "./logs/token_sac_v1/vecnormalize.pkl"
+    edge_detector_path: str = "./logs/edge_detector_v2"
+    sac_model_path: str = "./logs/token_sac_v2/final_model.zip"
+    vec_normalize_path: str = "./logs/token_sac_v2/vecnormalize.pkl"
 
     initial_balance: float = 1000.0
     base_position_size: float = 0.10  # Base 10% of balance per trade
     max_position_size: float = 0.30  # Max 30% for high-edge opportunistic trades
 
     # Edge thresholds
-    min_edge_to_trade: float = 0.05  # Only trade if |edge| > 5%
-    min_confidence: float = 0.6  # Minimum confidence to trade
-    opportunistic_edge: float = 0.15  # Edge threshold for larger positions
+    min_edge_to_trade: float = 0.03  # Only trade if |edge| > 3% (lowered from 5%)
+    min_confidence: float = 0.02  # Minimum confidence to trade (lowered from 0.6 - model outputs low confidence)
+    opportunistic_edge: float = 0.10  # Edge threshold for larger positions (lowered from 15%)
 
     # Risk management
     stop_loss_pct: float = 0.20  # Exit if price drops 20% from entry
@@ -1055,10 +1055,10 @@ class TokenPaperTrader:
 
 async def main():
     parser = argparse.ArgumentParser(description="Token-centric paper trading")
-    parser.add_argument("--edge-model", type=str, default="./logs/edge_detector_v1")
-    parser.add_argument("--sac-model", type=str, default="./logs/token_sac_v1/final_model.zip")
+    parser.add_argument("--edge-model", type=str, default="./logs/edge_detector_v2")
+    parser.add_argument("--sac-model", type=str, default="./logs/token_sac_v2/final_model.zip")
     parser.add_argument("--balance", type=float, default=1000.0)
-    parser.add_argument("--min-edge", type=float, default=0.05, help="Minimum edge to trade")
+    parser.add_argument("--min-edge", type=float, default=0.03, help="Minimum edge to trade")
     parser.add_argument("--log-dir", type=str, default="./logs/paper_trade", help="Directory for ML logs")
     parser.add_argument("--no-ml-log", action="store_true", help="Disable ML logging")
 
