@@ -227,7 +227,7 @@ class TokenPaperTrader:
             "sac_model_path": self.config.sac_model_path,
             "config": {
                 "initial_balance": self.config.initial_balance,
-                "position_size": self.config.position_size,
+                "base_position_size": self.config.base_position_size,
                 "min_edge_to_trade": self.config.min_edge_to_trade,
                 "min_confidence": self.config.min_confidence,
             }
