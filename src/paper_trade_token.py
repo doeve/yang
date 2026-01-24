@@ -978,32 +978,44 @@ class TokenPaperTrader:
         self.state.entry_price = 0.0
 
     def build_display(self) -> Panel:
-        """Build display panel."""
-        table = Table(show_header=False, box=None, padding=(0, 1))
-        table.add_column("Key", style="dim")
-        table.add_column("Value", style="bold")
+        """Build display panel with stats on left, trades on right."""
+        from rich.columns import Columns
 
-        table.add_row("Balance", f"${self.state.balance:.2f}")
+        # === LEFT SIDE: Stats ===
+        left_table = Table(show_header=False, box=None, padding=(0, 1))
+        left_table.add_column("Key", style="dim", width=12)
+        left_table.add_column("Value", style="bold")
+
+        left_table.add_row("Balance", f"${self.state.balance:.2f}")
         pnl_color = "green" if self.state.total_pnl >= 0 else "red"
-        table.add_row("Total PnL", f"[{pnl_color}]${self.state.total_pnl:+.2f}[/]")
+        left_table.add_row("Total PnL", f"[{pnl_color}]${self.state.total_pnl:+.2f}[/]")
 
         win_rate = self.state.wins / max(1, self.state.wins + self.state.losses)
-        table.add_row("Win Rate", f"{win_rate:.1%} ({self.state.wins}/{self.state.wins + self.state.losses})")
+        left_table.add_row("Win Rate", f"{win_rate:.1%} ({self.state.wins}/{self.state.wins + self.state.losses})")
 
-        table.add_row("", "")
-        table.add_row("YES Price", f"{self.state.last_yes_price:.3f}")
-        table.add_row("NO Price", f"{self.state.last_no_price:.3f}")
-        table.add_row("Time Left", f"{self.get_time_remaining():.1%}")
+        left_table.add_row("", "")
+        left_table.add_row("YES Price", f"{self.state.last_yes_price:.3f}")
+        left_table.add_row("NO Price", f"{self.state.last_no_price:.3f}")
+        left_table.add_row("Time Left", f"{self.get_time_remaining():.1%}")
 
-        table.add_row("", "")
+        # BTC prices
+        left_table.add_row("", "")
+        btc_open = self.state.btc_open_price or 0
+        btc_current = self.state.btc_current_price or 0
+        btc_change = ((btc_current - btc_open) / btc_open * 100) if btc_open > 0 else 0
+        btc_color = "green" if btc_change > 0 else "red" if btc_change < 0 else "white"
+        left_table.add_row("BTC Open", f"${btc_open:,.0f}")
+        left_table.add_row("BTC Now", f"${btc_current:,.0f} [{btc_color}]({btc_change:+.2f}%)[/]")
+
+        left_table.add_row("", "")
         edge_color = "green" if self.state.ema_edge > 0 else "red" if self.state.ema_edge < 0 else "white"
-        table.add_row("Raw Edge", f"{self.state.current_edge:+.1%}")
-        table.add_row("EMA Edge", f"[{edge_color}]{self.state.ema_edge:+.1%}[/]")
-        table.add_row("P(YES wins)", f"{self.state.p_yes_estimate:.1%}")
-        table.add_row("Confidence", f"{self.state.confidence:.1%}")
+        left_table.add_row("Raw Edge", f"{self.state.current_edge:+.1%}")
+        left_table.add_row("EMA Edge", f"[{edge_color}]{self.state.ema_edge:+.1%}[/]")
+        left_table.add_row("P(YES wins)", f"{self.state.p_yes_estimate:.1%}")
+        left_table.add_row("Confidence", f"{self.state.confidence:.1%}")
 
         if self.state.position_side:
-            table.add_row("", "")
+            left_table.add_row("", "")
             color = "green" if self.state.position_side == "yes" else "red"
             current_price = (
                 self.state.last_yes_price if self.state.position_side == "yes"
@@ -1012,22 +1024,57 @@ class TokenPaperTrader:
             unrealized_pnl = (current_price - self.state.entry_price) / self.state.entry_price
             pnl_color = "green" if unrealized_pnl > 0 else "red"
 
-            table.add_row(
+            left_table.add_row(
                 "Position",
                 f"[{color}]{self.state.position_side.upper()}[/] @ {self.state.entry_price:.3f}"
             )
-            table.add_row("Size", f"{self.state.position_size:.1%}")
-            table.add_row("Unrealized", f"[{pnl_color}]{unrealized_pnl:+.1%}[/]")
-            table.add_row("Ticks Held", f"{self._tick_count - self.state.entry_tick}")
+            left_table.add_row("Size", f"{self.state.position_size:.1%}")
+            left_table.add_row("Unrealized", f"[{pnl_color}]{unrealized_pnl:+.1%}[/]")
+            left_table.add_row("Ticks Held", f"{self._tick_count - self.state.entry_tick}")
 
-            # Show stop-loss/take-profit levels
-            table.add_row(
-                "SL/TP",
-                f"SL: {self.state.entry_price * (1 - self.config.stop_loss_pct):.3f} | "
-                f"TP: {self.state.entry_price * (1 + self.config.take_profit_pct):.3f}"
+        # === RIGHT SIDE: Trade History ===
+        trades_table = Table(show_header=True, box=None, padding=(0, 1))
+        trades_table.add_column("Time", style="dim", width=8)
+        trades_table.add_column("Side", width=4)
+        trades_table.add_column("Entry", width=6)
+        trades_table.add_column("Exit", width=6)
+        trades_table.add_column("PnL", width=8)
+        trades_table.add_column("Reason", width=6)
+
+        # Show last 10 trades (most recent first)
+        recent_trades = list(reversed(self.state.trades[-10:]))
+        for trade in recent_trades:
+            side_color = "green" if trade["side"] == "yes" else "red"
+            pnl_color = "green" if trade["pnl"] > 0 else "red"
+            time_str = trade["time"].strftime("%H:%M:%S") if hasattr(trade["time"], "strftime") else str(trade["time"])[-8:]
+
+            reason_short = {
+                "stop_loss": "SL",
+                "take_profit": "TP",
+                "edge_reversal": "ER",
+                "sac_signal": "SAC",
+                "time_expiry": "TIME",
+                "settlement": "SETT",
+            }.get(trade.get("reason", ""), trade.get("reason", "")[:4])
+
+            trades_table.add_row(
+                time_str,
+                f"[{side_color}]{trade['side'].upper()[:3]}[/]",
+                f"{trade['entry']:.3f}",
+                f"{trade['exit']:.3f}",
+                f"[{pnl_color}]${trade['pnl']:+.2f}[/]",
+                reason_short,
             )
 
-        return Panel(table, title="[bold blue]Token-Centric Paper Trading v2[/bold blue]", border_style="blue")
+        if not recent_trades:
+            trades_table.add_row("", "", "[dim]No trades yet[/]", "", "", "")
+
+        # Combine left and right panels
+        left_panel = Panel(left_table, title="[bold cyan]Status[/]", border_style="cyan", width=35)
+        right_panel = Panel(trades_table, title="[bold yellow]Recent Trades[/]", border_style="yellow")
+
+        layout = Columns([left_panel, right_panel], expand=True)
+        return Panel(layout, title="[bold blue]Token-Centric Paper Trading v2[/bold blue]", border_style="blue")
 
     async def run(self):
         """Run paper trading with live display."""
