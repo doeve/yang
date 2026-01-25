@@ -1472,7 +1472,7 @@ def train_unified_cmd(
     Key improvements:
     - Trained on REAL data (not simulated 50/50)
     - Predicts optimal ACTIONS with expected returns
-    - 73-dimensional enhanced features (trend, time, convergence awareness)
+    - 71-dimensional enhanced features (trend, time, convergence awareness)
     - No hardcoded thresholds - model learns everything
 
     Usage:

@@ -11,7 +11,7 @@ Uses the new MarketPredictorModel which:
 Key differences from token-centric paper trader:
 - Single model replaces EdgeDetector + SAC
 - Model directly outputs actions, not separate edge + policy
-- Uses enhanced 73-feature set with better trend/time awareness
+- Uses enhanced 71-feature set with better trend/time awareness
 - Position sizing based on predicted expected return
 """
 

@@ -49,11 +49,11 @@ class EnhancedFeatureBuilder:
     """
     Build enhanced features for market prediction.
 
-    Output dimension: 73 features
+    Output dimension: 71 features
     - Price State: 8 features
     - Momentum: 8 features (4 windows x 2 directions)
     - Volatility: 6 features
-    - Trend Analysis: 12 features
+    - Trend Analysis: 10 features
     - Convergence: 8 features
     - Time Features: 6 features
     - Entry Quality: 8 features
@@ -63,7 +63,7 @@ class EnhancedFeatureBuilder:
 
     def __init__(self, config: Optional[EnhancedFeatureConfig] = None):
         self.config = config or EnhancedFeatureConfig()
-        self.feature_dim = 73
+        self.feature_dim = 71
         self._build_feature_names()
         logger.info(
             "EnhancedFeatureBuilder initialized",
@@ -85,7 +85,7 @@ class EnhancedFeatureBuilder:
             *[f'volatility_{w}' for w in self.config.volatility_windows],
             'volatility_ratio', 'volatility_trend', 'volatility_zscore',
 
-            # Trend Analysis (12)
+            # Trend Analysis (10)
             *[f'trend_strength_{w}' for w in self.config.trend_windows],
             *[f'trend_consistency_{w}' for w in self.config.trend_windows],
             'trend_acceleration', 'trend_reversal_risk', 'trend_age', 'trend_maturity',
@@ -154,7 +154,7 @@ class EnhancedFeatureBuilder:
             btc_open: BTC candle open price
 
         Returns:
-            Feature vector (73 dimensions)
+            Feature vector (71 dimensions)
         """
         features = []
 
