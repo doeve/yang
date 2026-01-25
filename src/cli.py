@@ -1451,6 +1451,162 @@ def analyze_log_cmd(
         analyze_directory(log_dir)
 
 
+@app.command("train-unified")
+def train_unified_cmd(
+    collect_data: bool = typer.Option(False, "--collect-data", help="Collect historical data first"),
+    train_only: bool = typer.Option(False, "--train-only", help="Skip data collection, train only"),
+    days: int = typer.Option(30, help="Days of historical data"),
+    btc_interval: str = typer.Option("1m", help="BTC data interval (1s, 1m)"),
+    data_dir: str = typer.Option("./data/historical", help="Data directory"),
+    output: str = typer.Option("./logs/market_predictor_v1", help="Output directory for model"),
+    epochs: int = typer.Option(100, help="Training epochs"),
+    batch_size: int = typer.Option(128, help="Batch size"),
+    patience: int = typer.Option(15, help="Early stopping patience"),
+    samples_per_candle: int = typer.Option(15, help="Training samples per candle"),
+):
+    """Train unified MarketPredictor model on real historical data.
+
+    This replaces the EdgeDetector + SAC architecture with a single unified model
+    that predicts optimal actions directly.
+
+    Key improvements:
+    - Trained on REAL data (not simulated 50/50)
+    - Predicts optimal ACTIONS with expected returns
+    - 73-dimensional enhanced features (trend, time, convergence awareness)
+    - No hardcoded thresholds - model learns everything
+
+    Usage:
+        # Collect 30 days of data and train
+        yang train-unified --collect-data --days 30
+
+        # Train only (data already collected)
+        yang train-unified --train-only
+    """
+    import asyncio
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+
+    from scripts.train_market_predictor import (
+        collect_historical_data,
+        build_training_data,
+        train_model,
+    )
+
+    async def run():
+        # Step 1: Data collection
+        if collect_data and not train_only:
+            await collect_historical_data(
+                output_dir=data_dir,
+                days_back=days,
+                btc_interval=btc_interval,
+            )
+            console.print()
+
+        # Step 2: Build training data
+        features, position_states, actions, returns = build_training_data(
+            data_dir=data_dir,
+            days_back=days,
+            btc_interval=btc_interval,
+            samples_per_candle=samples_per_candle,
+        )
+
+        if features is None:
+            console.print("[red]Training aborted: No data available[/red]")
+            console.print("Run with --collect-data to fetch historical data first")
+            raise typer.Exit(1)
+
+        console.print()
+
+        # Step 3: Train
+        model, history, results = train_model(
+            features=features,
+            position_states=position_states,
+            actions=actions,
+            returns=returns,
+            output_dir=output,
+            epochs=epochs,
+            batch_size=batch_size,
+            patience=patience,
+        )
+
+        console.print()
+        console.print("[bold green]Training complete![/bold green]")
+        console.print()
+        console.print("[bold]Next Steps:[/bold]")
+        console.print(f"  Run paper trading: yang paper-trade-unified --model {output}")
+
+    console.print("[bold blue]Unified Market Predictor Training[/bold blue]")
+    console.print("=" * 50)
+    console.print()
+
+    asyncio.run(run())
+
+
+@app.command("paper-trade-unified")
+def paper_trade_unified_cmd(
+    model: str = typer.Option("./logs/market_predictor_v1", help="Path to trained model"),
+    balance: float = typer.Option(1000.0, help="Initial balance"),
+    min_confidence: float = typer.Option(0.3, help="Minimum confidence to trade"),
+    min_return: float = typer.Option(0.02, help="Minimum expected return to trade"),
+    log_dir: str = typer.Option("./logs/paper_trade_unified", help="Log directory"),
+    no_ml_log: bool = typer.Option(False, help="Disable ML logging"),
+):
+    """Paper trade with the unified MarketPredictor model.
+
+    Uses the new unified model architecture that:
+    - Makes direct action decisions (WAIT, BUY_YES, BUY_NO, EXIT, HOLD)
+    - Outputs expected returns and confidence
+    - Was trained on real historical data
+    - Has no hardcoded thresholds
+
+    Press Ctrl+C to stop.
+    """
+    import asyncio
+    from .paper_trade_unified import UnifiedPaperTrader, UnifiedPaperTradeConfig
+
+    config = UnifiedPaperTradeConfig(
+        model_path=model,
+        initial_balance=balance,
+        min_confidence=min_confidence,
+        min_expected_return=min_return,
+        log_dir=log_dir,
+        enable_ml_logging=not no_ml_log,
+    )
+
+    trader = UnifiedPaperTrader(config)
+    asyncio.run(trader.run())
+
+
+@app.command("collect-historical")
+def collect_historical_cmd(
+    days: int = typer.Option(30, help="Days of history"),
+    output_dir: str = typer.Option("./data/historical", help="Output directory"),
+    btc_interval: str = typer.Option("1m", help="BTC data interval"),
+):
+    """Collect historical Polymarket + BTC data for training.
+
+    Fetches:
+    - BTC price data from Binance at specified interval
+    - Polymarket 15-minute candle outcomes and prices
+
+    This data is used by train-unified to train the MarketPredictor model.
+    """
+    import asyncio
+    from .data.historical_data_collector import collect_training_data
+
+    console.print("[bold blue]Collecting Historical Training Data[/bold blue]")
+    console.print(f"  Days: {days}")
+    console.print(f"  BTC interval: {btc_interval}")
+    console.print(f"  Output: {output_dir}")
+    console.print()
+
+    asyncio.run(collect_training_data(
+        output_dir=output_dir,
+        days_back=days,
+        btc_interval=btc_interval,
+    ))
+
+
 if __name__ == "__main__":
     app()
 

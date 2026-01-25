@@ -9,6 +9,15 @@ from .features import (
 from .policy import TradingPolicy, TradingFeaturesExtractor, get_policy_kwargs
 from .agent import TradingAgent, AgentConfig, EnsembleAgent
 from .rewards import RewardCalculator, RewardConfig, SharpeRewardCalculator, create_reward_calculator
+from .market_predictor import (
+    MarketPredictorModel,
+    MarketPredictorConfig,
+    MarketPredictorTrainer,
+    OptimalActionLabeler,
+    EnhancedPositionState,
+    Action,
+    load_market_predictor,
+)
 
 __all__ = [
     "LSTMFeatureExtractor",
@@ -25,4 +34,11 @@ __all__ = [
     "RewardConfig",
     "SharpeRewardCalculator",
     "create_reward_calculator",
+    "MarketPredictorModel",
+    "MarketPredictorConfig",
+    "MarketPredictorTrainer",
+    "OptimalActionLabeler",
+    "EnhancedPositionState",
+    "Action",
+    "load_market_predictor",
 ]
