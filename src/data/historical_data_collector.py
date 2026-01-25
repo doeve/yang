@@ -517,7 +517,8 @@ class TrainingDataBuilder:
         console.print(f"Building training examples from {len(candle_groups)} candles...")
 
         for candle_ts, candle_prices in candle_groups:
-            if len(candle_prices) < 10:
+            # Need at least 20 prices to have meaningful samples (start from idx 10)
+            if len(candle_prices) < 20:
                 continue
 
             outcome = candle_prices['outcome'].iloc[0]
@@ -541,10 +542,13 @@ class TrainingDataBuilder:
                 btc_prices = None
                 btc_open = None
 
-            # Sample points within candle
+            # Sample points within candle (start from index 10, end at last valid index)
+            max_idx = len(yes_prices) - 1
+            start_idx = min(10, max_idx - 1)  # Ensure start is valid
             sample_indices = np.linspace(
-                10, len(yes_prices) - 1, samples_per_candle, dtype=int
+                start_idx, max_idx, samples_per_candle, dtype=int
             )
+            sample_indices = np.unique(sample_indices)  # Remove duplicates
 
             # Simulate position scenarios
             scenarios = [
@@ -554,14 +558,22 @@ class TrainingDataBuilder:
             ]
 
             for idx in sample_indices:
-                time_remaining = 1.0 - idx / len(yes_prices)
+                # Ensure idx is within bounds
+                if idx >= len(yes_prices):
+                    continue
+                time_remaining = max(0.0, 1.0 - idx / len(yes_prices))
 
                 # Compute features
+                btc_slice = None
+                if btc_prices is not None and len(btc_prices) > 0:
+                    btc_idx = min(idx + 1, len(btc_prices))
+                    btc_slice = btc_prices[:btc_idx]
+
                 features = feature_builder.compute_features(
                     yes_prices=yes_prices[:idx+1],
                     no_prices=no_prices[:idx+1],
                     time_remaining=time_remaining,
-                    btc_prices=btc_prices[:min(idx+1, len(btc_prices))] if btc_prices is not None else None,
+                    btc_prices=btc_slice,
                     btc_open=btc_open,
                 )
 
