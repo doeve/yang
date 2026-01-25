@@ -121,7 +121,7 @@ class UnifiedTradingState:
 
     # Model outputs
     last_action: int = 0  # Action.WAIT
-    last_q_values: List[float] = field(default_factory=lambda: [0.0] * 5)
+    last_action_logits: List[float] = field(default_factory=lambda: [0.0] * 5)
     last_confidence: float = 0.0
     last_expected_return: float = 0.0
 
@@ -1875,6 +1875,8 @@ async def main():
             initial_balance=args.balance,
             min_confidence=args.min_confidence,
             min_expected_return=args.min_return,
+            data_source=args.data_source,
+            onchain_data_path=args.onchain_data,
             candles_path=args.candles,
             prices_path=args.prices,
             btc_path=args.btc_data,

@@ -475,28 +475,30 @@ class TrainingDataBuilder:
         self,
         data: Dict[str, pd.DataFrame],
         samples_per_candle: int = 10,
+        augment_symmetry: bool = True,
+        randomize_positions: bool = True,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         Build training examples from historical data.
 
-        For each sample point in each candle, compute:
-        1. Features (using EnhancedFeatureBuilder)
-        2. Position state
-        3. Optimal action (using hindsight)
-        4. Expected return
+        KEY CHANGES for live profitability:
+        1. Randomized position scenarios (not fixed entry prices)
+        2. YES/NO symmetry augmentation (doubles data, removes bias)
+        3. Tradable action labels (not hindsight-optimal)
+        4. Capped returns in [-1, 1]
 
         Returns:
             (features, position_states, actions, returns)
         """
         from src.data.enhanced_features import EnhancedFeatureBuilder
         from src.models.market_predictor import (
-            OptimalActionLabeler,
+            TradableActionLabeler,
             EnhancedPositionState,
             Action,
         )
 
         feature_builder = EnhancedFeatureBuilder()
-        labeler = OptimalActionLabeler()
+        labeler = TradableActionLabeler()
 
         features_list = []
         position_states_list = []
@@ -515,9 +517,13 @@ class TrainingDataBuilder:
         candle_groups = prices_df.groupby('candle_timestamp')
 
         console.print(f"Building training examples from {len(candle_groups)} candles...")
+        console.print(f"  Symmetry augmentation: {augment_symmetry}")
+        console.print(f"  Randomized positions: {randomize_positions}")
+
+        rng = np.random.default_rng(42)  # Reproducible randomness
 
         for candle_ts, candle_prices in candle_groups:
-            # Need at least 20 prices to have meaningful samples (start from idx 10)
+            # Need at least 20 prices to have meaningful samples
             if len(candle_prices) < 20:
                 continue
 
@@ -542,23 +548,20 @@ class TrainingDataBuilder:
                 btc_prices = None
                 btc_open = None
 
-            # Sample points within candle (start from index 10, end at last valid index)
+            # Sample points within candle
             max_idx = len(yes_prices) - 1
-            start_idx = min(10, max_idx - 1)  # Ensure start is valid
+            start_idx = min(10, max_idx - 1)
             sample_indices = np.linspace(
                 start_idx, max_idx, samples_per_candle, dtype=int
             )
-            sample_indices = np.unique(sample_indices)  # Remove duplicates
+            sample_indices = np.unique(sample_indices)
 
-            # Simulate position scenarios
-            scenarios = [
-                (False, None, 0.0, 0),  # No position
-                (True, "yes", 0.4, 10),  # Long YES from earlier
-                (True, "no", 0.6, 10),   # Long NO from earlier
-            ]
+            # Generate position scenarios
+            scenarios = self._generate_position_scenarios(
+                yes_prices, no_prices, rng, randomize_positions
+            )
 
             for idx in sample_indices:
-                # Ensure idx is within bounds
                 if idx >= len(yes_prices):
                     continue
                 time_remaining = max(0.0, 1.0 - idx / len(yes_prices))
@@ -578,9 +581,14 @@ class TrainingDataBuilder:
                 )
 
                 for has_pos, pos_side, entry_price, ticks_held in scenarios:
-                    # Compute position state
-                    current_price = yes_prices[idx] if pos_side == "yes" else no_prices[idx]
-                    max_pnl = 0.1 if has_pos else 0.0
+                    # Compute position state with realistic values
+                    if has_pos:
+                        current_price = yes_prices[idx] if pos_side == "yes" else no_prices[idx]
+                        unrealized = (current_price - entry_price) / (entry_price + 1e-8)
+                        max_pnl = max(unrealized, rng.uniform(0, 0.2))  # Random max PnL seen
+                    else:
+                        current_price = 0.0
+                        max_pnl = 0.0
 
                     position_state = EnhancedPositionState.compute(
                         has_position=has_pos,
@@ -592,8 +600,8 @@ class TrainingDataBuilder:
                         max_pnl_seen=max_pnl,
                     )
 
-                    # Compute optimal action using hindsight
-                    action, expected_return = labeler.compute_optimal_action(
+                    # Compute tradable action (NOT hindsight-optimal)
+                    action, expected_return = labeler.compute_tradable_action(
                         yes_prices=yes_prices,
                         current_idx=idx,
                         has_position=has_pos,
@@ -602,19 +610,157 @@ class TrainingDataBuilder:
                         outcome=outcome,
                     )
 
+                    # Validate action is valid for position state
+                    if not Action.is_valid(action, has_pos):
+                        console.print(f"[red]BUG: Invalid action {action} for has_pos={has_pos}[/red]")
+                        continue
+
                     features_list.append(features)
                     position_states_list.append(position_state)
                     actions_list.append(action)
                     returns_list.append(expected_return)
 
+                    # Symmetry augmentation: flip YES<->NO
+                    if augment_symmetry:
+                        aug_features, aug_pos, aug_action, aug_return = self._augment_flip(
+                            features, position_state, action, expected_return,
+                            has_pos, pos_side, yes_prices, no_prices, idx, time_remaining,
+                            entry_price, outcome, labeler, feature_builder, btc_slice, btc_open
+                        )
+                        if aug_features is not None:
+                            features_list.append(aug_features)
+                            position_states_list.append(aug_pos)
+                            actions_list.append(aug_action)
+                            returns_list.append(aug_return)
+
         console.print(f"[green]Built {len(features_list)} training examples[/green]")
 
-        return (
-            np.array(features_list, dtype=np.float32),
-            np.array(position_states_list, dtype=np.float32),
-            np.array(actions_list, dtype=np.int64),
-            np.array(returns_list, dtype=np.float32),
+        # Verify no invalid actions
+        features_arr = np.array(features_list, dtype=np.float32)
+        position_arr = np.array(position_states_list, dtype=np.float32)
+        actions_arr = np.array(actions_list, dtype=np.int64)
+        returns_arr = np.array(returns_list, dtype=np.float32)
+
+        # Final validation
+        has_pos_arr = position_arr[:, 0] > 0.5
+        for i in range(len(actions_arr)):
+            if not Action.is_valid(actions_arr[i], bool(has_pos_arr[i])):
+                console.print(f"[red]FATAL: Invalid action in final dataset at idx {i}[/red]")
+
+        return features_arr, position_arr, actions_arr, returns_arr
+
+    def _generate_position_scenarios(
+        self,
+        yes_prices: np.ndarray,
+        no_prices: np.ndarray,
+        rng: np.random.Generator,
+        randomize: bool,
+    ) -> List[Tuple[bool, Optional[str], float, int]]:
+        """
+        Generate position scenarios for training.
+
+        Returns list of (has_position, side, entry_price, ticks_held)
+        """
+        scenarios = [
+            (False, None, 0.0, 0),  # No position (always include)
+        ]
+
+        if randomize:
+            # Randomized YES position
+            yes_entry = rng.uniform(0.2, 0.8)  # Realistic entry prices
+            yes_ticks = rng.integers(1, 50)
+            scenarios.append((True, "yes", yes_entry, yes_ticks))
+
+            # Randomized NO position
+            no_entry = rng.uniform(0.2, 0.8)
+            no_ticks = rng.integers(1, 50)
+            scenarios.append((True, "no", no_entry, no_ticks))
+        else:
+            # Fixed scenarios (legacy)
+            scenarios.append((True, "yes", 0.4, 10))
+            scenarios.append((True, "no", 0.6, 10))
+
+        return scenarios
+
+    def _augment_flip(
+        self,
+        features: np.ndarray,
+        position_state: np.ndarray,
+        action: int,
+        expected_return: float,
+        has_pos: bool,
+        pos_side: Optional[str],
+        yes_prices: np.ndarray,
+        no_prices: np.ndarray,
+        idx: int,
+        time_remaining: float,
+        entry_price: float,
+        outcome: int,
+        labeler,
+        feature_builder,
+        btc_slice: Optional[np.ndarray],
+        btc_open: Optional[float],
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[int], Optional[float]]:
+        """
+        Create augmented sample by flipping YES<->NO.
+
+        This enforces symmetry: if the model learns YES bias from data,
+        the augmented NO examples will cancel it out.
+        """
+        from src.models.market_predictor import EnhancedPositionState, Action
+
+        # Flip outcome
+        flipped_outcome = 1 - outcome
+
+        # Flip position side
+        if has_pos:
+            flipped_side = "no" if pos_side == "yes" else "yes"
+        else:
+            flipped_side = None
+
+        # Compute features with flipped prices (NO becomes YES, YES becomes NO)
+        aug_features = feature_builder.compute_features(
+            yes_prices=no_prices[:idx+1],  # Swapped
+            no_prices=yes_prices[:idx+1],  # Swapped
+            time_remaining=time_remaining,
+            btc_prices=btc_slice,
+            btc_open=btc_open,
         )
+
+        # Compute position state for flipped side
+        if has_pos:
+            flipped_current = no_prices[idx] if flipped_side == "yes" else yes_prices[idx]
+            unrealized = (flipped_current - entry_price) / (entry_price + 1e-8)
+            max_pnl = max(unrealized, 0.1)
+        else:
+            flipped_current = 0.0
+            max_pnl = 0.0
+
+        aug_pos = EnhancedPositionState.compute(
+            has_position=has_pos,
+            position_side=flipped_side,
+            entry_price=entry_price,
+            current_price=flipped_current,
+            time_remaining=time_remaining,
+            ticks_held=10,
+            max_pnl_seen=max_pnl,
+        )
+
+        # Compute action for flipped scenario
+        aug_action, aug_return = labeler.compute_tradable_action(
+            yes_prices=no_prices,  # Swapped
+            current_idx=idx,
+            has_position=has_pos,
+            position_side=flipped_side,
+            entry_price=entry_price,
+            outcome=flipped_outcome,
+        )
+
+        # Validate
+        if not Action.is_valid(aug_action, has_pos):
+            return None, None, None, None
+
+        return aug_features, aug_pos, aug_action, aug_return
 
 
 async def collect_training_data(

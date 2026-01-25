@@ -42,6 +42,11 @@ dependencies = [
     "rich>=13.7.0",
     "typer>=0.9.0",
     
+    # Web3 / On-Chain
+    "web3>=6.0.0",
+    "eth-abi>=4.0.0",
+    "eth-account>=0.8.0",
+    
     # Technical Analysis
     "ta>=0.11.0",
     
