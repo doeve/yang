@@ -863,7 +863,7 @@ class UnifiedPaperTrader:
         trades_table.add_column("PnL", width=8)
         trades_table.add_column("Reason", width=6)
 
-        recent_trades = list(reversed(self.state.trades[-10:]))
+        recent_trades = list(reversed(self.state.trades[-15:]))
         for trade in recent_trades:
             side_color = "green" if trade["side"] == "yes" else "red"
             pnl_color = "green" if trade["pnl"] > 0 else "red"
