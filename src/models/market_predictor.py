@@ -480,18 +480,18 @@ class TradableActionLabeler:
         # Current unrealized PnL
         unrealized_pnl = (current_price - entry_price) / (entry_price + 1e-8)
 
-        # Expected value of HOLD (using market-implied, NOT hindsight)
-        expected_hold_return = (implied_settlement - entry_price) / (entry_price + 1e-8)
-        expected_hold_return -= self.transaction_cost
+        # Expected value of HOLD (using ACTUAL settlement for training target)
+        actual_hold_return = (actual_settlement - entry_price) / (entry_price + 1e-8)
+        # Note: No transaction cost deducted for holding (already paid/sunk)
 
         # Value of EXIT now
         exit_return = unrealized_pnl - self.transaction_cost
 
-        # Decision: EXIT if current exit is better than expected hold
+        # Decision: EXIT if current exit is better than expected hold (hindsight)
         # Also EXIT if time is very low and position is profitable
         should_exit = (
-            exit_return > expected_hold_return or
-            (time_remaining < 0.1 and exit_return > 0)
+            exit_return > actual_hold_return or
+            (time_remaining < 0.1 and exit_return > 0 and exit_return > actual_hold_return)
         )
 
         if should_exit:
@@ -499,7 +499,7 @@ class TradableActionLabeler:
             capped_return = np.clip(exit_return, -self.return_cap, self.return_cap)
             return Action.EXIT, capped_return
         else:
-            capped_return = np.clip(expected_hold_return, -self.return_cap, self.return_cap)
+            capped_return = np.clip(actual_hold_return, -self.return_cap, self.return_cap)
             return Action.HOLD, capped_return
 
     def _compute_entry_action(
@@ -547,13 +547,13 @@ class TradableActionLabeler:
             if actual_yes_return > self.min_edge_threshold and yes_edge > 0:
                 # YES would have worked and market underpriced it
                 best_action = Action.BUY_YES
-                # Return is tradable expectation, NOT hindsight return
-                best_return = np.clip(yes_expected_return, -self.return_cap, self.return_cap)
+                # Return is ACTUAL realized return for training target
+                best_return = np.clip(actual_yes_return, -self.return_cap, self.return_cap)
 
             elif actual_no_return > self.min_edge_threshold and no_edge > 0:
                 # NO would have worked and market underpriced it
                 best_action = Action.BUY_NO
-                best_return = np.clip(no_expected_return, -self.return_cap, self.return_cap)
+                best_return = np.clip(actual_no_return, -self.return_cap, self.return_cap)
 
         return best_action, best_return
 
