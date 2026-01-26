@@ -236,7 +236,7 @@ class UnifiedPaperTrader:
             "model_output": {
                 "action": model_output["action"],
                 "action_name": Action.names()[model_output["action"]],
-                "q_values": model_output["q_values"],
+                "action_logits": model_output["action_logits"],
                 "confidence": model_output["confidence"],
                 "expected_return": model_output["expected_return"],
             },
@@ -424,7 +424,7 @@ class UnifiedPaperTrader:
         if self.model is None:
             return {
                 "action": Action.WAIT,
-                "q_values": [0.0] * 5,
+                "action_logits": [0.0] * 5,
                 "confidence": 0.0,
                 "expected_return": 0.0,
             }
@@ -470,27 +470,27 @@ class UnifiedPaperTrader:
         result = self.model.get_action(features_t, position_t, deterministic=True)
 
         action = int(result["action"].item())
-        q_values = result["q_values"].squeeze(0).cpu().numpy().tolist()
+        action_logits = result["action_logits"].squeeze(0).cpu().numpy().tolist()
         confidence = float(result["confidence"].item())
         expected_return = float(result["expected_return"].item())
 
         # Update state
         self.state.last_action = action
-        self.state.last_q_values = q_values
+        self.state.last_action_logits = action_logits
         self.state.last_confidence = confidence
         self.state.last_expected_return = expected_return
 
         # Log
         self._log_tick(features, position_state, {
             "action": action,
-            "q_values": q_values,
+            "action_logits": action_logits,
             "confidence": confidence,
             "expected_return": expected_return,
         })
 
         return {
             "action": action,
-            "q_values": q_values,
+            "action_logits": action_logits,
             "confidence": confidence,
             "expected_return": expected_return,
             "features": features,
@@ -605,7 +605,7 @@ class UnifiedPaperTrader:
             "dollar_size": dollar_size,
             "expected_return": model_output["expected_return"],
             "confidence": model_output["confidence"],
-            "q_values": model_output["q_values"],
+            "action_logits": model_output["action_logits"],
             "time_remaining": self.get_time_remaining(),
         })
 
@@ -832,7 +832,7 @@ class UnifiedPaperTrader:
         left_table.add_row("E[Return]", f"{self.state.last_expected_return:+.1%}")
 
         # Q-values
-        q_str = " ".join([f"{q:.2f}" for q in self.state.last_q_values])
+        q_str = " ".join([f"{q:.2f}" for q in self.state.last_action_logits])
         left_table.add_row("Q-values", f"[dim]{q_str}[/]")
 
         # Position
@@ -1029,7 +1029,7 @@ class BacktestRunner:
             "model_output": {
                 "action": model_output["action"],
                 "action_name": Action.names()[model_output["action"]],
-                "q_values": model_output["q_values"],
+                "action_logits": model_output["action_logits"],
                 "confidence": model_output["confidence"],
                 "expected_return": model_output["expected_return"],
             },
@@ -1307,7 +1307,7 @@ class BacktestRunner:
     def _get_model_action(self, state: UnifiedTradingState, time_remaining: float) -> Dict[str, Any]:
         """Get action from model."""
         if self.model is None:
-            return {"action": Action.WAIT, "q_values": [0]*5, "confidence": 0, "expected_return": 0}
+            return {"action": Action.WAIT, "action_logits": [0]*5, "confidence": 0, "expected_return": 0}
 
         yes_prices = np.array(state.yes_price_history[-300:] or [0.5])
         no_prices = np.array(state.no_price_history[-300:] or [0.5])
@@ -1344,7 +1344,7 @@ class BacktestRunner:
 
         return {
             "action": int(result["action"].item()),
-            "q_values": result["q_values"].squeeze(0).cpu().numpy().tolist(),
+            "action_logits": result["action_logits"].squeeze(0).cpu().numpy().tolist(),
             "confidence": float(result["confidence"].item()),
             "expected_return": float(result["expected_return"].item()),
         }

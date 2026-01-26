@@ -378,63 +378,65 @@ def analyze_equity_and_drawdown(ticks: List[Dict], trades: List[Dict]) -> Dict:
     return result
 
 
-def analyze_q_values(ticks: List[Dict]) -> Dict:
+def analyze_action_logits(ticks: List[Dict]) -> Dict:
     """
-    Analyze Q-value health - scale, spread, and patterns.
+    Analyze action logits health - scale, spread, and patterns.
+    Handles both old 'q_values' and new 'action_logits' field names.
     """
     result = {
-        'q_value_stats': {},
-        'q_value_spread': [],  # Difference between best and second-best
-        'action_q_dominance': defaultdict(int),  # How often each action has highest Q
-        'q_scale_issue': False,
-        'q_values_by_action': defaultdict(list),
+        'logit_stats': {},
+        'logit_spread': [],  # Difference between best and second-best
+        'action_dominance': defaultdict(int),  # How often each action has highest logit
+        'scale_issue': False,
+        'logits_by_action': defaultdict(list),
     }
 
     for tick in ticks:
         mo = tick.get('model_output', {})
-        q_values = mo.get('q_values', [])
+        # Handle both old and new field names
+        logits = mo.get('action_logits') or mo.get('q_values', [])
         action = mo.get('action', 0)
         action_name = mo.get('action_name', '')
 
-        if not q_values or len(q_values) < 2:
+        if not logits or len(logits) < 2:
             continue
 
-        q_arr = np.array(q_values)
+        q_arr = np.array(logits)
 
-        # Track which action has max Q
-        max_q_action = np.argmax(q_arr)
+        # Track which action has max logit
+        max_action = np.argmax(q_arr)
         action_names = ['WAIT', 'BUY_YES', 'BUY_NO', 'EXIT', 'HOLD']
-        if max_q_action < len(action_names):
-            result['action_q_dominance'][action_names[max_q_action]] += 1
+        if max_action < len(action_names):
+            result['action_dominance'][action_names[max_action]] += 1
 
-        # Q-value spread (decision margin)
+        # Logit spread (decision margin)
         sorted_q = np.sort(q_arr)[::-1]
         spread = sorted_q[0] - sorted_q[1]
-        result['q_value_spread'].append(spread)
+        result['logit_spread'].append(spread)
 
-        # Store Q-values by action taken
-        result['q_values_by_action'][action_name].append(q_arr.tolist())
+        # Store logits by action taken
+        result['logits_by_action'][action_name].append(q_arr.tolist())
 
     # Compute stats
-    if result['q_value_spread']:
-        spreads = result['q_value_spread']
-        result['q_value_stats'] = {
+    if result['logit_spread']:
+        spreads = result['logit_spread']
+        result['logit_stats'] = {
             'mean_spread': np.mean(spreads),
             'min_spread': np.min(spreads),
             'max_spread': np.max(spreads),
             'std_spread': np.std(spreads),
         }
 
-        # Check for Q-scale issues
-        all_q = []
-        for qlist in result['q_values_by_action'].values():
+        # Check for scale issues (very negative = old Q-learning bug)
+        all_logits = []
+        for qlist in result['logits_by_action'].values():
             for q in qlist:
-                all_q.extend(q)
-        if all_q:
-            mean_q = np.mean(all_q)
-            if mean_q < -50:
-                result['q_scale_issue'] = True
-                result['q_scale_warning'] = f"Q-values are very negative (mean={mean_q:.1f}). This suggests reward scaling issues or training instability."
+                all_logits.extend(q)
+        if all_logits:
+            mean_logit = np.mean(all_logits)
+            if mean_logit < -50:
+                result['scale_issue'] = True
+                result['scale_warning'] = f"Action logits are very negative (mean={mean_logit:.1f}). This suggests old Q-learning model or training issue."
 
     return result
 
@@ -621,7 +623,7 @@ def analyze_btc_momentum(ticks: List[Dict], trades: List[Dict]) -> Dict:
 
 def analyze_action_consistency(ticks: List[Dict]) -> Dict:
     """
-    Analyze if model action matches max Q-value (should always match for deterministic policy).
+    Analyze if model action matches max logit (should always match for deterministic policy).
     Also detect HOLD-without-position bugs.
     """
     result = {
@@ -637,16 +639,17 @@ def analyze_action_consistency(ticks: List[Dict]) -> Dict:
 
     for tick in ticks:
         mo = tick.get('model_output', {})
-        q_values = mo.get('q_values', [])
+        # Handle both old and new field names
+        logits = mo.get('action_logits') or mo.get('q_values', [])
         action = mo.get('action', 0)
         action_name = mo.get('action_name', '')
         position = tick.get('position', {})
         has_position = position.get('side') is not None
 
-        # Check Q-value consistency
-        if q_values and len(q_values) > action:
-            max_q_action = np.argmax(q_values)
-            if max_q_action != action:
+        # Check logit consistency (action should match argmax of logits)
+        if logits and len(logits) > action:
+            max_logit_action = np.argmax(logits)
+            if max_logit_action != action:
                 result['action_mismatch_count'] += 1
 
         # Check HOLD/EXIT without position
@@ -932,28 +935,28 @@ def print_equity_analysis(analysis: Dict):
         print(f"\n  ⚠️  WARNING: Max drawdown {analysis['max_drawdown']:.1%} exceeds 15%!")
 
 
-def print_q_value_analysis(analysis: Dict):
-    """Print Q-value health analysis."""
+def print_logit_analysis(analysis: Dict):
+    """Print action logits health analysis."""
     print(f"\n{'='*60}")
-    print(f"  Q-VALUE HEALTH CHECK")
+    print(f"  ACTION LOGITS HEALTH CHECK")
     print(f"{'='*60}")
 
-    stats = analysis.get('q_value_stats', {})
+    stats = analysis.get('logit_stats', {})
     if stats:
-        print(f"\nQ-Value Spread (decision margin):")
+        print(f"\nLogit Spread (decision margin):")
         print(f"  Mean: {stats.get('mean_spread', 0):.3f}")
         print(f"  Min: {stats.get('min_spread', 0):.3f}")
         print(f"  Max: {stats.get('max_spread', 0):.3f}")
         print(f"  Std: {stats.get('std_spread', 0):.3f}")
 
-    print(f"\nAction by Max Q-Value:")
-    dominance = analysis.get('action_q_dominance', {})
+    print(f"\nAction by Max Logit:")
+    dominance = analysis.get('action_dominance', {})
     total = sum(dominance.values()) or 1
     for action, count in sorted(dominance.items(), key=lambda x: -x[1]):
         print(f"  {action:12}: {count:5} ({count/total*100:.1f}%)")
 
-    if analysis.get('q_scale_issue'):
-        print(f"\n  ⚠️  {analysis.get('q_scale_warning', 'Q-value scale issue detected')}")
+    if analysis.get('scale_issue'):
+        print(f"\n  ⚠️  {analysis.get('scale_warning', 'Logit scale issue detected')}")
 
 
 def print_predicted_vs_actual(analysis: Dict):
@@ -1087,7 +1090,7 @@ def print_candle_performance(analysis: Dict):
 
 def print_recommendations_summary(
     equity: Dict,
-    q_analysis: Dict,
+    logit_analysis: Dict,
     pred_actual: Dict,
     consistency: Dict,
     time_effect: Dict,
@@ -1109,8 +1112,8 @@ def print_recommendations_summary(
     if consistency.get('exit_without_position', 0) > 0:
         issues.append((1, "CRITICAL BUG", "Model outputs EXIT when no position exists. Fix action masking in training."))
 
-    if q_analysis.get('q_scale_issue'):
-        issues.append((2, "TRAINING ISSUE", "Q-values are severely negative. Check reward scaling and discount factor."))
+    if logit_analysis.get('scale_issue'):
+        issues.append((2, "TRAINING ISSUE", "Action logits are severely negative. Likely old Q-learning model - retrain with classification."))
 
     if pred_actual.get('overconfident'):
         issues.append((2, "CALIBRATION", f"Model overconfident: predicts {pred_actual['mean_predicted']:+.1%}, achieves {pred_actual['mean_actual']:+.1%}"))
@@ -1267,9 +1270,9 @@ def analyze_log(entries: list, name: str, detailed: bool = True):
         equity_analysis = analyze_equity_and_drawdown(ticks, trades)
         print_equity_analysis(equity_analysis)
 
-        # Q-value health check
-        q_analysis = analyze_q_values(ticks)
-        print_q_value_analysis(q_analysis)
+        # Action logits health check
+        logit_analysis = analyze_action_logits(ticks)
+        print_logit_analysis(logit_analysis)
 
         # Predicted vs actual returns
         pred_actual = analyze_predicted_vs_actual(ticks, trades)
@@ -1309,7 +1312,7 @@ def analyze_log(entries: list, name: str, detailed: bool = True):
 
         # Final recommendations summary
         print_recommendations_summary(
-            equity_analysis, q_analysis, pred_actual, consistency,
+            equity_analysis, logit_analysis, pred_actual, consistency,
             time_effect, btc_momentum, bad_trades, missed
         )
 

@@ -217,7 +217,7 @@ def train_model(
         outputs = model(x)
 
         # Action accuracy
-        pred_actions = outputs['q_values'].argmax(dim=-1)
+        pred_actions = outputs['action_logits'].argmax(dim=-1)
         accuracy = (pred_actions == test_actions_t).float().mean().item()
 
         # Return MSE
