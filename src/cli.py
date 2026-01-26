@@ -1715,7 +1715,7 @@ def train_probability_cmd(
             "correlation": float(metrics["correlation"]),
             "accuracy": float(metrics["accuracy"]),
             "temperature": optimal_temp,
-            "gates_passed": gates_passed,
+            "gates_passed": bool(gates_passed),
             "timestamp": datetime.now().isoformat(),
         }, f, indent=2)
 
