@@ -762,6 +762,221 @@ class TrainingDataBuilder:
 
         return aug_features, aug_pos, aug_action, aug_return
 
+    def build_attention_training_examples(
+        self,
+        data: Dict[str, pd.DataFrame],
+        samples_per_candle: int = 10,
+        augment_symmetry: bool = True,
+        randomize_positions: bool = True,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Build training examples for attention-based model with KAMA features.
+
+        Returns:
+            (kama_spectrum, context_features, base_features, 
+             position_states, actions, returns)
+        """
+        from src.data.enhanced_features import EnhancedFeatureBuilder
+        from src.data.kama_features import KAMAFeatureBuilder
+        from src.models.market_predictor import (
+            TradableActionLabeler,
+            EnhancedPositionState,
+            Action,
+        )
+
+        enhanced_builder = EnhancedFeatureBuilder()
+        kama_builder = KAMAFeatureBuilder()
+        labeler = TradableActionLabeler()
+
+        kama_spectrum_list = []
+        context_features_list = []
+        base_features_list = []
+        position_states_list = []
+        actions_list = []
+        returns_list = []
+
+        prices_df = data.get('prices', pd.DataFrame())
+        candles_df = data.get('candles', pd.DataFrame())
+        btc_df = data.get('btc', pd.DataFrame())
+
+        if prices_df.empty or candles_df.empty:
+            console.print("[red]No price or candle data available![/red]")
+            return (np.array([]), np.array([]), np.array([]), 
+                    np.array([]), np.array([]), np.array([]))
+
+        candle_groups = prices_df.groupby('candle_timestamp')
+
+        console.print(f"Building ATTENTION training examples from {len(candle_groups)} candles...")
+        console.print(f"  KAMA spectrum dim: {kama_builder.kama_feature_dim}")
+        console.print(f"  Context dim: {kama_builder.context_feature_dim}")
+        console.print(f"  Symmetry augmentation: {augment_symmetry}")
+
+        rng = np.random.default_rng(42)
+
+        for candle_ts, candle_prices in candle_groups:
+            if len(candle_prices) < 20:
+                continue
+
+            outcome = candle_prices['outcome'].iloc[0]
+            yes_prices = candle_prices['price'].values
+            no_prices = 1.0 - yes_prices
+
+            # Get BTC data for this candle
+            candle_start = pd.Timestamp(candle_ts, unit='s', tz='UTC')
+            candle_end = candle_start + pd.Timedelta(minutes=15)
+
+            if not btc_df.empty and 'timestamp' in btc_df.columns:
+                btc_mask = (btc_df['timestamp'] >= candle_start) & (btc_df['timestamp'] < candle_end)
+                btc_candle = btc_df.loc[btc_mask]
+                if not btc_candle.empty:
+                    btc_prices = btc_candle['close'].values
+                    btc_open = btc_prices[0]
+                else:
+                    btc_prices = None
+                    btc_open = None
+            else:
+                btc_prices = None
+                btc_open = None
+
+            # Sample points within candle
+            max_idx = len(yes_prices) - 1
+            start_idx = min(10, max_idx - 1)
+            sample_indices = np.linspace(
+                start_idx, max_idx, samples_per_candle, dtype=int
+            )
+            sample_indices = np.unique(sample_indices)
+
+            # Generate position scenarios
+            scenarios = self._generate_position_scenarios(
+                yes_prices, no_prices, rng, randomize_positions
+            )
+
+            for idx in sample_indices:
+                if idx >= len(yes_prices):
+                    continue
+                time_remaining = max(0.0, 1.0 - idx / len(yes_prices))
+
+                # Compute KAMA spectrum and context
+                kama_spectrum, context_features = kama_builder.compute_features(
+                    yes_prices=yes_prices[:idx+1],
+                    time_remaining=time_remaining,
+                )
+
+                # Compute base features (enhanced features)
+                btc_slice = None
+                if btc_prices is not None and len(btc_prices) > 0:
+                    btc_idx = min(idx + 1, len(btc_prices))
+                    btc_slice = btc_prices[:btc_idx]
+
+                base_features = enhanced_builder.compute_features(
+                    yes_prices=yes_prices[:idx+1],
+                    no_prices=no_prices[:idx+1],
+                    time_remaining=time_remaining,
+                    btc_prices=btc_slice,
+                    btc_open=btc_open,
+                )
+
+                for has_pos, pos_side, entry_price, ticks_held in scenarios:
+                    if has_pos:
+                        current_price = yes_prices[idx] if pos_side == "yes" else no_prices[idx]
+                        unrealized = (current_price - entry_price) / (entry_price + 1e-8)
+                        max_pnl = max(unrealized, rng.uniform(0, 0.2))
+                    else:
+                        current_price = 0.0
+                        max_pnl = 0.0
+
+                    position_state = EnhancedPositionState.compute(
+                        has_position=has_pos,
+                        position_side=pos_side,
+                        entry_price=entry_price,
+                        current_price=current_price,
+                        time_remaining=time_remaining,
+                        ticks_held=ticks_held,
+                        max_pnl_seen=max_pnl,
+                    )
+
+                    action, expected_return = labeler.compute_tradable_action(
+                        yes_prices=yes_prices,
+                        current_idx=idx,
+                        has_position=has_pos,
+                        position_side=pos_side,
+                        entry_price=entry_price,
+                        outcome=outcome,
+                    )
+
+                    if not Action.is_valid(action, has_pos):
+                        continue
+
+                    kama_spectrum_list.append(kama_spectrum)
+                    context_features_list.append(context_features)
+                    base_features_list.append(base_features)
+                    position_states_list.append(position_state)
+                    actions_list.append(action)
+                    returns_list.append(expected_return)
+
+                    # Symmetry augmentation
+                    if augment_symmetry:
+                        # Flip KAMA spectrum (compute on NO prices)
+                        aug_kama, aug_context = kama_builder.compute_features(
+                            yes_prices=no_prices[:idx+1],
+                            time_remaining=time_remaining,
+                        )
+                        
+                        # Flip base features
+                        aug_base = enhanced_builder.compute_features(
+                            yes_prices=no_prices[:idx+1],
+                            no_prices=yes_prices[:idx+1],
+                            time_remaining=time_remaining,
+                            btc_prices=btc_slice,
+                            btc_open=btc_open,
+                        )
+                        
+                        # Flip position side
+                        if has_pos:
+                            flipped_side = "no" if pos_side == "yes" else "yes"
+                            flipped_current = no_prices[idx] if flipped_side == "yes" else yes_prices[idx]
+                        else:
+                            flipped_side = None
+                            flipped_current = 0.0
+
+                        aug_pos_state = EnhancedPositionState.compute(
+                            has_position=has_pos,
+                            position_side=flipped_side,
+                            entry_price=entry_price,
+                            current_price=flipped_current,
+                            time_remaining=time_remaining,
+                            ticks_held=ticks_held,
+                            max_pnl_seen=max_pnl,
+                        )
+
+                        aug_action, aug_return = labeler.compute_tradable_action(
+                            yes_prices=no_prices,
+                            current_idx=idx,
+                            has_position=has_pos,
+                            position_side=flipped_side,
+                            entry_price=entry_price,
+                            outcome=1 - outcome,
+                        )
+
+                        if Action.is_valid(aug_action, has_pos):
+                            kama_spectrum_list.append(aug_kama)
+                            context_features_list.append(aug_context)
+                            base_features_list.append(aug_base)
+                            position_states_list.append(aug_pos_state)
+                            actions_list.append(aug_action)
+                            returns_list.append(aug_return)
+
+        console.print(f"[green]Built {len(kama_spectrum_list)} ATTENTION training examples[/green]")
+
+        return (
+            np.array(kama_spectrum_list, dtype=np.float32),
+            np.array(context_features_list, dtype=np.float32),
+            np.array(base_features_list, dtype=np.float32),
+            np.array(position_states_list, dtype=np.float32),
+            np.array(actions_list, dtype=np.int64),
+            np.array(returns_list, dtype=np.float32),
+        )
+
 
 async def collect_training_data(
     output_dir: str = "./data/historical",
