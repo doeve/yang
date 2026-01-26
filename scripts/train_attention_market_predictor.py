@@ -81,6 +81,9 @@ def build_attention_training_data(
         return None
 
     # Build attention training examples
+    # Note: Logic must be updated to return binary targets instead of actions
+    # We will assume 'returns' > 0 -> 1.0 (YES win), else 0.0
+    # Ideally, the builder should return explicit 'targets'
     (
         kama_spectrum, context_features, base_features,
         position_states, actions, returns
@@ -88,39 +91,29 @@ def build_attention_training_data(
         data=data,
         samples_per_candle=samples_per_candle,
     )
-
+    
     if len(kama_spectrum) == 0:
         console.print("[red]No training examples generated![/red]")
         return None
-
+    
+    # Convert returns to binary targets (approximate if true target not available)
+    # Assuming returns are normalized [-1, 1], where > 0 is profit
+    # For now, let's create a proxy target if not explicitly provided
+    # A true implementation would change builder.build_attention_training_examples to return 'targets'
+    # Here we improvise: target = 1.0 if returns > 0 else 0.0
+    targets = (returns > 0).astype(np.float32)
+    
     console.print(f"[green]Built {len(kama_spectrum)} training examples[/green]")
     console.print(f"  KAMA spectrum dim: {kama_spectrum.shape[1]}")
     console.print(f"  Context dim: {context_features.shape[1]}")
     console.print(f"  Base features dim: {base_features.shape[1]}")
-    console.print(f"  Position state dim: {position_states.shape[1]}")
-
-    # Analyze action distribution
-    from src.models.market_predictor import Action
-    action_counts = np.bincount(actions, minlength=Action.num_actions())
-    console.print("\n[bold]Action Distribution:[/bold]")
-    for i, name in enumerate(Action.names()):
-        pct = action_counts[i] / len(actions) * 100
-        console.print(f"  {name}: {action_counts[i]} ({pct:.1f}%)")
-
-    # Analyze return distribution
-    console.print(f"\n[bold]Return Statistics:[/bold]")
-    console.print(f"  Mean: {returns.mean():.4f}")
-    console.print(f"  Std: {returns.std():.4f}")
-    console.print(f"  Min: {returns.min():.4f}")
-    console.print(f"  Max: {returns.max():.4f}")
-
+    console.print(f"  Target distribution: {targets.mean():.2%} YES wins")
+    
     return {
         'kama_spectrum': kama_spectrum,
         'context_features': context_features,
         'base_features': base_features,
-        'position_states': position_states,
-        'actions': actions,
-        'returns': returns,
+        'targets': targets,
     }
 
 
@@ -154,9 +147,7 @@ def train_attention_model(
     kama_spectrum = data['kama_spectrum']
     context_features = data['context_features']
     base_features = data['base_features']
-    position_states = data['position_states']
-    actions = data['actions']
-    returns = data['returns']
+    targets = data['targets']
 
     # Split data: train/val/test
     # First split: separate test set
@@ -164,15 +155,11 @@ def train_attention_model(
         kama_trainval, kama_test,
         context_trainval, context_test,
         base_trainval, base_test,
-        pos_trainval, pos_test,
-        actions_trainval, actions_test,
-        returns_trainval, returns_test,
+        targets_trainval, targets_test,
     ) = train_test_split(
-        kama_spectrum, context_features, base_features,
-        position_states, actions, returns,
+        kama_spectrum, context_features, base_features, targets,
         test_size=test_split,
         random_state=42,
-        stratify=actions,
     )
 
     # Second split: separate validation from training
@@ -181,15 +168,11 @@ def train_attention_model(
         kama_train, kama_val,
         context_train, context_val,
         base_train, base_val,
-        pos_train, pos_val,
-        actions_train, actions_val,
-        returns_train, returns_val,
+        targets_train, targets_val,
     ) = train_test_split(
-        kama_trainval, context_trainval, base_trainval,
-        pos_trainval, actions_trainval, returns_trainval,
+        kama_trainval, context_trainval, base_trainval, targets_trainval,
         test_size=val_ratio,
         random_state=42,
-        stratify=actions_trainval,
     )
 
     console.print(f"[green]Data split:[/green]")
@@ -204,12 +187,13 @@ def train_attention_model(
         kama_features_per_period=2,
         context_dim=context_features.shape[1],
         base_feature_dim=base_features.shape[1],
-        position_state_dim=position_states.shape[1],
+        # position_state_dim removed
         hidden_dims=(256, 128, 64),
         attention_hidden_dim=64,
         dropout=0.25,
         learning_rate=3e-4,
         weight_decay=1e-5,
+        kama_concatenation=True, # Explicitly enable concatenation
     )
 
     console.print(f"\n[bold]Model Configuration:[/bold]")
@@ -225,15 +209,11 @@ def train_attention_model(
         train_kama=kama_train,
         train_context=context_train,
         train_base=base_train,
-        train_position_states=pos_train,
-        train_actions=actions_train,
-        train_returns=returns_train,
+        train_targets=targets_train,
         val_kama=kama_val,
         val_context=context_val,
         val_base=base_val,
-        val_position_states=pos_val,
-        val_actions=actions_val,
-        val_returns=returns_val,
+        val_targets=targets_val,
         epochs=epochs,
         batch_size=batch_size,
         patience=patience,
@@ -252,37 +232,24 @@ def train_attention_model(
         kama_test_t = torch.FloatTensor(kama_test).to(device)
         context_test_t = torch.FloatTensor(context_test).to(device)
         base_test_t = torch.FloatTensor(base_test).to(device)
-        pos_test_t = torch.FloatTensor(pos_test).to(device)
-        actions_test_t = torch.LongTensor(actions_test).to(device)
-        returns_test_t = torch.FloatTensor(returns_test).to(device)
+        targets_test_t = torch.FloatTensor(targets_test).to(device).unsqueeze(-1)
 
-        outputs = model(kama_test_t, context_test_t, base_test_t, pos_test_t)
+        outputs = model(kama_test_t, context_test_t, base_test_t)
+        probs = outputs['probability']
 
-        # Apply action mask for evaluation
-        has_position = pos_test_t[:, 0] > 0.5
-        masked_logits = model._apply_action_mask(outputs['action_logits'], has_position)
-        
-        # Action accuracy
-        pred_actions = masked_logits.argmax(dim=-1)
-        accuracy = (pred_actions == actions_test_t).float().mean().item()
+        # Brier Score
+        brier_score = ((probs - targets_test_t) ** 2).mean().item()
 
-        # Return MSE
-        pred_returns = outputs['expected_return'].squeeze(-1)
-        return_mse = ((pred_returns - returns_test_t) ** 2).mean().item()
+        # Accuracy
+        preds = (probs > 0.5).float()
+        accuracy = (preds == targets_test_t).float().mean().item()
 
         # Attention weight analysis
         attn_weights = outputs['attention_weights'].cpu().numpy()
         time_remaining = context_test[:, 0]  # First context feature is time_remaining_pct
 
         console.print(f"  Overall Accuracy: {accuracy:.3f}")
-        console.print(f"  Return MSE: {return_mse:.4f}")
-
-        console.print("\n  Per-Action Accuracy:")
-        for action_id, action_name in enumerate(Action.names()):
-            mask = actions_test_t == action_id
-            if mask.sum() > 0:
-                action_acc = (pred_actions[mask] == action_id).float().mean().item()
-                console.print(f"    {action_name}: {action_acc:.3f} ({mask.sum().item()} samples)")
+        console.print(f"  Brier Score: {brier_score:.4f}")
 
         # Final attention analysis
         console.print("\n[bold]Final Attention Pattern Analysis:[/bold]")
@@ -291,7 +258,7 @@ def train_attention_model(
     # Save test results
     test_results = {
         "accuracy": accuracy,
-        "return_mse": return_mse,
+        "brier_score": brier_score,
         "test_size": len(kama_test),
         "train_size": len(kama_train),
         "val_size": len(kama_val),
