@@ -1577,6 +1577,222 @@ def paper_trade_unified_cmd(
     asyncio.run(trader.run())
 
 
+@app.command("train-probability")
+def train_probability_cmd(
+    data_dir: str = typer.Option("./data/historical", help="Data directory"),
+    output: str = typer.Option("./logs/probability_v1", help="Output directory for model"),
+    days: int = typer.Option(30, help="Days of historical data"),
+    epochs: int = typer.Option(100, help="Training epochs"),
+    batch_size: int = typer.Option(128, help="Batch size"),
+    lr: float = typer.Option(3e-4, help="Learning rate"),
+    samples_per_candle: int = typer.Option(20, help="Samples per candle"),
+    focal_loss: bool = typer.Option(False, help="Use focal loss instead of Brier"),
+    no_augment: bool = typer.Option(False, help="Disable symmetry augmentation"),
+    min_time: float = typer.Option(0.35, help="Min time remaining for samples"),
+):
+    """Train calibrated probability predictor (NEW ARCHITECTURE).
+
+    This replaces hindsight action labeling with direct probability estimation:
+    - Output: P(YES | features) calibrated probability
+    - Loss: Brier score for calibration
+    - No position state, no action classification
+    - Post-hoc temperature scaling
+
+    Edge is computed externally: edge = P(YES) - market_price_yes
+
+    Usage:
+        # Train probability predictor (data must be collected first)
+        yang train-probability --output ./logs/probability_v1
+
+        # With focal loss for class imbalance
+        yang train-probability --output ./logs/probability_v1 --focal-loss
+    """
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+
+    from scripts.train_probability_predictor import (
+        ProbabilityTrainingDataBuilder,
+        print_calibration_report,
+    )
+    from src.models.probability_predictor import (
+        ProbabilityPredictorConfig,
+        ProbabilityPredictorTrainer,
+        calibrate_temperature,
+        compute_calibration_metrics,
+    )
+    from sklearn.model_selection import train_test_split
+    import json
+    from datetime import datetime
+    import torch
+
+    console.print("[bold blue]Probability Predictor Training[/bold blue]")
+    console.print("=" * 50)
+    console.print()
+
+    # Build training data
+    builder = ProbabilityTrainingDataBuilder(data_dir)
+    data = builder.load_data(days_back=days)
+
+    if not data:
+        console.print("[red]No data found! Run collect-historical first.[/red]")
+        raise typer.Exit(1)
+
+    features, outcomes = builder.build_training_examples(
+        data,
+        samples_per_candle=samples_per_candle,
+        augment_symmetry=not no_augment,
+        min_time_remaining=min_time,
+    )
+
+    if len(features) == 0:
+        console.print("[red]No training examples generated![/red]")
+        raise typer.Exit(1)
+
+    # Split data
+    train_features, temp_features, train_outcomes, temp_outcomes = train_test_split(
+        features, outcomes, test_size=0.3, random_state=42
+    )
+    val_features, test_features, val_outcomes, test_outcomes = train_test_split(
+        temp_features, temp_outcomes, test_size=0.5, random_state=42
+    )
+
+    console.print(f"\n[bold]Data Split:[/bold]")
+    console.print(f"  Train: {len(train_features)}")
+    console.print(f"  Val: {len(val_features)}")
+    console.print(f"  Test: {len(test_features)}")
+
+    # Train model
+    config = ProbabilityPredictorConfig(
+        epochs=epochs,
+        batch_size=batch_size,
+        learning_rate=lr,
+    )
+
+    trainer = ProbabilityPredictorTrainer(config)
+
+    console.print("\n[bold]Starting training...[/bold]")
+    model, history = trainer.train(
+        train_features=train_features,
+        train_outcomes=train_outcomes,
+        val_features=val_features,
+        val_outcomes=val_outcomes,
+        output_dir=output,
+        use_focal_loss=focal_loss,
+    )
+
+    # Calibrate temperature
+    console.print("\n[bold]Calibrating temperature...[/bold]")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    optimal_temp = calibrate_temperature(model, val_features, val_outcomes, device)
+    model.set_temperature(optimal_temp)
+
+    # Update saved config
+    config_path = Path(output) / "config.json"
+    with open(config_path, "r") as f:
+        config_dict = json.load(f)
+    config_dict["temperature"] = optimal_temp
+    with open(config_path, "w") as f:
+        json.dump(config_dict, f, indent=2)
+
+    torch.save(model.state_dict(), Path(output) / "final_model.pt")
+
+    # Evaluate on test set
+    console.print("\n[bold]Evaluating on test set...[/bold]")
+    model.eval()
+    with torch.no_grad():
+        test_features_t = torch.FloatTensor(test_features).to(device)
+        test_preds = model(test_features_t).squeeze().cpu().numpy()
+
+    metrics = compute_calibration_metrics(test_preds, test_outcomes)
+    gates_passed = print_calibration_report(metrics, "Test Set Calibration")
+
+    # Save metrics
+    metrics_path = Path(output) / "calibration_metrics.json"
+    with open(metrics_path, "w") as f:
+        json.dump({
+            "brier_score": float(metrics["brier_score"]),
+            "ece": float(metrics["ece"]),
+            "correlation": float(metrics["correlation"]),
+            "accuracy": float(metrics["accuracy"]),
+            "temperature": optimal_temp,
+            "gates_passed": gates_passed,
+            "timestamp": datetime.now().isoformat(),
+        }, f, indent=2)
+
+    console.print(f"\n[green]Model saved to: {output}[/green]")
+
+    if gates_passed:
+        console.print("[bold green]MODEL READY FOR PAPER TRADING[/bold green]")
+        console.print(f"\nRun: yang paper-trade-safeguarded --model {output}")
+    else:
+        console.print("[bold red]MODEL NOT READY - CALIBRATION FAILED[/bold red]")
+
+
+@app.command("paper-trade-safeguarded")
+def paper_trade_safeguarded_cmd(
+    model: str = typer.Option("./logs/probability_v1", help="Path to trained model"),
+    model_type: str = typer.Option("probability", help="Model type: 'probability' or 'legacy'"),
+    balance: float = typer.Option(1000.0, help="Initial balance"),
+    edge_threshold: float = typer.Option(0.07, help="Minimum edge to trade (7% = 0.07)"),
+    stop_loss: float = typer.Option(0.05, help="Stop loss percentage (5% = 0.05)"),
+    min_time: float = typer.Option(0.35, help="Min time remaining to enter (35% = 0.35)"),
+    log_dir: str = typer.Option("./logs/paper_trade_safeguarded", help="Log directory"),
+    no_ml_log: bool = typer.Option(False, help="Disable ML logging"),
+):
+    """Paper trade with safeguards and edge-based decisions.
+
+    CAPITAL PROTECTION:
+    - Fixed 5% stop loss per trade
+    - Drawdown-scaled position sizing
+    - 5-loss circuit breaker
+    - No model EXIT control (rule-based exits only)
+
+    ENTRY LOGIC:
+    - Model outputs P(YES)
+    - Edge = P(YES) - market_price
+    - Enter only when edge > threshold
+
+    Usage:
+        # With new probability model
+        yang paper-trade-safeguarded --model ./logs/probability_v1
+
+        # With legacy model (extracts probability from logits)
+        yang paper-trade-safeguarded --model ./logs/market_predictor_v2.5 --model-type legacy
+    """
+    import asyncio
+    from .paper_trade_safeguarded import (
+        SafeguardedPaperTrader,
+        SafeguardedPaperTradeConfig,
+        SafeguardConfig,
+    )
+
+    safeguards = SafeguardConfig(
+        edge_threshold=edge_threshold,
+        stop_loss_pct=stop_loss,
+        min_time_remaining=min_time,
+    )
+
+    config = SafeguardedPaperTradeConfig(
+        model_path=model,
+        model_type=model_type,
+        initial_balance=balance,
+        safeguards=safeguards,
+        log_dir=log_dir,
+        enable_ml_logging=not no_ml_log,
+    )
+
+    console.print("[bold blue]Safeguarded Paper Trading[/bold blue]")
+    console.print("=" * 50)
+    console.print(f"  Model: {model} ({model_type})")
+    console.print(f"  Edge threshold: {edge_threshold:.1%}")
+    console.print(f"  Stop loss: {stop_loss:.1%}")
+    console.print(f"  Min time remaining: {min_time:.1%}")
+    console.print()
+
+    trader = SafeguardedPaperTrader(config)
+    asyncio.run(trader.run())
+
+
 @app.command("collect-historical")
 def collect_historical_cmd(
     days: int = typer.Option(30, help="Days of history"),

@@ -18,6 +18,14 @@ from .market_predictor import (
     Action,
     load_market_predictor,
 )
+from .probability_predictor import (
+    ProbabilityPredictorModel,
+    ProbabilityPredictorConfig,
+    ProbabilityPredictorTrainer,
+    calibrate_temperature,
+    compute_calibration_metrics,
+    load_probability_predictor,
+)
 
 __all__ = [
     "LSTMFeatureExtractor",
@@ -41,4 +49,10 @@ __all__ = [
     "EnhancedPositionState",
     "Action",
     "load_market_predictor",
+    "ProbabilityPredictorModel",
+    "ProbabilityPredictorConfig",
+    "ProbabilityPredictorTrainer",
+    "calibrate_temperature",
+    "compute_calibration_metrics",
+    "load_probability_predictor",
 ]
