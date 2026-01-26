@@ -47,10 +47,8 @@ class AttentionMarketPredictorConfig:
     context_dim: int = 12  # Time(5) + Strike(4) + Volatility(3)
     
     # Base features (from EnhancedFeatureBuilder if used)
+    # Base features (from EnhancedFeatureBuilder if used)
     base_feature_dim: int = 71  # Original features (can be 0 if not using)
-    
-    # Position state
-    position_state_dim: int = 6
     
     # Attention network architecture
     attention_hidden_dim: int = 64
@@ -61,16 +59,12 @@ class AttentionMarketPredictorConfig:
     dropout: float = 0.2
     use_layer_norm: bool = True
     
-    # Output
-    num_actions: int = 5  # WAIT, BUY_YES, BUY_NO, EXIT, HOLD
+    # Feature fusion strategy
+    kama_concatenation: bool = True  # If True, concatenate weighted features instead of summing
     
     # Training
     learning_rate: float = 3e-4
     weight_decay: float = 1e-5
-    
-    # Loss weighting
-    policy_loss_weight: float = 1.0
-    value_loss_weight: float = 1.0
     
     @property
     def kama_spectrum_dim(self) -> int:
@@ -179,14 +173,17 @@ class AttentionMarketPredictorModel(nn.Module):
         )
         
         # Calculate input dimension for MLP
-        # After attention: num_kamas * features_per_period get weighted summed → features_per_period
-        attended_dim = self.config.kama_features_per_period
+        if self.config.kama_concatenation:
+            # Concatenate all weighted KAMA features -> num_kamas * features_per_period
+            attended_dim = self.config.kama_spectrum_dim
+        else:
+            # Sum weighted features -> features_per_period
+            attended_dim = self.config.kama_features_per_period
         
         mlp_input_dim = (
             attended_dim +                      # Weighted KAMA signal
             self.config.context_dim +           # Context features
-            self.config.base_feature_dim +      # Base features (optional)
-            self.config.position_state_dim      # Position state
+            self.config.base_feature_dim        # Base features
         )
         
         # Feature encoder with layer norm
@@ -204,34 +201,19 @@ class AttentionMarketPredictorModel(nn.Module):
         self.encoder = nn.Sequential(*encoder_layers)
         final_dim = self.config.hidden_dims[-1]
         
-        # Action classification head
-        self.action_head = nn.Sequential(
-            nn.Linear(final_dim, 64),
-            nn.GELU(),
-            nn.Linear(64, self.config.num_actions),
-        )
-        
-        # Confidence head
-        self.confidence_head = nn.Sequential(
+        # Probability Head (P(YES))
+        self.probability_head = nn.Sequential(
             nn.Linear(final_dim, 32),
             nn.GELU(),
             nn.Linear(32, 1),
             nn.Sigmoid(),
         )
         
-        # Expected return head
-        self.expected_return_head = nn.Sequential(
-            nn.Linear(final_dim, 32),
-            nn.GELU(),
-            nn.Linear(32, 1),
-            nn.Tanh(),  # Returns capped to [-1, 1]
-        )
-        
         self._init_weights()
         
         num_params = sum(p.numel() for p in self.parameters())
         logger.info(
-            "AttentionMarketPredictorModel initialized",
+            "AttentionMarketPredictorModel initialized (P(YES))",
             num_kamas=self.config.num_kamas,
             context_dim=self.config.context_dim,
             mlp_input_dim=mlp_input_dim,
@@ -252,7 +234,6 @@ class AttentionMarketPredictorModel(nn.Module):
         kama_spectrum: torch.Tensor,
         context: torch.Tensor,
         base_features: torch.Tensor,
-        position_state: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass with attention over KAMA spectrum.
@@ -261,11 +242,9 @@ class AttentionMarketPredictorModel(nn.Module):
             kama_spectrum: (batch, num_kamas * 2) - KAMA features
             context: (batch, context_dim) - Time/strike/vol context
             base_features: (batch, base_feature_dim) - Other features
-            position_state: (batch, position_state_dim) - Position info
             
         Returns:
-            Dictionary with action_logits, confidence, expected_return, 
-            action_probs, attention_weights
+            Dictionary with probability, attention_weights
         """
         batch_size = kama_spectrum.shape[0]
         
@@ -279,53 +258,42 @@ class AttentionMarketPredictorModel(nn.Module):
             self.config.kama_features_per_period
         )
         
-        # 3. Apply attention: weighted sum over KAMA variants
+        # 3. Apply attention
         # attn_weights: (batch, num_kamas) → (batch, num_kamas, 1)
         weighted_spectrum = spectrum_reshaped * attn_weights.unsqueeze(-1)
-        attended_signal = weighted_spectrum.sum(dim=1)  # (batch, features_per_period)
+        
+        if self.config.kama_concatenation:
+            # Flatten to preserve all features, weighted by attention
+            # (batch, num_kamas * features_per_period)
+            attended_signal = weighted_spectrum.flatten(start_dim=1)
+        else:
+            # Summation (Bottleneck)
+            attended_signal = weighted_spectrum.sum(dim=1)
         
         # 4. Concatenate all features
         combined = torch.cat([
             attended_signal,    # Attended KAMA signal
-            context,            # Context features (also useful for prediction)
+            context,            # Context features
             base_features,      # Base features
-            position_state,     # Position info
         ], dim=-1)
         
         # 5. Encode through MLP
         h = self.encoder(combined)
         
         # 6. Compute outputs
-        action_logits = self.action_head(h)
-        action_probs = F.softmax(action_logits, dim=-1)
-        confidence = self.confidence_head(h)
-        expected_return = self.expected_return_head(h)
+        probability = self.probability_head(h)
         
         return {
-            'action_logits': action_logits,
-            'action_probs': action_probs,
-            'confidence': confidence,
-            'expected_return': expected_return,
+            'probability': probability,
             'attention_weights': attn_weights,
         }
     
     def forward_combined(
         self,
         combined_features: torch.Tensor,
-        position_state: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass with combined feature tensor.
-        
-        For compatibility with existing data pipeline that produces
-        concatenated [kama_spectrum, context, base_features] tensors.
-        
-        Args:
-            combined_features: Concatenated feature tensor
-            position_state: Position state tensor
-            
-        Returns:
-            Same as forward()
         """
         kama_dim = self.config.kama_spectrum_dim
         context_dim = self.config.context_dim
@@ -334,7 +302,7 @@ class AttentionMarketPredictorModel(nn.Module):
         context = combined_features[:, kama_dim:kama_dim + context_dim]
         base_features = combined_features[:, kama_dim + context_dim:]
         
-        return self.forward(kama_spectrum, context, base_features, position_state)
+        return self.forward(kama_spectrum, context, base_features)
     
     def get_action(
         self,
@@ -411,27 +379,20 @@ class AttentionMarketPredictorModel(nn.Module):
             valid = Action.get_valid_actions(bool(has_position[i]))
             actions[i] = valid[np.random.randint(len(valid))]
         
-        return actions
-
-
 class AttentionMarketPredictorDataset(Dataset):
-    """Dataset for training attention market predictor."""
+    """Dataset for training attention market predictor (P(YES))."""
     
     def __init__(
         self,
         kama_spectrum: np.ndarray,
         context_features: np.ndarray,
         base_features: np.ndarray,
-        position_states: np.ndarray,
-        actions: np.ndarray,
-        returns: np.ndarray,
+        targets: np.ndarray,  # Binary targets (1.0 = YES win, 0.0 = NO win)
     ):
         self.kama_spectrum = torch.FloatTensor(kama_spectrum)
         self.context_features = torch.FloatTensor(context_features)
         self.base_features = torch.FloatTensor(base_features)
-        self.position_states = torch.FloatTensor(position_states)
-        self.actions = torch.LongTensor(actions)
-        self.returns = torch.FloatTensor(returns)
+        self.targets = torch.FloatTensor(targets).unsqueeze(-1)  # (N, 1)
     
     def __len__(self) -> int:
         return len(self.kama_spectrum)
@@ -441,9 +402,7 @@ class AttentionMarketPredictorDataset(Dataset):
             self.kama_spectrum[idx],
             self.context_features[idx],
             self.base_features[idx],
-            self.position_states[idx],
-            self.actions[idx],
-            self.returns[idx],
+            self.targets[idx],
         )
 
 
@@ -463,55 +422,27 @@ class AttentionMarketPredictorTrainer:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         logger.info("AttentionMarketPredictorTrainer initialized", device=self.device)
     
-    def _apply_training_mask(
+    def __init__(
         self,
-        logits: torch.Tensor,
-        has_position: torch.Tensor,
-    ) -> torch.Tensor:
-        """Apply action mask during training."""
-        masked = logits.clone()
-        
-        for i in range(len(logits)):
-            if has_position[i]:
-                masked[i, Action.WAIT] = float('-inf')
-                masked[i, Action.BUY_YES] = float('-inf')
-                masked[i, Action.BUY_NO] = float('-inf')
-            else:
-                masked[i, Action.EXIT] = float('-inf')
-                masked[i, Action.HOLD] = float('-inf')
-        
-        return masked
+        config: Optional[AttentionMarketPredictorConfig] = None,
+        device: Optional[str] = None,
+    ):
+        self.config = config or AttentionMarketPredictorConfig()
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info("AttentionMarketPredictorTrainer initialized", device=self.device)
     
-    def _check_action_validity(
+    def train(
         self,
-        actions: torch.Tensor,
-        has_position: torch.Tensor,
-    ) -> torch.Tensor:
-        """Check which actions are invalid."""
-        invalid = torch.zeros(len(actions), dtype=torch.bool, device=actions.device)
-        
-        for i in range(len(actions)):
-            a = int(actions[i])
-            hp = bool(has_position[i])
-            if not Action.is_valid(a, hp):
-                invalid[i] = True
-        
-        return invalid
-    
     def train(
         self,
         train_kama: np.ndarray,
         train_context: np.ndarray,
         train_base: np.ndarray,
-        train_position_states: np.ndarray,
-        train_actions: np.ndarray,
-        train_returns: np.ndarray,
+        train_targets: np.ndarray,
         val_kama: np.ndarray,
         val_context: np.ndarray,
         val_base: np.ndarray,
-        val_position_states: np.ndarray,
-        val_actions: np.ndarray,
-        val_returns: np.ndarray,
+        val_targets: np.ndarray,
         epochs: int = 100,
         batch_size: int = 128,
         patience: int = 15,
@@ -534,12 +465,10 @@ class AttentionMarketPredictorTrainer:
         
         # Create datasets
         train_dataset = AttentionMarketPredictorDataset(
-            train_kama, train_context, train_base,
-            train_position_states, train_actions, train_returns
+            train_kama, train_context, train_base, train_targets
         )
         val_dataset = AttentionMarketPredictorDataset(
-            val_kama, val_context, val_base,
-            val_position_states, val_actions, val_returns
+            val_kama, val_context, val_base, val_targets
         )
         
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
@@ -549,7 +478,6 @@ class AttentionMarketPredictorTrainer:
         self.config.kama_features_per_period = train_kama.shape[1] // self.config.num_kamas
         self.config.context_dim = train_context.shape[1]
         self.config.base_feature_dim = train_base.shape[1]
-        self.config.position_state_dim = train_position_states.shape[1]
         
         # Create model
         model = AttentionMarketPredictorModel(self.config).to(self.device)
@@ -564,16 +492,14 @@ class AttentionMarketPredictorTrainer:
             optimizer, mode='min', factor=0.5, patience=5
         )
         
-        # Loss functions
-        action_criterion = nn.CrossEntropyLoss(reduction='none')
-        return_criterion = nn.SmoothL1Loss()
-        confidence_criterion = nn.BCELoss()
+        # Loss function (P(YES))
+        criterion = nn.BCELoss()
         
         history = {
             'train_loss': [],
             'val_loss': [],
-            'val_action_accuracy': [],
-            'val_return_mse': [],
+            'val_accuracy': [],
+            'val_brier_score': [],
             'attention_weights': [],  # Store attention weight snapshots
         }
         
@@ -588,58 +514,16 @@ class AttentionMarketPredictorTrainer:
             train_losses = []
             
             for batch in train_loader:
-                kama, context, base, pos_states, actions, returns = [
+                kama, context, base, targets = [
                     x.to(self.device) for x in batch
                 ]
                 
-                has_position = pos_states[:, 0] > 0.5
-                
-                # Check for invalid actions
-                invalid_mask = self._check_action_validity(actions, has_position)
-                if invalid_mask.any():
-                    valid_mask = ~invalid_mask
-                    if not valid_mask.any():
-                        continue
-                    kama = kama[valid_mask]
-                    context = context[valid_mask]
-                    base = base[valid_mask]
-                    pos_states = pos_states[valid_mask]
-                    actions = actions[valid_mask]
-                    returns = returns[valid_mask]
-                    has_position = has_position[valid_mask]
-                
                 optimizer.zero_grad()
                 
-                outputs = model(kama, context, base, pos_states)
+                outputs = model(kama, context, base)
+                probs = outputs['probability']
                 
-                # Apply action mask
-                masked_logits = self._apply_training_mask(
-                    outputs['action_logits'], has_position
-                )
-                
-                # Losses
-                action_loss = action_criterion(masked_logits, actions).mean()
-                
-                capped_returns = torch.clamp(returns, -1.0, 1.0)
-                return_loss = return_criterion(
-                    outputs['expected_return'].squeeze(-1),
-                    capped_returns
-                )
-                
-                with torch.no_grad():
-                    pred_actions = masked_logits.argmax(dim=-1)
-                    is_correct = (pred_actions == actions).float()
-                
-                confidence_loss = confidence_criterion(
-                    outputs['confidence'].squeeze(-1),
-                    is_correct
-                )
-                
-                loss = (
-                    self.config.policy_loss_weight * action_loss +
-                    self.config.value_loss_weight * return_loss +
-                    0.5 * confidence_loss
-                )
+                loss = criterion(probs, targets)
                 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -650,57 +534,44 @@ class AttentionMarketPredictorTrainer:
             # Validation
             model.eval()
             val_losses = []
-            all_pred_actions = []
-            all_true_actions = []
-            all_pred_returns = []
-            all_true_returns = []
+            all_probs = []
+            all_targets = []
             all_attention_weights = []
             all_time_remaining = []
             
             with torch.no_grad():
                 for batch in val_loader:
-                    kama, context, base, pos_states, actions, returns = [
+                    kama, context, base, targets = [
                         x.to(self.device) for x in batch
                     ]
                     
-                    has_position = pos_states[:, 0] > 0.5
-                    
-                    outputs = model(kama, context, base, pos_states)
-                    
-                    masked_logits = self._apply_training_mask(
-                        outputs['action_logits'], has_position
-                    )
-                    
-                    action_loss = action_criterion(masked_logits, actions).mean()
-                    capped_returns = torch.clamp(returns, -1.0, 1.0)
-                    return_loss = return_criterion(
-                        outputs['expected_return'].squeeze(-1),
-                        capped_returns
-                    )
-                    loss = action_loss + return_loss
-                    
-                    pred_actions = masked_logits.argmax(dim=-1)
+                    outputs = model(kama, context, base)
+                    probs = outputs['probability']
+                    loss = criterion(probs, targets)
                     
                     val_losses.append(loss.item())
-                    all_pred_actions.extend(pred_actions.cpu().numpy())
-                    all_true_actions.extend(actions.cpu().numpy())
-                    all_pred_returns.extend(outputs['expected_return'].squeeze(-1).cpu().numpy())
-                    all_true_returns.extend(returns.cpu().numpy())
+                    all_probs.extend(probs.cpu().numpy())
+                    all_targets.extend(targets.cpu().numpy())
                     all_attention_weights.extend(outputs['attention_weights'].cpu().numpy())
-                    all_time_remaining.extend(context[:, 0].cpu().numpy())  # time_remaining_pct
+                    all_time_remaining.extend(context[:, 0].cpu().numpy())
             
             avg_train_loss = np.mean(train_losses)
             avg_val_loss = np.mean(val_losses)
-            action_accuracy = np.mean(np.array(all_pred_actions) == np.array(all_true_actions))
-            capped_true = np.clip(np.array(all_true_returns), -1.0, 1.0)
-            return_mse = np.mean((np.array(all_pred_returns) - capped_true) ** 2)
+            
+            # Metrics
+            probs_arr = np.array(all_probs).flatten()
+            targets_arr = np.array(all_targets).flatten()
+            
+            preds = (probs_arr > 0.5).astype(float)
+            accuracy = np.mean(preds == targets_arr)
+            brier_score = np.mean((probs_arr - targets_arr) ** 2)
             
             scheduler.step(avg_val_loss)
             
             history['train_loss'].append(avg_train_loss)
             history['val_loss'].append(avg_val_loss)
-            history['val_action_accuracy'].append(action_accuracy)
-            history['val_return_mse'].append(return_mse)
+            history['val_accuracy'].append(accuracy)
+            history['val_brier_score'].append(brier_score)
             
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
@@ -723,8 +594,8 @@ class AttentionMarketPredictorTrainer:
                     f"Epoch {epoch+1}/{epochs}",
                     train_loss=f"{avg_train_loss:.4f}",
                     val_loss=f"{avg_val_loss:.4f}",
-                    action_acc=f"{action_accuracy:.3f}",
-                    return_mse=f"{return_mse:.4f}",
+                    accuracy=f"{accuracy:.3f}",
+                    brier=f"{brier_score:.4f}",
                 )
             
             if patience_counter >= patience:
@@ -747,7 +618,7 @@ class AttentionMarketPredictorTrainer:
         logger.info(
             "Training complete",
             best_val_loss=f"{best_val_loss:.4f}",
-            final_action_accuracy=f"{history['val_action_accuracy'][-1]:.3f}",
+            final_accuracy=f"{history['val_accuracy'][-1]:.3f}",
         )
         
         return model, history
