@@ -433,8 +433,6 @@ class AttentionMarketPredictorTrainer:
     
     def train(
         self,
-    def train(
-        self,
         train_kama: np.ndarray,
         train_context: np.ndarray,
         train_base: np.ndarray,
