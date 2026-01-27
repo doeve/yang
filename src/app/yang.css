@@ -1,0 +1,114 @@
+/* Global Styles */
+Screen {
+    layout: grid;
+    grid-size: 1;
+    background: black;
+}
+
+#main_grid {
+    layout: grid;
+    grid-size: 2;
+    grid-columns: 1fr 1fr;
+    height: 1fr;
+}
+
+.box {
+    border: solid green;
+    padding: 1;
+    margin: 1;
+    height: 100%;
+    background: black;
+}
+
+.title {
+    width: 100%;
+    text-align: center;
+    background: green;
+    color: white;
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+.label {
+    text-style: bold;
+    color: gray;
+}
+
+/* Settings Specific */
+.settings_root {
+    layout: vertical;
+    width: 100%;
+    height: 100%;
+}
+
+.settings_grid {
+    layout: grid;
+    grid-size: 2;
+    grid-columns: 1fr 1fr;
+    height: 1fr;
+    margin-top: 1;
+}
+
+.settings_column {
+    padding: 1 2;
+}
+
+.section_header {
+    color: cyan;
+    text-style: bold;
+    border-bottom: solid cyan;
+    margin-bottom: 1;
+    width: 100%;
+}
+
+.row {
+    height: 3;
+    align-vertical: middle;
+    margin-bottom: 1;
+}
+
+.lbl {
+    width: 16;
+    content-align: right middle;
+    padding-right: 1;
+    color: green;
+}
+
+/* Widget Overrides for Skeekness */
+Input {
+    border: none;
+    background: #111;
+    color: white;
+    width: 1fr;
+    height: 1;
+}
+Input:focus {
+    border: none;
+    background: #222;
+}
+
+Select {
+    border: none;
+    background: #111;
+    width: 1fr;
+    height: 1; 
+}
+
+.actions {
+    height: 3;
+    align: center middle;
+    margin-top: 1;
+}
+
+.action_btn {
+    width: 20;
+    margin: 0 2;
+    background: #111;
+    border: solid green;
+    color: green;
+}
+.action_btn:hover {
+    background: green;
+    color: white;
+}
+
