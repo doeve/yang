@@ -1,0 +1,19 @@
+{
+  "trading_mode": "paper",
+  "model_path": "logs/market_predictor_v1",
+  "data_source": "onchain",
+  "execution_strategy": "polymarket",
+  "proxy_url": "socks5://127.0.0.1:1080",
+  "rpc_url": "http://localhost:8545",
+  "polymarket_api_key": null,
+  "polymarket_secret": null,
+  "polymarket_passphrase": null,
+  "private_key": null,
+  "risk": {
+    "max_position_size_usd": 100.0,
+    "max_daily_loss_usd": 55.0,
+    "stop_loss_pct": 0.1,
+    "take_profit_pct": 0.2,
+    "max_open_positions": 3
+  }
+}
