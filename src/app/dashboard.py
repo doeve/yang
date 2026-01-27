@@ -27,11 +27,15 @@ class MarketWatch(Static):
                 yield Label("YES Price: ", classes="label")
                 yield Label("---", id="yes_price")
 
+
     def update_data(self, data: dict):
+        import logging
+        logging.info(f"MarketWatch Update: {data.get('market_slug')}")
         self.query_one("#mkt_slug", Label).update(data.get("market_slug") or "Searching...")
         self.query_one("#btc_price", Label).update(f"${data.get('btc_current_price', 0):,.2f}")
         self.query_one("#time_rem", Label).update(f"{data.get('time_remaining', 0):.1%}")
         self.query_one("#yes_price", Label).update(f"{data.get('yes_price', 0):.3f}")
+
 
 class ModelSignal(Static):
     """Display model prediction."""

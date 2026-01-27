@@ -904,6 +904,73 @@ class MarketPredictorTrainer:
         return model, history
 
 
+
+class LegacyDuelingPredictorModel(MarketPredictorModel):
+    """
+    Backward compatibility for Dueling Architecture checkpoints (v1).
+    Replaces action_head with value_head + advantage_head.
+    """
+    def __init__(self, config: Optional[MarketPredictorConfig] = None):
+        # Initialize parent to get encoder, attention, aux heads
+        super().__init__(config)
+        
+        final_dim = self.config.hidden_dims[-1]
+        
+        # Remove action_head
+        if hasattr(self, "action_head"):
+            del self.action_head
+            
+        # Add Dueling Heads
+        self.value_head = nn.Sequential(
+            nn.Linear(final_dim, 64),
+            nn.GELU(),
+            nn.Linear(64, 1)
+        )
+        
+        self.advantage_head = nn.Sequential(
+            nn.Linear(final_dim, 64),
+            nn.GELU(),
+            nn.Linear(64, self.config.num_actions)
+        )
+        
+        # Re-init weights for new heads (though they will be loaded)
+        self._init_dueling_weights()
+        
+    def _init_dueling_weights(self):
+        for m in [self.value_head, self.advantage_head]:
+            for layer in m.modules():
+                if isinstance(layer, nn.Linear):
+                    nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
+                    if layer.bias is not None:
+                         nn.init.zeros_(layer.bias)
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        # Exact copy of parent forward up to heads
+        h = self.encoder(x)
+        h = self.temporal_attention(h)
+        
+        # Dueling Logic
+        value = self.value_head(h)
+        advantage = self.advantage_head(h)
+        
+        # Q = V + (A - mean(A))
+        q_values = value + (advantage - advantage.mean(dim=1, keepdim=True))
+        
+        # In this legacy model, Q-values ARE the logits for action selection
+        action_logits = q_values
+        
+        action_probs = F.softmax(action_logits, dim=-1)
+        
+        confidence = self.confidence_head(h)
+        expected_return = self.expected_return_head(h)
+        
+        return {
+            'action_logits': action_logits,
+            'confidence': confidence,
+            'expected_return': expected_return,
+            'action_probs': action_probs
+        }
+
 def load_market_predictor(
     model_dir: str,
     device: Optional[str] = None,
@@ -920,11 +987,26 @@ def load_market_predictor(
         position_state_dim=config_dict["position_state_dim"],
     )
 
-    model = MarketPredictorModel(config)
-    model.load_state_dict(
-        torch.load(model_path / "final_model.pt", map_location=device, weights_only=True)
-    )
+    # Try standard model first
+    try:
+        model = MarketPredictorModel(config)
+        model.load_state_dict(
+            torch.load(model_path / "final_model.pt", map_location=device, weights_only=True)
+        )
+    except RuntimeError as e:
+        # Check if it's the specific architecture mismatch
+        err_msg = str(e)
+        if "value_head" in err_msg and "action_head" in err_msg:
+            logger.warning("Detected Dueling Architecture checkpoint. Loading LegacyDuelingPredictorModel.")
+            model = LegacyDuelingPredictorModel(config)
+            model.load_state_dict(
+                torch.load(model_path / "final_model.pt", map_location=device, weights_only=True)
+            )
+        else:
+            raise e
+
     model.to(device)
     model.eval()
 
     return model
+

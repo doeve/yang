@@ -8,7 +8,16 @@ from textual.widgets import Header, Footer
 from src.app.config import AppConfig
 from src.app.engine import TradingEngine
 from src.app.dashboard import Dashboard
+
 from src.app.settings import SettingsScreen
+
+import logging
+logging.basicConfig(
+    filename="logs/app.log",
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
+
 
 class YangApp(App):
     """Polymarket Trading TUI."""
@@ -26,12 +35,15 @@ class YangApp(App):
         self.engine = TradingEngine(self.config)
         self.loop_task = None
         
+
     def on_mount(self):
+        logging.info("App Mounting...")
         self.push_screen(Dashboard(id="dashboard"))
         # Start Engine in background
         self.run_worker(self.engine_lifespan())
         # Start UI update loop
         self.set_interval(1.0, self.update_ui)
+        logging.info("App Mounted and Timers set")
         
     def action_settings(self):
         """Open settings screen."""
@@ -44,26 +56,33 @@ class YangApp(App):
             await self.engine.tick()
             await asyncio.sleep(1.0)
             
+
     async def update_ui(self):
         """Poll engine state and update widgets."""
+        logging.info("UI Update Tick")
+
         try:
-            dash = self.query_one(Dashboard)
-        except:
-            return # Dashboard not ready
+            # Access active screen directly
+            dash = self.screen
+            if not isinstance(dash, Dashboard):
+                return # Settings or other screen active
+                
+            state = self.engine.get_state()
+            market_data = state["market"]
+            prediction = state["prediction"]
             
-        state = self.engine.get_state()
-        market_data = state["market"]
-        prediction = state["prediction"]
-        
-        dash.query_one("#market_watch").update_data(market_data)
-        dash.query_one("#model_signal").update_data(prediction)
-        
-        # Account
-        bal = await self.engine.execution.get_balance()
-        slug = market_data.get("market_slug")
-        pos = await self.engine.execution.get_position(slug) if slug else None
-        
-        dash.query_one("#account_summary").update_data(bal, pos)
+            dash.query_one("#market_watch").update_data(market_data)
+            dash.query_one("#model_signal").update_data(prediction)
+            
+            # Account
+            bal = await self.engine.execution.get_balance()
+            slug = market_data.get("market_slug")
+            pos = await self.engine.execution.get_position(slug) if slug else None
+            
+            dash.query_one("#account_summary").update_data(bal, pos)
+        except Exception as e:
+            logging.error(f"UI Update Error: {e}", exc_info=True)
+
 
 def main():
     app = YangApp()

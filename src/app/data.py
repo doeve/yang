@@ -139,11 +139,13 @@ class OnChainDataSource(MarketDataSource):
     NEGRISK_CTF_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
     ORDER_FILLED_TOPIC = "0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6"
 
+
     def __init__(self, config: AppConfig):
         self.config = config
         self.w3 = None
         # Reuse the API helper just for market discovery (easiest way to get Token IDs)
         self.api_helper = PolymarketAPISource(config)
+        self.last_scanned_block = None
         
     async def start(self):
         from web3 import Web3
@@ -161,96 +163,81 @@ class OnChainDataSource(MarketDataSource):
     async def stop(self):
         await self.api_helper.stop()
         
+
     async def refresh(self, state: Dict[str, Any]):
         # 1. Discovery (Use API helper for robust ID lookup)
         # We need to know WHICH tokens to look for on-chain
+        # This is async (httpx), so we can await it directly
         await self.api_helper.refresh(state)
         
-        # 2. On-Chain Price Fetching
-        if not self.w3 or not self.w3.is_connected():
+        # 2. On-Chain Price Fetching (Blocking Web3 calls)
+        if not self.w3:
             return
-            
-        yes_id = state.get("yes_id")
-        if not yes_id:
-            return
-            
-        # If we already have fresh history from API helper (fallback), we could use it, 
-        # but user specifically asked for on-chain fetching.
-        # So let's overwrite history with on-chain data if possible.
-        
+
+        # Offload blocking IO to thread
+        await asyncio.to_thread(self._refresh_sync, state)
+
+    def _refresh_sync(self, state: Dict[str, Any]):
+        """Synchronous part of refresh running in a thread."""
         try:
-            # Look back ~1000 blocks (approx 45 mins on Polygon)
+            if not self.w3.is_connected():
+                return
+
+            yes_id = state.get("yes_id")
+            if not yes_id:
+                return
+
             current_block = self.w3.eth.block_number
-            from_block = current_block - 1000
             
-            # Normalize ID for topic filter
-            # Token ID in topics is hex padded
-            token_hex = hex(int(yes_id))
-            token_topic = "0x" + token_hex[2:].zfill(64)
-            
-            # We want logs where EITHER makerAssetId OR takerAssetId is our token
-            # But get_logs with OR topics is tricky in one go if positions differ
-            # NegRisk OrderFilled: orderHash, maker, taker (topics 1,2,3)
-            # IDs are in Data, not Topics for OrderFilled? 
-            # Wait, fetch_onchain_prices.py says:
-            # "Indexed params... maker, taker. Non-indexed: makerAssetId..."
-            # So we cannot filter by TokenID in logs! We must fetch all OrderFilled and filter in client.
-            # This is heavy for a full node, but fine for local Bor if volume isn't insane.
-            # actually fetch_onchain_prices.py does `get_logs` with just address and topic0
-            
+            # Determine block range
+            if self.last_scanned_block is None:
+                # First run: Scan back 1000 blocks
+                from_block = current_block - 1000
+                to_block = current_block
+                logger.info(f"OnChain: Initial scan from {from_block} to {to_block}")
+            else:
+                # Incremental: Scan from last + 1
+                from_block = self.last_scanned_block + 1
+                to_block = current_block
+                
+                if from_block > to_block:
+                    # No new blocks
+                    return
+
             filter_params = {
                 "fromBlock": from_block,
-                "toBlock": "latest",
+                "toBlock": to_block,
                 "topics": [self.ORDER_FILLED_TOPIC]
             }
             
-            # Check both exchanges? Usually NegRisk for these markets
+            # Check both exchanges (Standard CTF and NegRisk)
+            addresses = [
+                self.w3.to_checksum_address(self.NEGRISK_CTF_EXCHANGE),
+                self.w3.to_checksum_address(self.CTF_EXCHANGE)
+            ]
+            
             logs = self.w3.eth.get_logs({
                 **filter_params,
-                "address": self.w3.to_checksum_address(self.NEGRISK_CTF_EXCHANGE)
+                "address": addresses
             })
             
-            prices = []
-            
+            # Decode NEW prices
+            new_prices = []
             from eth_abi import decode
             
             for log in logs:
                 try:
-                    # Decode Data
                     data_hex = log["data"].hex() if hasattr(log["data"], "hex") else log["data"]
                     if data_hex.startswith("0x"): data_hex = data_hex[2:]
                     data_bytes = bytes.fromhex(data_hex)
-                    
-                    # uint256 makerAssetId, uint256 takerAssetId, uint256 makerAmount, uint256 takerAmount, uint256 fee
                     decoded = decode(["uint256", "uint256", "uint256", "uint256", "uint256"], data_bytes)
                     
-                    maker_id = str(decoded[0])
-                    taker_id = str(decoded[1])
-                    maker_amt = decoded[2]
-                    taker_amt = decoded[3]
-                    
                     price = None
-                    
-                    # Check if our token involved
-                    # USDC is usually ID 0 or specific addr, but in CTF it's often 0 implies collateral
-                    # Wait, fetch_onchain_prices says: "if maker_asset_id_int == 0 ... price = usdc/tokens"
-                    
                     target_int = int(yes_id)
                     
-                    if decoded[1] == target_int and decoded[0] == 0:
-                        # Taker bought YES (gave USDC)
-                        if taker_amt > 0:
-                            price = maker_amt / taker_amt # maker gave USDC? No.
-                            # Maker Asset 0 (USDC), Taker Asset YES
-                            # Taker GAVE YES? No.
-                            # Let's trust fetch_onchain_prices logic:
-                            # if maker_asset_id_int == 0: Maker gave USDC, got tokens. Price = USDC/Tokens. Token is TakerAsset.
-                            pass
-                    
-                    # Simplification: Just look for matches
+                    # Simplification: Just look for matches (Maker or Taker)
                     if decoded[0] == 0 and decoded[1] == target_int:
                         # Maker=USDC, Taker=YES. Maker BUYING YES? 
-                        # Maker gave USDC, Taker gave YES. Maker BOUGHT YES.
                         if decoded[3] > 0:
                             price = (decoded[2] / 1e6) / (decoded[3] / 1e6)
                     elif decoded[1] == 0 and decoded[0] == target_int:
@@ -259,23 +246,45 @@ class OnChainDataSource(MarketDataSource):
                             price = (decoded[3] / 1e6) / (decoded[2] / 1e6)
                             
                     if price is not None:
-                        prices.append(price)
+                        new_prices.append(price)
                         
                 except Exception:
                     continue
             
-            if prices:
-                # Update state
-                state["yes_history"] = prices
-                state["no_history"] = [1.0 - p for p in prices]
-                state["yes_price"] = prices[-1]
-                state["no_price"] = state["no_history"][-1]
-                logger.info(f"OnChain: Found {len(prices)} trades. Last: {prices[-1]:.3f}")
-            else:
-                logger.info("OnChain: No trades found in lookback")
+            # Update State
+            if new_prices:
+                logger.info(f"OnChain: Found {len(new_prices)} new trades in blocks {from_block}-{to_block}")
+                
+                # Append to existing history if incremental
+                if self.last_scanned_block is not None:
+                    # Keep existing history, append new
+                    state["yes_history"].extend(new_prices)
+                    state["no_history"].extend([1.0 - p for p in new_prices])
+                    
+                    # Limit history length to avoid unbounded growth?
+                    # Let's keep last 5000 points
+                    if len(state["yes_history"]) > 5000:
+                         state["yes_history"] = state["yes_history"][-5000:]
+                         state["no_history"] = state["no_history"][-5000:]
+                else:
+                    # Initial scan: Overwrite
+                    state["yes_history"] = new_prices
+                    state["no_history"] = [1.0 - p for p in new_prices]
+                
+                # Update latest prices
+                if state["yes_history"]:
+                    state["yes_price"] = state["yes_history"][-1]
+                    state["no_price"] = state["no_history"][-1]
+            elif self.last_scanned_block is None:
+                 logger.info("OnChain: No trades found in lookback")
+
+            # Update pointer
+            self.last_scanned_block = to_block
 
         except Exception as e:
             logger.error(f"OnChain Fetch Error: {e}")
+
+
 
 
 class MarketDataService:
