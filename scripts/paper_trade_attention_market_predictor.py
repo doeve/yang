@@ -1,33 +1,35 @@
 #!/usr/bin/env python3
 """
-Live Paper Trading for Attention-Based Market Predictor.
+Attention Market Predictor - Paper Trading Script.
 
-Uses REAL LIVE data from:
-1. Binance (BTC Prices)
-2. Polymarket (YES/NO Token Prices for current 15m market)
-
-This script:
-- Identifies the current active 15m BTC Up/Down market on Polymarket
-- Streams live BTC prices from Binance
-- Streams live YES/NO token prices from Polymarket CLOB
-- Generates KAMA Spectrum and Context features
-- Runs the AttentionMarketPredictor model
-- Executes paper trades based on model probability (P(YES))
+Refactored to match `src/paper_trade_unified.py` design patterns:
+1. Robust Class-based structure (State, Config, Trader)
+2. Rich UI with Layouts
+3. Default SOCKS5 Proxy support
+4. Unified error handling and logging
 """
 
+import os
 import asyncio
 import argparse
 import json
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from collections import deque
-from typing import Optional, Dict, List, Tuple
-import os
+from typing import Optional, Dict, List, Any, Tuple
 
-import numpy as np
-import pandas as pd
 import httpx
+import numpy as np
+import torch
+from rich.console import Console
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.layout import Layout
+from rich.text import Text
+
+# Try importing SOCKS support
 try:
     import httpx_socks
     SOCKS_AVAILABLE = True
@@ -35,22 +37,15 @@ except ImportError:
     SOCKS_AVAILABLE = False
     httpx_socks = None
 
-import torch
-from rich.console import Console
-from rich.table import Table
-from rich.live import Live
-from rich.panel import Panel
-from rich.layout import Layout
-
+# Internal imports
 from src.models.attention_market_predictor import (
     load_attention_market_predictor,
     AttentionMarketPredictorModel,
-    AttentionMarketPredictorConfig,
 )
 from src.data.kama_features import create_kama_feature_builder
 from src.data.enhanced_features import create_enhanced_feature_builder
 
-# Configure logging
+# Logging setup
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger("paper_trade")
 console = Console()
@@ -59,410 +54,443 @@ console = Console()
 BINANCE_REST = "https://api.binance.com/api/v3"
 POLYMARKET_GAMMA = "https://gamma-api.polymarket.com"
 POLYMARKET_CLOB = "https://clob.polymarket.com"
-SOCKS5_PROXY_URL = os.environ.get("SOCKS5_PROXY", "socks5://127.0.0.1:1080")
+DEFAULT_PROXY = "socks5://127.0.0.1:1080"
 
-class LivePolymarketStreamer:
+
+@dataclass
+class AttentionTradingState:
+    """Tracks the state of the trading session."""
+    balance: float = 1000.0
+    total_pnl: float = 0.0
+    wins: int = 0
+    losses: int = 0
+    
+    # Current Market
+    current_candle_ts: Optional[int] = None
+    market_slug: Optional[str] = None
+    active_yes_id: Optional[str] = None
+    active_no_id: Optional[str] = None
+    
+    # Prices
+    btc_current: float = 0.0
+    btc_open: float = 0.0
+    yes_price: float = 0.5
+    no_price: float = 0.5
+    
+    # History
+    yes_price_history: List[float] = field(default_factory=list)
+    no_price_history: List[float] = field(default_factory=list)
+    btc_price_history: List[float] = field(default_factory=list)
+    
+    # Position
+    position_side: Optional[str] = None  # "YES" or "NO"
+    position_size: float = 0.0
+    entry_price: float = 0.0
+    
+    # Model Output
+    last_prob: float = 0.5
+    last_attn: Optional[np.ndarray] = None
+
+
+@dataclass
+class AttentionPaperTradeConfig:
+    """Configuration parameters."""
+    model_path: str
+    initial_balance: float = 1000.0
+    
+    # Strategy
+    min_confidence_yes: float = 0.70
+    max_confidence_no: float = 0.30
+    bet_size: float = 100.0  # Fixed bet size
+    
+    # Network
+    proxy_url: str = DEFAULT_PROXY
+    refresh_rate: float = 1.0
+
+
+class AttentionPaperTrader:
     """
-    Streams live market data from Polymarket for the current 15m BTC market.
+    Paper trader for Attention Market Predictor.
+    Matches the design of UnifiedPaperTrader.
     """
     
-    def __init__(self):
-        self.current_market: Optional[Dict] = None
-        self.yes_price_history: deque = deque(maxlen=3000)
-        self.no_price_history: deque = deque(maxlen=3000)
-        self.last_fetch_time = 0
-        self.market_slug = None
-        self.yes_token_id = None
-        self.no_token_id = None
+    def __init__(self, config: AttentionPaperTradeConfig):
+        self.config = config
+        self.state = AttentionTradingState(balance=config.initial_balance)
         
-        # Determine if we should use proxy
-        self.use_proxy = SOCKS_AVAILABLE and "SOCKS5_PROXY" in os.environ
-        if self.use_proxy:
-            logger.info(f"Using SOCKS5 proxy: {SOCKS5_PROXY_URL}")
-
-    def create_client(self) -> httpx.AsyncClient:
-        """Create an HTTP client with optional proxy support"""
-        if self.use_proxy:
-            transport = httpx_socks.AsyncProxyTransport.from_url(SOCKS5_PROXY_URL)
-            return httpx.AsyncClient(transport=transport, verify=False, timeout=10.0)
+        # Feature Builders
+        self.kama_builder = create_kama_feature_builder()
+        self.enhanced_builder = create_enhanced_feature_builder()
+        
+        # Model
+        self.model: Optional[AttentionMarketPredictorModel] = None
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        # Clients
+        self.poly_client: Optional[httpx.AsyncClient] = None
+        self.binance_client: Optional[httpx.AsyncClient] = None
+        
+        self._running = False
+        
+    async def _setup_clients(self):
+        """Initialize HTTP clients with Proxy support."""
+        self.binance_client = httpx.AsyncClient(timeout=10.0)
+        
+        # Setup Proxy for Polymarket
+        if SOCKS_AVAILABLE:
+            console.print(f"[blue]Using SOCKS5 proxy: {self.config.proxy_url}[/blue]")
+            transport = httpx_socks.AsyncProxyTransport.from_url(self.config.proxy_url)
+            self.poly_client = httpx.AsyncClient(transport=transport, verify=False, timeout=10.0)
         else:
-            return httpx.AsyncClient(timeout=10.0)
-
-        
-    async def find_current_market(self, client: httpx.AsyncClient) -> bool:
-        """
-        Find the current active 15m BTC market.
-        Logic: Look for market ending at the next 15m boundary.
-        """
-        now = datetime.now(timezone.utc)
-        
-        # Calculate next 15m boundary
-        minutes = now.minute
-        next_boundary_min = ((minutes // 15) + 1) * 15
-        if next_boundary_min == 60:
-            next_boundary = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-        else:
-            next_boundary = now.replace(minute=next_boundary_min, second=0, microsecond=0)
+            console.print("[yellow]SOCKS5 not available. using direct connection.[/yellow]")
+            self.poly_client = httpx.AsyncClient(timeout=10.0)
             
-        target_ts = int(next_boundary.timestamp())
+    async def load_model(self):
+        """Load the PyTorch model."""
+        console.print(f"[blue]Loading model from {self.config.model_path}...[/blue]")
+        self.model = load_attention_market_predictor(self.config.model_path)
+        # Ensure model is on correct device
+        # (load function might put it on CPU by default or Auto)
+        self.device = next(self.model.parameters()).device
+        console.print(f"[green]Model loaded on {self.device}![/green]")
+
+    def get_time_remaining(self) -> float:
+        """Calculate fraction of 15m candle remaining."""
+        if not self.state.current_candle_ts:
+            return 1.0
+            
+        start_ts = self.state.current_candle_ts
+        end_ts = start_ts + 900  # 15 mins
+        now_ts = datetime.now(timezone.utc).timestamp()
         
-        # Try to construct slug directly? Or search?
-        # Pattern: btc-updown-15m-{timestamp}
-        # Note: Polymarket slugs might use specific formatting.
-        # Let's search via Gamma API if possible, or try direct slug.
+        remaining = end_ts - now_ts
+        return max(0.0, min(1.0, remaining / 900.0))
+
+    async def fetch_active_market(self) -> bool:
+        """Find the current active 15m BTC market."""
+        # Polymarket 15m market slugs use the candle START timestamp
+        # e.g. btc-updown-15m-{start_ts}
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        target_ts = (now_ts // 900) * 900
         
-        # We can try to guess the slug
+        # If we already have this market, verify it's still valid
+        if self.state.current_candle_ts == target_ts and self.state.active_yes_id:
+            return True
+        
+        # New candle? Settle previous if needed
+        if self.state.current_candle_ts is not None and self.state.current_candle_ts != target_ts:
+            self.settle_position()
+        
         slug = f"btc-updown-15m-{target_ts}"
         
         try:
-            resp = await client.get(f"{POLYMARKET_GAMMA}/events/slug/{slug}")
+            resp = await self.poly_client.get(f"{POLYMARKET_GAMMA}/events/slug/{slug}")
             if resp.status_code == 200:
                 data = resp.json()
                 markets = data.get("markets", [])
                 if markets:
-                    self.current_market = markets[0]
-                    self.market_slug = slug
-                    
-                    # Extract token IDs
-                    clob_tokens = self.current_market.get("clobTokenIds", [])
+                    market = markets[0]
+                    clob_tokens = market.get("clobTokenIds", [])
                     if isinstance(clob_tokens, str):
                         clob_tokens = json.loads(clob_tokens)
                         
                     if len(clob_tokens) >= 2:
-                        self.yes_token_id = clob_tokens[0]
-                        self.no_token_id = clob_tokens[1]
+                        self.state.market_slug = slug
+                        self.state.current_candle_ts = target_ts
+                        self.state.active_yes_id = clob_tokens[0]
+                        self.state.active_no_id = clob_tokens[1]
+                        
+                        # Reset history for new market
+                        self.state.yes_price_history = []
+                        self.state.no_price_history = []
+                        self.state.btc_price_history = []
+                        self.state.btc_open = 0.0 # Will fill on next fetch
+                        
                         return True
-            
-            # If explicit slug fails, maybe try searching events?
-            # For now, let's assume the slug pattern holds or we fail.
-            # print(f"Could not find market for slug: {slug}")
-            return False
-            
         except Exception as e:
-            logger.error(f"Error finding market: {e}")
-            return False
-
-    async def update_prices(self, client: httpx.AsyncClient):
-        """Fetch latest prices for the current market."""
-        if not self.yes_token_id:
-            return
-
-        # Fetch recent trades or orderbook mid-price?
-        # Using prices-history for consistency with training
-        try:
-            # Fetch YES history (last few minutes to append)
-            resp = await client.get(
-                f"{POLYMARKET_CLOB}/prices-history",
-                params={
-                    "market": self.yes_token_id,
-                    "fidelity": 1,
-                    "interval": "1h" # Get last hour
-                }
-            )
+            logger.debug(f"Market find error: {e}")
             
+        return False
+
+    async def fetch_prices(self):
+        """Fetch BTC and Polymarket prices."""
+        # BTC
+        try:
+            resp = await self.binance_client.get(f"{BINANCE_REST}/ticker/price", params={"symbol": "BTCUSDT"})
+            price = float(resp.json()['price'])
+            self.state.btc_current = price
+            self.state.btc_price_history.append(price)
+            if self.state.btc_open == 0.0:
+                self.state.btc_open = price
+        except Exception as e:
+            logger.error(f"BTC fetch error: {e}")
+            
+        # Polymarket
+        if self.state.active_yes_id:
+            try:
+                # Use Prices History for consistency
+                # We need enough history for KAMA (at least 20 points, so ~2 hours of 1m data to be safe)
+                now_ts = int(datetime.now(timezone.utc).timestamp())
+                start_ts = now_ts - (3600 * 2) # 2 hours ago
+                
+                url = f"{POLYMARKET_CLOB}/prices-history"
+                params = {
+                    "market": self.state.active_yes_id, 
+                    "fidelity": 1,
+                    "startTs": start_ts,
+                    "endTs": now_ts
+                }
+                
+                resp = await self.poly_client.get(url, params=params)
+                
+                if resp.status_code == 200:
+                    data = resp.json()
+                    history = data.get("history", [])
+                    
+                    if not history:
+                        # Try orderbook fallback
+                        await self.fetch_orderbook_price()
+                    else:
+                        # Extract latest
+                        latest = float(history[-1]['p'])
+                        self.state.yes_price = latest
+                        self.state.no_price = 1.0 - latest
+                        
+                        # Use the fetched history directly instead of just appending
+                        # This handles the "initial load" better and keeps window rolling
+                        self.state.yes_price_history = [float(p['p']) for p in history]
+                        self.state.no_price_history = [1.0 - p for p in self.state.yes_price_history]
+                else:
+                    logger.warning(f"History fetch failed: {resp.status_code} {resp.text}")
+                    # Fallback
+                    await self.fetch_orderbook_price()
+                    
+            except Exception as e:
+                logger.error(f"Poly fetch error: {e}")
+                
+    async def fetch_orderbook_price(self):
+        """Fallback to orderbook if history is empty."""
+        try:
+            resp = await self.poly_client.get(f"{POLYMARKET_CLOB}/book", params={"token_id": self.state.active_yes_id})
             if resp.status_code == 200:
                 data = resp.json()
-                history = data.get("history", [])
+                bids = data.get("bids", [])
+                asks = data.get("asks", [])
                 
-                # We need to act like a stream. 
-                # Ideally we only add NEW data points.
-                # For simplicity in this loop, we replace the history with the fetched batch
-                # but in a real high-freq setup we'd use websocket.
-                
-                # Clear and refill for robustness (simplest for polling)
-                self.yes_price_history.clear()
-                self.no_price_history.clear()
-                
-                for point in history:
-                    p = float(point['p'])
-                    self.yes_price_history.append(p)
-                    self.no_price_history.append(1.0 - p) # Approx NO price
-            
-            # Also get CURRENT price from orderbook for the very latest tick
-            # (History API might be delayed)
-            # await self._fetch_live_tick(client)
-            
+                if bids and asks:
+                     mid = (float(bids[0]['price']) + float(asks[0]['price'])) / 2
+                     self.state.yes_price = mid
+                     self.state.no_price = 1.0 - mid
+                     # Stick it in history so model has *something*
+                     self.state.yes_price_history.append(mid)
         except Exception as e:
-            logger.error(f"Error fetching prices: {e}")
+            logger.error(f"OB fetch error: {e}")
 
-    def get_yes_prices(self) -> np.ndarray:
-        return np.array(self.yes_price_history)
-
-    def get_no_prices(self) -> np.ndarray:
-        return np.array(self.no_price_history)
-
-
-class LivePaperTrader:
-    def __init__(self, model_dir: str, balance: float):
-        self.model_dir = model_dir
-        self.balance = balance
-        self.initial_balance = balance
-        self.model = None
-        self.kama_builder = create_kama_feature_builder()
-        self.enhanced_builder = create_enhanced_feature_builder()
+    def get_model_output(self):
+        """Run model inference."""
+        if len(self.state.yes_price_history) < 20:
+            return  # Not enough data
+            
+        time_rem = self.get_time_remaining()
         
-        self.poly_streamer = LivePolymarketStreamer()
-        self.btc_history: deque = deque(maxlen=3000)
-        self.btc_start_price = None # Open price of candle
+        # Build Features
+        kama_spectrum, context_features = self.kama_builder.compute_features(
+            yes_prices=np.array(self.state.yes_price_history),
+            time_remaining=time_rem
+        )
         
-        self.current_position = None # {direction: 'YES'/'NO', size: float, entry_price: float}
-        self.trades = []
-        self.candle_start_time = None
-        self.candle_end_time = None
+        base_features = self.enhanced_builder.compute_features(
+            yes_prices=np.array(self.state.yes_price_history),
+            no_prices=np.array(self.state.no_price_history),
+            time_remaining=time_rem,
+            btc_prices=np.array(self.state.btc_price_history),
+            btc_open=self.state.btc_open
+        )
         
-        # Stats
-        self.wins = 0
-        self.losses = 0
+        # Inference
+        with torch.no_grad():
+            kama_t = torch.FloatTensor(kama_spectrum).unsqueeze(0).to(self.device)
+            context_t = torch.FloatTensor(context_features).unsqueeze(0).to(self.device)
+            base_t = torch.FloatTensor(base_features).unsqueeze(0).to(self.device)
+            
+            outputs = self.model(kama_t, context_t, base_t)
+            
+            self.state.last_prob = outputs['probability'].item()
+            self.state.last_attn = outputs['attention_weights'].cpu().numpy()[0]
 
-    async def load_model(self):
-        console.print(f"[blue]Loading model from {self.model_dir}...[/blue]")
-        self.model = load_attention_market_predictor(self.model_dir)
-        console.print("[green]Model loaded![/green]")
+    def execute_trading_logic(self):
+        """Execute entries based on thresholds."""
+        if self.state.position_side:
+            return # Hold position until settlement (binary)
+            
+        time_rem = self.get_time_remaining()
+        if time_rem < 0.05: # Don't trade last 5%
+            return
+            
+        prob = self.state.last_prob
+        price = self.state.yes_price
+        
+        if prob > self.config.min_confidence_yes and price < 0.85:
+            self.enter_position("YES", price)
+        elif prob < self.config.max_confidence_no and price > 0.15:
+            # Short YES = Buy NO
+            # Polymarket 'no' price is approx 1 - yes
+            self.enter_position("NO", 1.0 - price)
 
-    def start_new_candle(self):
-        now = datetime.now(timezone.utc)
-        minutes = now.minute
-        # 15m boundary
-        slot = (minutes // 15) * 15
-        self.candle_start_time = now.replace(minute=slot, second=0, microsecond=0)
-        self.candle_end_time = self.candle_start_time + timedelta(minutes=15)
+    def enter_position(self, side: str, price: float):
+        self.state.position_side = side
+        self.state.position_size = self.config.bet_size
+        self.state.entry_price = price
         
-        self.btc_start_price = self.btc_history[-1] if self.btc_history else 0.0
-        self.current_position = None
+        console.print(f"[bold green] >>> ENTER {side} @ {price:.3f} (Prob: {self.state.last_prob:.2f})[/bold green]")
+
+    def settle_position(self):
+        """Settle PnL at end of candle."""
+        if not self.state.position_side:
+             return
+             
+        # Determine outcome (Simulation using BTC price)
+        # In real Unified trader we check resolution, but here we estimate
+        won = False
+        if self.state.btc_current > self.state.btc_open:
+            outcome = "YES"
+        else:
+            outcome = "NO"
+            
+        if self.state.position_side == outcome:
+            won = True
+            
+        # PnL logic
+        if won:
+            # Profit = (1 - entry) / entry * size
+            profit = (1.0 - self.state.entry_price) / self.state.entry_price * self.state.position_size
+            self.state.balance += profit
+            self.state.total_pnl += profit
+            self.state.wins += 1
+            console.print(f"[bold green]WIN! +${profit:.2f}[/bold green]")
+        else:
+            loss = self.state.position_size
+            self.state.balance -= loss
+            self.state.total_pnl -= loss
+            self.state.losses += 1
+            console.print(f"[bold red]LOSS. -${loss:.2f}[/bold red]")
+            
+        self.state.position_side = None
+
+    def build_display(self) -> Layout:
+        """Create Rich UI Layout."""
+        layout = Layout()
+        layout.split_column(
+            Layout(name="header", size=3),
+            Layout(name="main", ratio=1),
+            Layout(name="footer", size=3)
+        )
         
-        console.print(f"\n[bold cyan]NEW CANDLE: {self.candle_start_time.strftime('%H:%M')} - {self.candle_end_time.strftime('%H:%M')}[/bold cyan]")
-        console.print(f"BTC Open: {self.btc_start_price}")
+        # Header
+        layout["header"].update(Panel(Text("Attention Market Predictor - Paper Trading", justify="center", style="bold cyan")))
+        
+        # Main: Grid
+        grid = Table.grid(expand=True)
+        grid.add_column(ratio=1)
+        grid.add_column(ratio=1)
+        grid.add_row(
+            self._build_market_panel(),
+            self._build_stats_panel()
+        )
+        layout["main"].update(grid)
+        
+        # Footer: Attention
+        layout["footer"].update(self._build_attn_panel())
+        
+        return layout
+
+    def _build_market_panel(self) -> Panel:
+        table = Table(box=None)
+        table.add_column("Metric", style="cyan")
+        table.add_column("Value", style="bold white")
+        
+        time_rem = self.get_time_remaining()
+        
+        table.add_row("Market", self.state.market_slug or "Searching...")
+        table.add_row("Time Rem", f"{time_rem:.1%}")
+        table.add_row("BTC Price", f"${self.state.btc_current:,.2f}")
+        table.add_row("YES Price", f"{self.state.yes_price:.3f}")
+        table.add_row("Model Prob", f"{self.state.last_prob:.3f}")
+        
+        return Panel(table, title="Market Status")
+
+    def _build_stats_panel(self) -> Panel:
+        table = Table(box=None)
+        table.add_column("Metric", style="magenta")
+        table.add_column("Value", style="bold white")
+        
+        table.add_row("Balance", f"${self.state.balance:,.2f}")
+        table.add_row("PnL", f"${self.state.total_pnl:+.2f}", style="green" if self.state.total_pnl >= 0 else "red")
+        table.add_row("Win/Loss", f"{self.state.wins}/{self.state.losses}")
+        
+        pos_str = "None"
+        if self.state.position_side:
+            pos_str = f"{self.state.position_side} @ {self.state.entry_price:.2f}"
+        table.add_row("Position", pos_str)
+        
+        return Panel(table, title="Account")
+        
+    def _build_attn_panel(self) -> Panel:
+        if self.state.last_attn is None:
+            return Panel("No attention data")
+            
+        # Draw a simple bar chart string
+        bars = ""
+        for w in self.state.last_attn:
+             bars += "█" * int(w * 10) + " "
+             
+        return Panel(Text(f"Attention Weights: {bars}", style="yellow"), title="Model Internals")
 
     async def run(self):
+        await self._setup_clients()
         await self.load_model()
         
-        # Use a persistent client for Polymarket to keep connection open (maybe?)
-        # Actually it's better to recreate or manage properly.
-        # But for now let's use the helper to create one.
+        console.print("[yellow]Starting Loop...[/yellow]")
         
-        # We need two clients? One for Binance (no proxy usually) and one for Poly (proxy).
-        poly_client = self.poly_streamer.create_client()
-        binance_client = httpx.AsyncClient(timeout=10.0)
-        
-        try:
-            console.print("[blue]Finding current market...[/blue]")
-            found = await self.poly_streamer.find_current_market(poly_client)
-            if not found:
-                console.print("[red]Could not find active Polymarket market. Waiting...[/red]")
-            else:
-                console.print(f"[green]Tracking market: {self.poly_streamer.market_slug}[/green]")
+        with Live(self.build_display(), refresh_per_second=2) as live:
+            self._running = True
             
-            # Initial fetch
-            await self.poly_streamer.update_prices(poly_client)
-            
-            # BTC History fill (short)
-            try:
-                resp = await binance_client.get(f"{BINANCE_REST}/klines", params={"symbol": "BTCUSDT", "interval": "1m", "limit": 60})
-                if resp.status_code == 200:
-                    klines = resp.json()
-                    for k in klines:
-                        self.btc_history.append(float(k[4])) # Close
-            except Exception as e:
-                logger.error(f"Binance init error: {e}")
-
-            # Start loop
-            msg_counter = 0
-            while True:
-                now = datetime.now(timezone.utc)
-                
-                # Check candle boundary
-                if self.candle_end_time and now >= self.candle_end_time:
-                    self.settle_candle()
-                    self.start_new_candle()
-                    # Refresh Polymarket for new candle
-                    await self.poly_streamer.find_current_market(poly_client)
-                
-                if not self.candle_start_time:
-                    self.start_new_candle()
-
-                # Update Data
+            while self._running:
                 try:
-                    # BTC
-                    btc_resp = await binance_client.get(f"{BINANCE_REST}/ticker/price", params={"symbol": "BTCUSDT"})
-                    btc_price = float(btc_resp.json()['price'])
-                    self.btc_history.append(btc_price)
+                    # 1. Market Sync
+                    found = await self.fetch_active_market()
                     
-                    # Polymarket
-                    await self.poly_streamer.update_prices(poly_client)
+                    # 2. Data Fetch
+                    await self.fetch_prices()
+                    
+                    # 3. Model
+                    self.get_model_output()
+                    
+                    # 4. Act
+                    self.execute_trading_logic()
+                    
+                    # 5. UI
+                    live.update(self.build_display())
+                    
+                    await asyncio.sleep(self.config.refresh_rate)
+                    
                 except Exception as e:
-                    logger.error(f"Fetch error: {e}")
+                    logger.error(f"Loop error: {e}")
                     await asyncio.sleep(1)
-                    continue
-
-
-                # Run Inference
-                # 1. Build Features
-                yes_prices = self.poly_streamer.get_yes_prices()
-                no_prices = self.poly_streamer.get_no_prices()
-                
-                if len(yes_prices) < 20: # Need some history
-                    console.print("[yellow]Waiting for more price history...[/yellow]", end="\r")
-                    await asyncio.sleep(2)
-                    continue
-                
-                btc_arr = np.array(self.btc_history)
-                
-                total_seconds = (self.candle_end_time - self.candle_start_time).total_seconds()
-                elapsed = (now - self.candle_start_time).total_seconds()
-                time_remaining = max(0.0, 1.0 - (elapsed / total_seconds))
-                
-                # KAMA Spectrum
-                kama_spectrum, context_features = self.kama_builder.compute_features(
-                    yes_prices=yes_prices,
-                    time_remaining=time_remaining
-                )
-                
-                # Base Features
-                base_features = self.enhanced_builder.compute_features(
-                    yes_prices=yes_prices,
-                    no_prices=no_prices,
-                    time_remaining=time_remaining,
-                    btc_prices=btc_arr,
-                    btc_open=self.btc_start_price
-                )
-                
-                # 2. Predict
-                with torch.no_grad():
-                    device = next(self.model.parameters()).device
-                    # Batch dim
-                    kama_t = torch.FloatTensor(kama_spectrum).unsqueeze(0).to(device)
-                    context_t = torch.FloatTensor(context_features).unsqueeze(0).to(device)
-                    base_t = torch.FloatTensor(base_features).unsqueeze(0).to(device)
-                    
-                    outputs = self.model(kama_t, context_t, base_t)
-                    prob_yes = outputs['probability'].item()
-                    attn_weights = outputs['attention_weights'].cpu().numpy()[0]
-
-                # 3. Trade Logic
-                self.execute_trade_logic(prob_yes, yes_prices[-1], time_remaining)
-
-                # UI Update (every few seconds)
-                if msg_counter % 5 == 0:
-                    self.update_ui(prob_yes, yes_prices[-1], attn_weights, btc_price)
-                msg_counter += 1
-                
-                await asyncio.sleep(1)
-
-        except Exception as e:
-            logger.error(f"Run loop error: {e}")
-            raise
-
-    def execute_trade_logic(self, prob_yes: float, current_price: float, time_remaining: float):
-        if self.current_position:
-            return # Already in a position
-            
-        # Simple threshold strategy driven by model confidence
-        # Buy YES if Prob > 0.7 and Price < 0.6 (edge)
-        # Buy NO if Prob < 0.3 and Price > 0.4
-        
-        # Don't trade too late
-        if time_remaining < 0.1:
-            return
-
-        size = 100.0 # Fixed bet size
-        
-        if prob_yes > 0.70 and current_price < 0.8:
-            self.current_position = {
-                "side": "YES",
-                "entry_price": current_price,
-                "size": size,
-                "entry_prop": prob_yes
-            }
-            console.print(f"[bold green] >>> BUY YES @ {current_price:.2f} (Prob: {prob_yes:.2f})[/bold green]")
-            
-        elif prob_yes < 0.30 and current_price > 0.2:
-             self.current_position = {
-                "side": "NO",
-                "entry_price": 1.0 - current_price, # NO price
-                "size": size,
-                "entry_prop": prob_yes
-            }
-             console.print(f"[bold red] >>> BUY NO @ {1.0 - current_price:.2f} (Prob: {prob_yes:.2f})[/bold red]")
-
-    def settle_candle(self):
-        if not self.current_position:
-            console.print("Candle ended. No position taken.")
-            return
-            
-        # Determine outcome based on BTC price vs Strike
-        # Wait, strictly speaking we should check Polymarket resolution.
-        # But locally we can approximate with BTC price.
-        btc_close = self.btc_history[-1]
-        strike = self.btc_start_price # Approx
-        
-        outcome_yes = btc_close > strike
-        
-        # Calculate PnL
-        side = self.current_position['side']
-        entry = self.current_position['entry_price']
-        size = self.current_position['size']
-        
-        if (side == "YES" and outcome_yes) or (side == "NO" and not outcome_yes):
-            # Win
-            profit = (1.0 - entry) / entry * size # Simple ROI calc
-            self.balance += profit
-            self.wins += 1
-            console.print(f"[bold green]WIN! PnL: +${profit:.2f}[/bold green]")
-        else:
-            # Loss
-            loss = size
-            self.balance -= loss
-            self.losses += 1
-            console.print(f"[bold red]LOSS. PnL: -${loss:.2f}[/bold red]")
-            
-        self.current_position = None
-        console.print(f"Current Balance: ${self.balance:.2f}")
-
-    def update_ui(self, prob: float, price: float, attn: np.ndarray, btc: float):
-        # We can make a nice rich table here
-        console.clear() 
-        
-        table = Table(title="Attention Market Predictor - Live")
-        table.add_column("Metric", style="cyan")
-        table.add_column("Value", style="magenta")
-        
-        table.add_row("BTC Price", f"${btc:,.2f}")
-        table.add_row("Poly YES Price", f"{price:.3f}")
-        table.add_row("Model P(YES)", f"{prob:.3f}")
-        
-        if self.current_position:
-            table.add_row("Position", f"{self.current_position['side']} @ {self.current_position['entry_price']:.2f}")
-        else:
-            table.add_row("Position", "None")
-            
-        table.add_row("Balance", f"${self.balance:,.2f}")
-        table.add_row("W/L", f"{self.wins}/{self.losses}")
-        
-        # Show top attended KAMA
-        # Just simple argmax
-        top_kama_idx = np.argmax(attn)
-        table.add_row("Top Attention", f"KAMA Idx {top_kama_idx} ({attn[top_kama_idx]:.3f})")
-        
-        console.print(table)
 
 
 async def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True, help="Path to model directory")
+    parser.add_argument("--model", required=True, help="Path to model logs/ directory")
     args = parser.parse_args()
     
-    trader = LivePaperTrader(
-        model_dir=args.model,
-        balance=1000.0
+    config = AttentionPaperTradeConfig(
+        model_path=args.model,
     )
     
-    try:
-        await trader.run()
-    except KeyboardInterrupt:
-        print("Stopping...")
-    finally:
-        # Cleanup would go here if we kept clients in 'trader'
-        pass
+    trader = AttentionPaperTrader(config)
+    await trader.run()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
