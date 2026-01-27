@@ -114,11 +114,16 @@ class TradingEngine:
 
     async def _handle_signal(self, market_id: str, prediction: Dict, snapshot: Dict):
         """Interpret signal and execute."""
-        # 0. Check Max Daily Loss
+        # 0. Check Max Daily Loss (Real mode only)
         daily_pnl = self.get_todays_pnl()
-        if daily_pnl < -self.config.risk.max_daily_loss_usd:
-            logger.warning(f"Max Daily Loss hit: {daily_pnl:.2f} < -{self.config.risk.max_daily_loss_usd}")
-            return # STOP TRADING
+        
+        if self.config.trading_mode == "real":
+            balance = await self.execution.get_balance()
+            if balance > 0:
+                pnl_pct = (daily_pnl / balance) * 100
+                if pnl_pct < -self.config.risk.max_daily_loss_pct:
+                    logger.warning(f"Max Daily Loss hit: {pnl_pct:.2f}% < -{self.config.risk.max_daily_loss_pct}%")
+                    return # STOP TRADING
 
         action = prediction["action"]
         conf = prediction["confidence"]
@@ -157,6 +162,12 @@ class TradingEngine:
                 
             if size > 0:
                 await self.execution.execute_order(market_id, side, size, price)
+
+        # Log heartbeat if no action to confirm model is alive
+        if action == "WAIT" or action == "HOLD":
+            # Log periodically or just debug
+            logger.info(f"Model Signal: {action} | Conf: {conf:.2f} | PnL: {daily_pnl:.2f}")
+
 
     # Accessors for UI
     def get_state(self):

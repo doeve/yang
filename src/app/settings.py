@@ -57,7 +57,7 @@ class SettingsScreen(Screen):
                         
                         with Horizontal(classes="row"):
                             yield Label("Max Loss/Day:", classes="lbl")
-                            yield Input(value=str(self.config.risk.max_daily_loss_usd), id="max_daily_loss")
+                            yield Input(value=str(self.config.risk.max_daily_loss_pct), id="max_daily_loss")
 
                         with Horizontal(classes="row"):
                             yield Label("Stop Loss (%):", classes="lbl")
@@ -87,7 +87,7 @@ class SettingsScreen(Screen):
         
         # Risk
         try:
-            self.config.risk.max_daily_loss_usd = float(self.query_one("#max_daily_loss", Input).value)
+            self.config.risk.max_daily_loss_pct = float(self.query_one("#max_daily_loss", Input).value)
             self.config.risk.stop_loss_pct = float(self.query_one("#stop_loss", Input).value)
         except ValueError:
             self.notify("Invalid number format in Risk settings", severity="error")

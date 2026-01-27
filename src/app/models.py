@@ -50,10 +50,9 @@ class UnifiedPredictor(Predictor):
         self.device = device
         # We need feature builders
         # NOTE: In a real app we might inject these or load config
-        from src.data.kama_features import create_kama_feature_builder
+        # NOTE: In a real app we might inject these or load config
         from src.data.enhanced_features import create_enhanced_feature_builder
         
-        self.kama_builder = create_kama_feature_builder()
         self.enhanced_builder = create_enhanced_feature_builder()
         
     def load(self, path: str):

@@ -70,16 +70,18 @@ class YangApp(App):
             state = self.engine.get_state()
             market_data = state["market"]
             prediction = state["prediction"]
-            
-            dash.query_one("#market_watch").update_data(market_data)
-            dash.query_one("#model_signal").update_data(prediction)
-            
-            # Account
+            dash.query_one("#left").update_data(market_data, self.config.trading_mode)
+
+            # Account & Signal in RightPanel
             bal = await self.engine.execution.get_balance()
             slug = market_data.get("market_slug")
             pos = await self.engine.execution.get_position(slug) if slug else None
             
-            dash.query_one("#account_summary").update_data(bal, pos)
+            # Get trades (not async in this implementation, or simply awaited)
+            # engine.execution.get_trade_history is async
+            trades = await self.engine.execution.get_trade_history()
+            
+            dash.query_one("#right").update_data(prediction, bal, pos, trades)
         except Exception as e:
             logging.error(f"UI Update Error: {e}", exc_info=True)
 

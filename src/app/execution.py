@@ -39,8 +39,8 @@ class ExecutionAdapter(abc.ABC):
         pass
         
     @abc.abstractmethod
-    async def close_position(self, market_id: str):
-        """Execute SELL order (exit)."""
+    async def get_trade_history(self) -> list:
+        """Return list of past trades."""
         pass
 
 class PaperAdapter(ExecutionAdapter):
@@ -49,6 +49,7 @@ class PaperAdapter(ExecutionAdapter):
     def __init__(self, config: AppConfig):
         self.balance = 1000.0  # Default paper balance
         self.positions: Dict[str, Position] = {} # market_id -> Position
+        self.trades = [] # List of closed trades
         self.config = config
         
     async def get_balance(self) -> float:
@@ -57,6 +58,9 @@ class PaperAdapter(ExecutionAdapter):
     async def get_position(self, market_id: str) -> Optional[Position]:
         return self.positions.get(market_id)
         
+    async def get_trade_history(self) -> list:
+        return self.trades
+
     async def execute_order(self, market_id: str, side: str, size: float, price_limit: float = None):
         # In paper mode, we assume immediate fill at current price if not provided
         # The engine usually passes the current market price as 'limit' for Paper Adapter consistency
@@ -86,9 +90,21 @@ class PaperAdapter(ExecutionAdapter):
         # PnL calc depends on current price updates which happens in Engine loop
         # Here we just realize whatever the current_price IS
         proceeds = pos.size * pos.current_price
+        pnl = proceeds - (pos.size * pos.entry_price)
         self.balance += proceeds
         
-        logger.info(f"Paper SELL {pos.side} {pos.size} @ {pos.current_price} PnL={proceeds - (pos.size*pos.entry_price):.2f}")
+        # Log trade
+        from datetime import datetime
+        self.trades.append({
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "market": market_id,
+            "side": pos.side,
+            "entry": pos.entry_price,
+            "exit": pos.current_price,
+            "pnl": pnl
+        })
+        
+        logger.info(f"Paper SELL {pos.side} {pos.size} @ {pos.current_price} PnL={pnl:.2f}")
         del self.positions[market_id]
 
     def update_position_price(self, market_id: str, new_price: float):

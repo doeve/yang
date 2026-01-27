@@ -336,7 +336,35 @@ class MarketDataService:
             self._fetch_btc_price(),
             self.source.refresh(self.market_state)
         )
+        self._update_model_sampling()
+
+    def _update_model_sampling(self):
+        """Sample prices at fixed intervals for the model."""
+        import time
+        now = time.time()
         
+        # Init sampling state if needed
+        if "last_sample_ts" not in self.market_state:
+            self.market_state["last_sample_ts"] = 0
+            self.market_state["model_yes_history"] = []
+            self.market_state["model_no_history"] = []
+            
+        # Sample every 5 seconds (matching typical training data freq)
+        if now - self.market_state["last_sample_ts"] >= 5.0:
+            self.market_state["last_sample_ts"] = now
+            
+            # Use current price
+            y_price = self.market_state.get("yes_price", 0.5)
+            n_price = self.market_state.get("no_price", 0.5)
+            
+            self.market_state["model_yes_history"].append(y_price)
+            self.market_state["model_no_history"].append(n_price)
+            
+            # Keep history bounded (e.g. 500 points = ~40 mins)
+            if len(self.market_state["model_yes_history"]) > 500:
+                self.market_state["model_yes_history"] = self.market_state["model_yes_history"][-500:]
+                self.market_state["model_no_history"] = self.market_state["model_no_history"][-500:]
+
     async def _fetch_btc_price(self):
         """Fetch BTC price from Binance."""
         try:
@@ -365,14 +393,25 @@ class MarketDataService:
             rem_sec = max(0, end_ts - now_ts)
             time_rem = min(1.0, rem_sec / 900.0)
 
+        # Use SAMPLED history for the model if available, otherwise fallback (graceful start)
+        model_yes = self.market_state.get("model_yes_history", [])
+        model_no = self.market_state.get("model_no_history", [])
+        
+        # If sampling hasn't built up yet, use raw history but warn/limit? 
+        # Actually better to send what we have.
+        if not model_yes:
+            model_yes = self.market_state["yes_history"]
+            model_no = self.market_state["no_history"]
+
         return {
-            "yes_price_history": self.market_state["yes_history"],
-            "no_price_history": self.market_state["no_history"],
+            "yes_price_history": model_yes,
+            "no_price_history": model_no,
             "btc_price_history": self.market_state["btc_history"],
             "btc_open_price": self.market_state["btc_open"],
             "btc_current_price": self.market_state["btc_price"],
             "time_remaining": time_rem,
             "market_slug": self.market_state["market_slug"],
             "yes_price": self.market_state["yes_price"],
+            "no_price": self.market_state["no_price"],
             "last_updated": now_ts
         }

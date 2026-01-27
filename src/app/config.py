@@ -13,7 +13,7 @@ DEFAULT_CONFIG_PATH = Path("yang_config.json")
 @dataclass
 class RiskSettings:
     max_position_size_usd: float = 100.0
-    max_daily_loss_usd: float = 50.0
+    max_daily_loss_pct: float = 5.0
     stop_loss_pct: float = 0.10
     take_profit_pct: float = 0.20
     max_open_positions: int = 3
