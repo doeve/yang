@@ -66,6 +66,8 @@ class PolymarketAPISource(MarketDataSource):
              state["no_history"] = []
              state["model_yes_history"] = []
              state["model_no_history"] = []
+             state["ui_yes_history"] = []  # Fix: Clear UI history too
+             state["ui_no_history"] = []   # Fix: Clear UI history too
              state["market_slug"] = None
              
         if not state["market_slug"]:
@@ -107,6 +109,23 @@ class PolymarketAPISource(MarketDataSource):
                         state["no_history"] = [1.0 - x for x in state["yes_history"]]
                         state["yes_price"] = state["yes_history"][-1]
                         state["no_price"] = state["no_history"][-1]
+                        
+                        # Pre-fill Model History (so it doesn't wait 20 mins)
+                        # API returns 1-minute samples which is EXACTLY what the model needs
+                        state["model_yes_history"] = state["yes_history"].copy()
+                        state["model_no_history"] = state["no_history"].copy()
+                        
+                        # Pre-fill UI history (so chart isn't empty)
+                        # It will look blocky until new high-freq points come in, but better than empty
+                        state["ui_yes_history"] = state["yes_history"].copy()
+                        state["ui_no_history"] = state["no_history"].copy()
+                        
+                        # Reset sample counters to now
+                        import time
+                        now = time.time()
+                        state["last_sample_ts"] = now
+                        state["last_ui_sample_ts"] = now
+                        
                     else:
                         # Fallback to book if history empty (rare but possible at scan start)
                         await self._fetch_book(state)
@@ -341,23 +360,37 @@ class MarketDataService:
         self._update_model_sampling()
 
     def _update_model_sampling(self):
-        """Sample prices at fixed intervals for the model."""
+        """Sample prices at fixed intervals for the model and UI."""
         import time
         now = time.time()
         
         # Init sampling state if needed
         if "last_sample_ts" not in self.market_state:
-            self.market_state["last_sample_ts"] = 0
+            self.market_state["last_sample_ts"] = 0 # For Model (1m)
+            self.market_state["last_ui_sample_ts"] = 0 # For UI (5s)
             self.market_state["model_yes_history"] = []
             self.market_state["model_no_history"] = []
+            self.market_state["ui_yes_history"] = []
+            self.market_state["ui_no_history"] = []
             
-        # Sample every 60 seconds (1 minute data as requested)
+        # Get current prices
+        y_price = self.market_state.get("yes_price", 0.5)
+        n_price = self.market_state.get("no_price", 0.5)
+
+        # 1. UI Sampling (5 seconds) - Restore high freq for dashboard
+        if now - self.market_state.get("last_ui_sample_ts", 0) >= 5.0:
+            self.market_state["last_ui_sample_ts"] = now
+            self.market_state.get("ui_yes_history", []).append(y_price)
+            self.market_state.get("ui_no_history", []).append(n_price)
+            
+            # Keep UI history bounded (180 points * 2 for safety = ~360)
+            if len(self.market_state["ui_yes_history"]) > 360:
+                self.market_state["ui_yes_history"] = self.market_state["ui_yes_history"][-360:]
+                self.market_state["ui_no_history"] = self.market_state["ui_no_history"][-360:]
+
+        # 2. Model Sampling (60 seconds) - Keep aligned with training data
         if now - self.market_state["last_sample_ts"] >= 60.0:
             self.market_state["last_sample_ts"] = now
-            
-            # Use current price
-            y_price = self.market_state.get("yes_price", 0.5)
-            n_price = self.market_state.get("no_price", 0.5)
             
             self.market_state["model_yes_history"].append(y_price)
             self.market_state["model_no_history"].append(n_price)
@@ -409,9 +442,17 @@ class MarketDataService:
             model_yes = self.market_state["yes_history"]
             model_no = self.market_state["no_history"]
 
+        # Use UI sampled history for display
+        ui_yes = self.market_state.get("ui_yes_history", [])
+        ui_no = self.market_state.get("ui_no_history", [])
+        
+        if not ui_yes:
+             ui_yes = self.market_state["yes_history"]
+             ui_no = self.market_state["no_history"]
+
         return {
-            "yes_price_history": self.market_state["yes_history"], # UI High Freq
-            "no_price_history": self.market_state["no_history"],
+            "yes_price_history": ui_yes, # UI High Freq (5s)
+            "no_price_history": ui_no,
             "model_yes_history": model_yes, # Model 1-min Freq
             "model_no_history": model_no,
             "btc_price_history": self.market_state["btc_history"],

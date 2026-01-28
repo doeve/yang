@@ -50,7 +50,6 @@ class UnifiedPredictor(Predictor):
         self.device = device
         # We need feature builders
         # NOTE: In a real app we might inject these or load config
-        # NOTE: In a real app we might inject these or load config
         from src.data.enhanced_features import create_enhanced_feature_builder
         
         self.enhanced_builder = create_enhanced_feature_builder()
@@ -64,7 +63,6 @@ class UnifiedPredictor(Predictor):
         if not self.model:
             raise RuntimeError("Model not loaded")
             
-        # Extract data
         # Extract data
         # Use 1-minute sampled history for model (as fixed in data service)
         # Fallback to yes_price_history if model history is missing (should not happen after warmup)
