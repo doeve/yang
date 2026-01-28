@@ -475,6 +475,32 @@ class UnifiedPaperTrader:
             logger.error(f"Binance fetch error: {e}")
         return None
 
+    async def fetch_btc_candle_open(self) -> Optional[float]:
+        """Fetch the open price of the current 15m candle."""
+        try:
+            # Calculate start of current 15m candle
+            now_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
+            candle_start = (now_ts // 900000) * 900000
+            
+            url = "https://api.binance.com/api/v3/klines"
+            params = {
+                "symbol": "BTCUSDT",
+                "interval": "15m",
+                "limit": 1,
+                "startTime": candle_start
+            }
+            response = await self.binance_client.get(url, params=params)
+
+            if response.status_code == 200:
+                data = response.json()
+                if data and len(data) > 0:
+                    # Index 1 is Open price
+                    # [Open Time, Open, High, Low, Close, Volume, Close Time, ...]
+                    return float(data[0][1])
+        except Exception as e:
+            logger.error(f"Binance candle fetch error: {e}")
+        return None
+
     def get_model_action(self) -> Dict[str, Any]:
         """Get action from unified model."""
         if self.model is None:
@@ -610,7 +636,7 @@ class UnifiedPaperTrader:
                 return
 
             size = self.calculate_position_size(expected_return, confidence)
-            self.execute_entry("yes", size, model_output)
+            await self.execute_entry("yes", size, model_output)
 
         elif action == Action.BUY_NO:
             if self.state.position_side is not None:
@@ -625,7 +651,7 @@ class UnifiedPaperTrader:
                 return
 
             size = self.calculate_position_size(expected_return, confidence)
-            self.execute_entry("no", size, model_output)
+            await self.execute_entry("no", size, model_output)
 
         elif action == Action.WAIT:
             # Smart Entry Override: Check if model is freezing despite high confidence
@@ -646,17 +672,17 @@ class UnifiedPaperTrader:
                     # Favors YES
                     size = self.calculate_position_size(expected_return, confidence)
                     console.print(f"[bold cyan]⚡ SMART ENTRY TRIGGERED: YES (Conf={confidence:.1%} Ret={expected_return:.1%})[/bold cyan]")
-                    self.execute_entry("yes", size, model_output)
+                    await self.execute_entry("yes", size, model_output)
                 else:
                     # Favors NO
                     size = self.calculate_position_size(expected_return, confidence)
                     console.print(f"[bold cyan]⚡ SMART ENTRY TRIGGERED: NO (Conf={confidence:.1%} Ret={expected_return:.1%})[/bold cyan]")
-                    self.execute_entry("no", size, model_output)
+                    await self.execute_entry("no", size, model_output)
 
         elif action == Action.EXIT:
             if self.state.position_side is None:
                 return  # No position to exit
-            self.execute_exit("model_signal")
+            await self.execute_exit("model_signal")
 
         elif action == Action.HOLD:
             # Model says hold current position - do nothing
@@ -664,11 +690,52 @@ class UnifiedPaperTrader:
 
         # Force exit near settlement (safety net)
         if self.state.position_side and time_remaining < 0.02:
-            self.execute_exit("time_expiry")
+            await self.execute_exit("time_expiry")
 
-    def execute_entry(self, side: str, position_size: float, model_output: Dict):
+    async def execute_entry(self, side: str, position_size: float, model_output: Dict):
         """Execute position entry."""
         price = self.state.last_yes_price if side == "yes" else self.state.last_no_price
+        dollar_size = position_size * self.state.balance
+        
+        # Calculate quantity (shares) = investment / price
+        if price <= 0:
+            logger.error("Price is 0, cannot enter")
+            return
+        quantity = dollar_size / price
+
+        # Live Execution
+        if self.is_live_mode and self.executor:
+            # Determine token ID
+            token_id = self.state.active_yes_id if side == "yes" else self.state.active_no_id
+            if not token_id:
+                logger.error("No active token ID for entry")
+                return
+
+            console.print(f"[bold yellow]Executing LIVE BUY {side.upper()}: ${dollar_size:.2f} ({quantity:.1f} shares) @ {price:.3f}[/bold yellow]")
+            
+            # Place order
+            result = await self.executor.place_order(
+                token_id=token_id,
+                side="BUY",
+                size=quantity,
+                price=price
+            )
+            
+            if not result.success:
+                console.print(f"[bold red]Order Execution Failed: {result.error}[/bold red]")
+                return
+            
+            # Wait for fill (optional but recommended)
+            if result.order_id:
+                filled = await self.executor.wait_for_fill(result.order_id)
+                if not filled:
+                    console.print("[red]Order not filled within timeout[/red]")
+                    # In real logic you might cancel here or keep tracking. 
+                    # For now we assume partial fill or proceed to track it.
+                    # Upgrading state anyway to track intent, but warning user.
+            
+            # Update wallet balance
+            self.state.wallet_balance = await self.executor.get_usdc_balance()
 
         self.state.position_side = side
         self.state.position_size = position_size
@@ -697,7 +764,7 @@ class UnifiedPaperTrader:
             "time_remaining": self.get_time_remaining(),
         })
 
-    def execute_exit(self, reason: str = "manual"):
+    async def execute_exit(self, reason: str = "manual"):
         """Execute position exit."""
         if self.state.position_side is None:
             return
@@ -710,7 +777,36 @@ class UnifiedPaperTrader:
         )
 
         invested = self.state.position_size * self.state.balance
-        shares = invested / entry_price
+        shares = invested / entry_price if entry_price > 0 else 0
+        
+        # Live Execution
+        if self.is_live_mode and self.executor:
+            # Determine token ID
+            token_id = self.state.active_yes_id if side == "yes" else self.state.active_no_id
+            if token_id:
+                console.print(f"[bold yellow]Executing LIVE SELL {side.upper()}: {shares:.1f} shares @ {current_price:.3f}[/bold yellow]")
+                
+                # Place order
+                result = await self.executor.place_order(
+                    token_id=token_id,
+                    side="SELL",
+                    size=shares,
+                    price=current_price
+                )
+                
+                if not result.success:
+                    console.print(f"[bold red]Exit Order Failed: {result.error}[/bold red]")
+                    # For exit, we might want to retry or mark as stuck?
+                    # For now, we return and don't clear the position so we try again next tick
+                    return
+                
+                # Wait for fill
+                if result.order_id:
+                    await self.executor.wait_for_fill(result.order_id)
+                
+                # Update wallet balance
+                self.state.wallet_balance = await self.executor.get_usdc_balance()
+
         exit_value = shares * current_price
         pnl = exit_value - invested
 
@@ -900,7 +996,15 @@ class UnifiedPaperTrader:
                     self.state.btc_current_price = btc_price
                     self.state.btc_price_history.append(btc_price)
                     if self.state.btc_open_price is None:
-                        self.state.btc_open_price = btc_price
+                        # Try to fetch true open price
+                        true_open = await self.fetch_btc_candle_open()
+                        if true_open:
+                            self.state.btc_open_price = true_open
+                            console.print(f"[bold cyan]Synced BTC Candle Open: ${true_open:.2f}[/bold cyan]")
+                        else:
+                            # Fallback to current if fetch fails
+                            self.state.btc_open_price = btc_price
+                            logger.warning("Using current BTC price as open (fetch failed)")
 
                 # Get model action
                 model_output = self.get_model_action()

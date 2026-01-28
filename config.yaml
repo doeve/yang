@@ -10,7 +10,7 @@ trading_mode: live
 risk:
   # Maximum daily loss as percentage of starting balance
   # Trading pauses automatically when this limit is hit
-  max_daily_loss_pct: 5.0
+  max_daily_loss_pct: 10.0
   
   # Maximum position size in USDC for a single trade
   max_position_size_usdc: 100.0
