@@ -1,0 +1,44 @@
+# Yang Trading Configuration
+# This file controls trading behavior and risk parameters
+
+# Trading Mode
+# "paper" - Simulated trading (default, safe for testing)
+# "live"  - Real on-chain trading with actual funds
+trading_mode: paper
+
+# Risk Controls
+risk:
+  # Maximum daily loss as percentage of starting balance
+  # Trading pauses automatically when this limit is hit
+  max_daily_loss_pct: 5.0
+  
+  # Maximum position size in USDC for a single trade
+  max_position_size_usdc: 100.0
+  
+  # Minimum balance to maintain (don't trade below this)
+  min_balance_usdc: 10.0
+
+# Execution Settings
+execution:
+  # Order timeout in seconds (cancel unfilled orders after this)
+  order_timeout_seconds: 30
+  
+  # Polling interval for trade confirmation (seconds)
+  poll_interval_seconds: 5
+  
+  # Use public RPC for redemption (more reliable)
+  use_public_rpc_for_redeem: true
+  
+  # Public RPC URL (fallback for redemption)
+  public_rpc_url: "https://polygon-rpc.com"
+
+# Model Settings (can be overridden by CLI)
+model:
+  path: "./logs/market_predictor_v1"
+  min_confidence: 0.3
+  min_expected_return: 0.02
+
+# Logging
+logging:
+  dir: "./logs/paper_trade_unified"
+  enable_ml_logging: true

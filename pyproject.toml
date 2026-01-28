@@ -41,6 +41,11 @@ dependencies = [
     "structlog>=24.1.0",
     "rich>=13.7.0",
     "typer>=0.9.0",
+    "pyyaml>=6.0",
+    
+    # Web3 / Blockchain
+    "web3>=6.0.0",
+    "eth-account>=0.10.0",
     
     # Technical Analysis
     "ta>=0.11.0",
