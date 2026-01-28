@@ -104,30 +104,143 @@ class PolymarketAPISource(MarketDataSource):
                 if resp.status_code == 200 and "history" in resp.json():
                     hist = resp.json()["history"]
                     if hist:
-                        # Full replace
-                        state["yes_history"] = [float(p['p']) for p in hist]
-                        state["no_history"] = [1.0 - x for x in state["yes_history"]]
-                        state["yes_price"] = state["yes_history"][-1]
-                        state["no_price"] = state["no_history"][-1]
+                        # Parse API history: [{t: ts, p: price}, ...]
+                        # Ensure sorted
+                        raw_data = []
+                        for h in hist:
+                            try:
+                                t_val = int(h['t'])
+                                p_val = float(h['p'])
+                                raw_data.append((t_val, p_val))
+                            except:
+                                continue
                         
-                        # Pre-fill Model History (so it doesn't wait 20 mins)
-                        # API returns 1-minute samples which is EXACTLY what the model needs
-                        state["model_yes_history"] = state["yes_history"].copy()
-                        state["model_no_history"] = state["no_history"].copy()
+                        raw_data.sort(key=lambda x: x[0])
                         
-                        # Pre-fill UI history (so chart isn't empty)
-                        # It will look blocky until new high-freq points come in, but better than empty
-                        state["ui_yes_history"] = state["yes_history"].copy()
-                        state["ui_no_history"] = state["no_history"].copy()
-                        
-                        # Reset sample counters to now
-                        import time
-                        now = time.time()
-                        state["last_sample_ts"] = now
-                        state["last_ui_sample_ts"] = now
-                        
+                        if raw_data:
+                            # 1. Update UI History (Use raw data, it's fine for charts)
+                            state["yes_history"] = [x[1] for x in raw_data]
+                            # Recalculate no_history
+                            state["no_history"] = [1.0 - x for x in state["yes_history"]]
+                            
+                            # Update latest
+                            last_pt = raw_data[-1]
+                            state["yes_price"] = last_pt[1]
+                            state["no_price"] = 1.0 - last_pt[1]
+                            
+                            # 2. Strict Resampling for Model (1-minute grid)
+                            # Model expects fixed stride of 60s.
+                            # We generate a grid going back e.g. 500 minutes from now.
+                            
+                            import time
+                            now_epoch = int(time.time())
+                            # Align to nearest minute just to be clean, though current time is better anchor?
+                            # Model just wants last X points spaced by 60s.
+                            
+                            resampled_yes = []
+                            resampled_no = []
+                            
+                            # Look back 500 minutes (enough for model context)
+                            points_needed = 500
+                            stride = 60
+                            
+                            # Pointer to raw_data
+                            raw_idx = len(raw_data) - 1
+                            current_price = raw_data[-1][1] # Default to latest
+                            
+                            # We build backwards from Now
+                            for i in range(points_needed):
+                                t_target = now_epoch - (i * stride)
+                                
+                                # Find price at t_target (latest price <= t_target)
+                                # Since we are going backwards, we can move raw_idx back
+                                while raw_idx >= 0 and raw_data[raw_idx][0] > t_target:
+                                    raw_idx -= 1
+                                
+                                if raw_idx >= 0:
+                                    # We found a point <= t_target
+                                    # But is it relevant? If it's too old (e.g. gap > 1 hour), maybe invalid?
+                                    # For crypto markets, last trade holds.
+                                    val = raw_data[raw_idx][1]
+                                    resampled_yes.append(val)
+                                    resampled_no.append(1.0 - val)
+                                else:
+                                    # No data before this point. 
+                                    # If we have some future data (we iterated backwards), replicate it (backfill)?
+                                    # Or just stop if we run out of history.
+                                    pass
+                            
+                            # Reverse back to [old -> new]
+                            state["model_yes_history"] = resampled_yes[::-1]
+                            state["model_no_history"] = resampled_no[::-1]
+                            
+                            # 3. Robust Resampling for UI (5-second grid for Dashboard)
+                            # Dashboard X-axis is 15 minutes = 900 seconds = 180 ticks (5s each).
+                            # We need to fill ui_yes_history with 5s ticks starting from 'market_ts'.
+                            
+                            market_ts = state.get("market_ts")
+                            if market_ts:
+                                # How many seconds into the market are we?
+                                elapsed = now_epoch - market_ts
+                                if elapsed > 0:
+                                    # Cap at 900s (15m) just in case
+                                    elapsed = min(elapsed, 900)
+                                    # Expected ticks
+                                    ticks_needed = int(elapsed // 5)
+                                    
+                                    ui_resampled_yes = []
+                                    ui_resampled_no = []
+                                    
+                                    if ticks_needed > 0:
+                                        # We need to generate ticks for [market_ts, market_ts+5, ..., market_ts + ticks*5]
+                                        # Use forward fill from available raw_data
+                                        
+                                        # Filter raw_data to be relevant? 
+                                        # Actually, just search in raw_data for price <= tick_ts
+                                        # Raw data is sorted (t, p)
+                                        
+                                        # Optimization: only look at data >= market_ts - some buffer?
+                                        # Actually, for the very first tick, we might need the price right before market_ts?
+                                        # Let's just use binary search or simple iteration.
+                                        
+                                        curr_raw_idx = 0
+                                        last_known_val = 0.5 # Default start
+                                        
+                                        # Find initial price (just before or at market start)
+                                        # We want the price that was active at market_ts.
+                                        while curr_raw_idx < len(raw_data) and raw_data[curr_raw_idx][0] <= market_ts:
+                                            last_known_val = raw_data[curr_raw_idx][1]
+                                            curr_raw_idx += 1
+                                            
+                                        # Now generate ticks
+                                        for i in range(ticks_needed):
+                                            tick_ts = market_ts + (i * 5)
+                                            
+                                            # Advance last_known_val if new data points appear <= tick_ts
+                                            while curr_raw_idx < len(raw_data) and raw_data[curr_raw_idx][0] <= tick_ts:
+                                                last_known_val = raw_data[curr_raw_idx][1]
+                                                curr_raw_idx += 1
+                                            
+                                            ui_resampled_yes.append(last_known_val)
+                                            ui_resampled_no.append(1.0 - last_known_val)
+                                            
+                                    state["ui_yes_history"] = ui_resampled_yes
+                                    state["ui_no_history"] = ui_resampled_no
+                                else:
+                                    # Market hasn't started or just started
+                                    state["ui_yes_history"] = []
+                                    state["ui_no_history"] = []
+                            else:
+                                # Fallback if no market ts?
+                                state["ui_yes_history"] = state["yes_history"].copy()
+                                state["ui_no_history"] = state["no_history"].copy()
+                            
+                            # Reset sample counters
+                            state["last_sample_ts"] = float(now_epoch)
+                            state["last_ui_sample_ts"] = float(now_epoch)
+                            
                     else:
-                        # Fallback to book if history empty (rare but possible at scan start)
+                        # Fallback to book
                         await self._fetch_book(state)
                 else:
                     await self._fetch_book(state)
