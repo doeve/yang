@@ -64,6 +64,8 @@ class PolymarketAPISource(MarketDataSource):
             # New candle? Clear history
              state["yes_history"] = []
              state["no_history"] = []
+             state["model_yes_history"] = []
+             state["model_no_history"] = []
              state["market_slug"] = None
              
         if not state["market_slug"]:

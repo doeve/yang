@@ -41,6 +41,18 @@ class AppConfig:
     # Risk
     risk: RiskSettings = field(default_factory=RiskSettings)
     
+    # Strategy
+    @dataclass
+    class StrategySettings:
+        min_confidence: float = 0.3
+        min_expected_return: float = 0.02
+        min_time_remaining: float = 0.05
+        base_position_size: float = 0.10
+        max_position_size: float = 0.25
+        min_position_size: float = 0.05
+
+    strategy: StrategySettings = field(default_factory=StrategySettings)
+    
     def save(self, path: Path = DEFAULT_CONFIG_PATH):
         """Save config to JSON."""
         data = asdict(self)
@@ -59,6 +71,9 @@ class AppConfig:
         # Handle nested dataclass
         if "risk" in data:
             data["risk"] = RiskSettings(**data["risk"])
+            
+        if "strategy" in data:
+            data["strategy"] = cls.StrategySettings(**data["strategy"])
             
         return cls(**data)
 

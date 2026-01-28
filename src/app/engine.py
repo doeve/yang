@@ -4,6 +4,7 @@ Core Trading Engine.
 import asyncio
 import logging
 from typing import Optional, Dict
+import numpy as np
 
 from src.app.config import AppConfig
 from src.app.data import MarketDataService
@@ -112,6 +113,20 @@ class TradingEngine:
             return self.execution.balance - 1000.0 # Hack: assuming 1000 start
         return 0.0
 
+    
+    def calculate_position_size(self, expected_return: float, confidence: float) -> float:
+        """Calculate position size based on model outputs."""
+        # Base size scales linearly with expected return
+        # 0.5x to 2x based on return relative to 10% benchmark
+        return_factor = np.clip(expected_return / 0.10, 0.5, 2.0)
+        
+        # Confidence factor: 0.5x to 1x
+        conf_factor = 0.5 + 0.5 * confidence
+        
+        size = self.config.strategy.base_position_size * return_factor * conf_factor
+        
+        return float(np.clip(size, self.config.strategy.min_position_size, self.config.strategy.max_position_size))
+
     async def _handle_signal(self, market_id: str, prediction: Dict, snapshot: Dict):
         """Interpret signal and execute."""
         # 0. Check Max Daily Loss (Real mode only)
@@ -127,46 +142,58 @@ class TradingEngine:
 
         action = prediction["action"]
         conf = prediction["confidence"]
+        expected_return = prediction.get("expected_return", 0.0)
+        time_remaining = snapshot.get("time_remaining", 0.0)
         
         # Get current pos
         pos = await self.execution.get_position(market_id)
         
-        # Rules
+        # Check Expiry/Settlement
+        if time_remaining == 0 and pos:
+             logger.info(f"Market Expired: Forcing Close for {market_id}")
+             await self.execution.close_position(market_id)
+             return
+
         # 1. EXIT
         if action == "EXIT" and pos:
+            # We could add logic here: only exit if expected_return is low?
+            # But "EXIT" usually means the model sees negative value.
             await self.execution.close_position(market_id)
             return
 
         # 2. ENTRY
         if action in ["BUY_YES", "BUY_NO"] and not pos:
-            # Check thresholds (simple safety)
-            if conf < 0.3: # Hardcoded safety floor
+            # Safety Filters
+            if conf < self.config.strategy.min_confidence:
+                return
+            if expected_return < self.config.strategy.min_expected_return:
+                return
+            if time_remaining < self.config.strategy.min_time_remaining:
                 return
                 
             side = "yes" if action == "BUY_YES" else "no"
             price = snapshot["yes_price"] if side == "yes" else snapshot["no_price"]
             
-            # Size calc - User said "bot chooses", so let's try to infer or use default
-            # If we removed Max Pos from UI, we need a default or dynamic size
-            # Let's use 10% of balance or 100 USD default if config is missing
+            # Dynamic Sizing
+            pct_size = self.calculate_position_size(expected_return, conf)
+            
             balance = await self.execution.get_balance()
+            size_usd = balance * pct_size
             
-            # Dynamic sizing: 10% of current balance
-            size_usd = balance * 0.10
-            
-            # Cap size at balance
+            # Cap at balance
             if size_usd > balance:
                 size_usd = balance
                 
             size = size_usd / price if price > 0 else 0
                 
             if size > 0:
+                logger.info(f"ENTRY: {side.upper()} @ {price:.3f} | Size={pct_size:.1%} (${size_usd:.0f}) | E[R]={expected_return:.1%}")
                 await self.execution.execute_order(market_id, side, size, price)
 
-        # Log heartbeat if no action to confirm model is alive
-        if action == "WAIT" or action == "HOLD":
-            # Log periodically or just debug
-            logger.info(f"Model Signal: {action} | Conf: {conf:.2f} | PnL: {daily_pnl:.2f}")
+        # Log heartbeat
+        if action in ["WAIT", "HOLD"]:
+            # logger.info(f"Model Signal: {action} | Conf: {conf:.2f}")
+            pass
 
 
     # Accessors for UI

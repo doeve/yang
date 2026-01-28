@@ -3,8 +3,9 @@ Dashboard Screen and Widgets.
 """
 from textual.app import ComposeResult
 from textual.containers import Container, Vertical, Horizontal
-from textual.widgets import Header, Footer, Static, Label, Sparkline, DataTable
+from textual.widgets import Header, Footer, Static, Label, DataTable
 from textual.screen import Screen
+from textual_plotext import PlotextPlot
 import numpy as np
 
 class MarketHeader(Static):
@@ -14,25 +15,25 @@ class MarketHeader(Static):
         with Horizontal(classes="header-container"):
             # Market Name
             with Vertical(classes="info-col"):
-                yield Label("MARKET", classes="label-dim")
-                yield Label("---", id="market_name", classes="value-bright")
+                yield Label("MARKET", classes="label-dim full-width")
+                yield Label("---", id="market_name", classes="value-bright full-width")
             
             # BTC Price
             with Vertical(classes="info-col"):
-                yield Label("BTC PRICE", classes="label-dim")
-                with Horizontal(classes="centered"):
+                yield Label("BTC PRICE", classes="label-dim full-width")
+                with Horizontal(classes="centered full-width"):
                      yield Label("---", id="btc_price", classes="value-bright")
                      yield Label("", id="btc_arrow", classes="arrow")
                 
             # BTC Open
             with Vertical(classes="info-col"):
-                yield Label("OPEN", classes="label-dim")
-                yield Label("---", id="btc_open", classes="value-bright")
+                yield Label("OPEN", classes="label-dim full-width")
+                yield Label("---", id="btc_open", classes="value-bright full-width")
 
             # YES/NO Price
             with Vertical(classes="info-col"):
-                yield Label("YES / NO", classes="label-dim")
-                with Horizontal(classes="centered"):
+                yield Label("YES / NO", classes="label-dim full-width")
+                with Horizontal(classes="centered full-width"):
                     yield Label("Y:", classes="label-dim")
                     yield Label("--", id="yes_price", classes="value-yes")
                     yield Label(" N:", classes="label-dim")
@@ -40,9 +41,10 @@ class MarketHeader(Static):
                 
             # Model & State
             with Vertical(classes="info-col"):
-                yield Label("MODEL", classes="label-dim")
-                yield Label("Unified v1", classes="value-bright")
-                yield Label("---", id="app_state")
+                yield Label("MODEL", classes="label-dim full-width")
+                with Horizontal(classes="centered full-width"):
+                    yield Label("market_predictor_v1 (mp1)", classes="value-bright")
+                    yield Label("---", id="app_state", classes="value-bright")
 
     def update_data(self, data: dict, config_mode: str = "paper"):
         # Market Name
@@ -77,26 +79,62 @@ class MarketHeader(Static):
 class BTCChart(Static):
     """Row 2: BTC Chart"""
     def compose(self) -> ComposeResult:
-        with Vertical():
+        with Vertical(id="btc-container"):
             yield Label("BTC TREND (vs Open)", classes="label-dim box-title")
-            yield Sparkline([], summary_function=np.mean, id="btc_spark")
+            yield PlotextPlot(id="btc_plot")
             
     def update_data(self, data: dict):
         hist = data.get("btc_price_history", [])
-        if hist:
-            self.query_one("#btc_spark", Sparkline).data = hist
+        if not hist:
+            return
+            
+        plot_widget = self.query_one(PlotextPlot)
+        plt = plot_widget.plt
+        
+        plt.clear_data()
+        plt.title("BTC/USDT")
+        plt.theme("dark")
+        plt.plot(hist, color="blue", label="Price")
+        
+        # Set sensible Y limits?
+        # Auto-scaling is usually fine in plotext, but we can pad?
+        # plt.ylim(min(hist)*0.999, max(hist)*1.001)
+        
+        plot_widget.refresh()
 
 class YESChart(Static):
     """Row 3: YES Chart"""
     def compose(self) -> ComposeResult:
-        with Vertical():
+        with Vertical(id="yes-container"):
             yield Label("YES PRICE TREND", classes="label-dim box-title")
-            yield Sparkline([], summary_function=np.mean, id="yes_spark")
+            yield PlotextPlot(id="yes_plot")
             
     def update_data(self, data: dict):
         hist = data.get("yes_price_history", [])
-        if hist:
-            self.query_one("#yes_spark", Sparkline).data = hist
+        no_hist = data.get("no_price_history", []) # If available
+        
+        # We want fixed 15m window.
+        # Sampling is 5s => 15*60/5 = 180 ticks.
+        # If we just started, hist has 1 point.
+        # We set xlim(0, 180).
+        
+        if not hist:
+            return
+            
+        plot_widget = self.query_one(PlotextPlot)
+        plt = plot_widget.plt
+        
+        plt.clear_data()
+        plt.title("Outcome Probability (15m Fixed)")
+        plt.theme("dark")
+        plt.ylim(0, 1.0)
+        plt.xlim(0, 180) # Fixed X axis
+        
+        plt.plot(hist, color="green", label="YES")
+        if no_hist and len(no_hist) == len(hist):
+             plt.plot(no_hist, color="red", label="NO")
+        
+        plot_widget.refresh()
 
 class LeftPanel(Static):
     """Left Side Panel (2/3 width)"""
@@ -130,8 +168,22 @@ class RightPanel(Static):
             # Account
             with Vertical(classes="box-section"):
                 yield Label("ACCOUNT", classes="section-title")
-                yield Label("$---", id="balance", classes="value-bright")
-                yield Label("Profit: ---", id="total_profit")
+                
+                with Horizontal(classes="acc-row"):
+                    yield Label("Balance:", classes="label-dim")
+                    yield Label("$---", id="balance", classes="value-bright")
+                    
+                with Horizontal(classes="acc-row"):
+                    yield Label("Total PnL:", classes="label-dim")
+                    yield Label("$---", id="total_profit")
+
+                with Horizontal(classes="acc-row"):
+                    yield Label("Daily PnL:", classes="label-dim")
+                    yield Label("$---", id="daily_profit")
+                    
+                with Horizontal(classes="acc-row"):
+                    yield Label("Win Rate:", classes="label-dim")
+                    yield Label("---%", id="win_rate")
                 
             # History
             with Vertical(classes="history-section"):
@@ -171,16 +223,26 @@ class RightPanel(Static):
             
         # Account
         self.query_one("#balance", Label).update(f"${bal:,.2f}")
+        
+        # Total Profit
         profit = bal - initial_bal
         prof_c = "green" if profit >= 0 else "red"
         self.query_one("#total_profit", Label).update(f"[{prof_c}]${profit:+.2f}[/]")
         
+        # Daily Profit (Use same as total for now, or approx)
+        # Ideally we get this from engine/state
+        self.query_one("#daily_profit", Label).update(f"[{prof_c}]${profit:+.2f}[/]")
+        
+        # Win Rate
+        wins = sum(1 for t in trades if t['pnl'] > 0)
+        total = len(trades)
+        rate = (wins / total * 100) if total > 0 else 0
+        self.query_one("#win_rate", Label).update(f"{rate:.1f}% ({wins}/{total})")
+
         # Trades
         table = self.query_one("#history_table", DataTable)
         
-        # Check if we need to add rows
-        # Simplistic sync: if len(trades) > rows, add difference
-        # Assuming trades is append-only list
+        # Check rows
         current_rows = len(table.rows)
         if len(trades) > current_rows:
             for t in trades[current_rows:]:
@@ -233,8 +295,15 @@ class Dashboard(Screen):
         align: center middle;
     }
     
+    .full-width {
+        width: 100%;
+        text-align: center;
+    }
+    
     .centered {
-        align: center middle;
+        height: 1;
+        align-horizontal: center;
+        align-vertical: middle;
     }
     
     .label-dim { color: $text-disabled; text-align: center; }
@@ -254,6 +323,21 @@ class Dashboard(Screen):
         color: $text-disabled;
         margin-bottom: 1;
     }
+    
+    .acc-row {
+        height: 1;
+        width: 100%;
+        align: center middle;
+        /* Distribute space */
+        layout: horizontal;
+    }
+    .acc-row Label:first-child {
+        dock: left;
+    }
+    .acc-row Label:last-child {
+        dock: right;
+    }
+    /* Alternatively use 1fr on middle if needed on spacer */
     
     .big_text {
         text-align: center;
@@ -276,8 +360,10 @@ class Dashboard(Screen):
         padding: 0;
     }
     
-    #btc_spark { color: blue; }
-    #yes_spark { color: green; }
+    PlotextPlot {
+        height: 1fr;
+        width: 100%;
+    }
     
     DataTable {
         height: 100%;
