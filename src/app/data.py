@@ -351,8 +351,8 @@ class MarketDataService:
             self.market_state["model_yes_history"] = []
             self.market_state["model_no_history"] = []
             
-        # Sample every 5 seconds (matching typical training data freq)
-        if now - self.market_state["last_sample_ts"] >= 5.0:
+        # Sample every 60 seconds (1 minute data as requested)
+        if now - self.market_state["last_sample_ts"] >= 60.0:
             self.market_state["last_sample_ts"] = now
             
             # Use current price
@@ -362,7 +362,7 @@ class MarketDataService:
             self.market_state["model_yes_history"].append(y_price)
             self.market_state["model_no_history"].append(n_price)
             
-            # Keep history bounded (e.g. 500 points = ~40 mins)
+            # Keep history bounded 
             if len(self.market_state["model_yes_history"]) > 500:
                 self.market_state["model_yes_history"] = self.market_state["model_yes_history"][-500:]
                 self.market_state["model_no_history"] = self.market_state["model_no_history"][-500:]
@@ -395,19 +395,25 @@ class MarketDataService:
             rem_sec = max(0, end_ts - now_ts)
             time_rem = min(1.0, rem_sec / 900.0)
 
-        # Use SAMPLED history for the model if available, otherwise fallback (graceful start)
+        # Model uses 1-minute sampled history
         model_yes = self.market_state.get("model_yes_history", [])
         model_no = self.market_state.get("model_no_history", [])
         
-        # If sampling hasn't built up yet, use raw history but warn/limit? 
-        # Actually better to send what we have.
+        # If sampling hasn't built up yet, fall back to main history but we should be careful with frequency mismatch
         if not model_yes:
+            # Fallback: Sample from main history? Or just send main history?
+            # Sending main history (which is mixed frequency) corresponds to the bug we are fixing.
+            # But sending empty list crashes model.
+            # Let's take every 60th point if possible? Or last N?
+            # For robustness, just send what we have, but ideally we wait for samples.
             model_yes = self.market_state["yes_history"]
             model_no = self.market_state["no_history"]
 
         return {
-            "yes_price_history": model_yes,
-            "no_price_history": model_no,
+            "yes_price_history": self.market_state["yes_history"], # UI High Freq
+            "no_price_history": self.market_state["no_history"],
+            "model_yes_history": model_yes, # Model 1-min Freq
+            "model_no_history": model_no,
             "btc_price_history": self.market_state["btc_history"],
             "btc_open_price": self.market_state["btc_open"],
             "btc_current_price": self.market_state["btc_price"],

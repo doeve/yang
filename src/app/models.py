@@ -65,8 +65,12 @@ class UnifiedPredictor(Predictor):
             raise RuntimeError("Model not loaded")
             
         # Extract data
-        yes_hist = np.array(market_data.get("yes_price_history", []))
-        no_hist = np.array(market_data.get("no_price_history", []))
+        # Extract data
+        # Use 1-minute sampled history for model (as fixed in data service)
+        # Fallback to yes_price_history if model history is missing (should not happen after warmup)
+        yes_hist = np.array(market_data.get("model_yes_history") or market_data.get("yes_price_history", []))
+        no_hist = np.array(market_data.get("model_no_history") or market_data.get("no_price_history", []))
+        
         btc_hist = np.array(market_data.get("btc_price_history", []))
         btc_open = market_data.get("btc_open_price", 0.0)
         time_rem = market_data.get("time_remaining", 0.0)

@@ -19,7 +19,7 @@ class Position:
     entry_price: float
     current_price: float = 0.0
     pnl: float = 0.0
-    ticks_held: int = 0
+    ticks_held: float = 0.0
     max_pnl: float = 0.0
 
 class ExecutionAdapter(abc.ABC):
@@ -107,12 +107,30 @@ class PaperAdapter(ExecutionAdapter):
         logger.info(f"Paper SELL {pos.side} {pos.size} @ {pos.current_price} PnL={pnl:.2f}")
         del self.positions[market_id]
 
+    @dataclass
+    class Position:
+        symbol: str  # e.g. "btc-15m-UUID" or "YES"
+        side: str   # "yes" or "no"
+        size: float
+        entry_price: float
+        current_price: float = 0.0
+        pnl: float = 0.0
+        ticks_held: float = 0.0 # Changed to float to allow fractional accumulation
+        max_pnl: float = 0.0
+
+    # ... (in PaperAdapter)
+
     def update_position_price(self, market_id: str, new_price: float):
         """Helper for Engine to update tracking."""
         if market_id in self.positions:
             pos = self.positions[market_id]
             pos.current_price = new_price
-            pos.ticks_held += 1
+            
+            # Increment ticks: Paper trade script counted 1 tick per 5 seconds.
+            # App runs at 1Hz (1 tick per 1 second).
+            # So we increment by 0.2 to match the RATE of accumulation.
+            # The model will see int(ticks_held) or float, but scaling remains consistent.
+            pos.ticks_held += 0.2
             
             # Calc PnL
             cost = pos.size * pos.entry_price
