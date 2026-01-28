@@ -627,6 +627,32 @@ class UnifiedPaperTrader:
             size = self.calculate_position_size(expected_return, confidence)
             self.execute_entry("no", size, model_output)
 
+        elif action == Action.WAIT:
+            # Smart Entry Override: Check if model is freezing despite high confidence
+            # Thresholds: Confidence > 60%, Expected Return > 5%
+            smart_conf_thresh = 0.60
+            smart_ret_thresh = 0.05
+            
+            if (confidence > smart_conf_thresh and 
+                expected_return > smart_ret_thresh and 
+                time_remaining >= self.config.min_time_remaining):
+                
+                # Check which side is favored by Q-values (even if lower than WAIT)
+                q_values = model_output["q_values"]
+                q_buy_yes = q_values[Action.BUY_YES]
+                q_buy_no = q_values[Action.BUY_NO]
+                
+                if q_buy_yes > q_buy_no:
+                    # Favors YES
+                    size = self.calculate_position_size(expected_return, confidence)
+                    console.print(f"[bold cyan]⚡ SMART ENTRY TRIGGERED: YES (Conf={confidence:.1%} Ret={expected_return:.1%})[/bold cyan]")
+                    self.execute_entry("yes", size, model_output)
+                else:
+                    # Favors NO
+                    size = self.calculate_position_size(expected_return, confidence)
+                    console.print(f"[bold cyan]⚡ SMART ENTRY TRIGGERED: NO (Conf={confidence:.1%} Ret={expected_return:.1%})[/bold cyan]")
+                    self.execute_entry("no", size, model_output)
+
         elif action == Action.EXIT:
             if self.state.position_side is None:
                 return  # No position to exit

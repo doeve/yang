@@ -1,0 +1,16 @@
+{
+  "total_ticks": 49070,
+  "total_candles": 310,
+  "total_trades": 141,
+  "wins": 72,
+  "losses": 69,
+  "total_pnl": 3520.664661805732,
+  "missed_opportunities_count": 19659,
+  "missed_opportunities_potential_profit": 2210322.8372230856,
+  "bad_decisions_count": 72,
+  "bad_decisions_loss": -541.5190861478925,
+  "poor_entries": 36,
+  "late_entries": 18,
+  "premature_exits": 13,
+  "negative_expectancy_entries": 5
+}
