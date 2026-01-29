@@ -4,7 +4,7 @@
 # Trading Mode
 # "paper" - Simulated trading (default, safe for testing)
 # "live"  - Real on-chain trading with actual funds
-trading_mode: live
+trading_mode: paper
 
 # Risk Controls
 risk:

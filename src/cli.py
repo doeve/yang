@@ -1463,6 +1463,7 @@ def train_unified_cmd(
     batch_size: int = typer.Option(128, help="Batch size"),
     patience: int = typer.Option(15, help="Early stopping patience"),
     samples_per_candle: int = typer.Option(15, help="Training samples per candle"),
+    no_proxy: bool = typer.Option(False, "--no-proxy", help="Do not use socks5 proxy to gather polymarket Data")
 ):
     """Train unified MarketPredictor model on real historical data.
 
@@ -1499,6 +1500,7 @@ def train_unified_cmd(
                 output_dir=data_dir,
                 days_back=days,
                 btc_interval=btc_interval,
+                use_proxy=not no_proxy,
             )
             console.print()
 

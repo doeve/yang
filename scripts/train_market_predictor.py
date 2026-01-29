@@ -41,7 +41,8 @@ console = Console()
 async def collect_historical_data(
     output_dir: str = "./data/historical",
     days_back: int = 30,
-    btc_interval: str = "1m",  # Use 1m for faster collection, still good resolution
+    btc_interval: str = "1m",  # Use 1m for faster collection, still good resolution,
+    use_proxy: bool = True
 ):
     """Collect historical data from Binance and Polymarket."""
     from src.data.historical_data_collector import HistoricalDataCollector
@@ -52,7 +53,7 @@ async def collect_historical_data(
     console.print(f"  Output: {output_dir}")
     console.print()
 
-    collector = HistoricalDataCollector(output_dir=output_dir)
+    collector = HistoricalDataCollector(output_dir=output_dir, use_proxy=use_proxy)
     data = await collector.collect_all_data(
         days_back=days_back,
         btc_interval=btc_interval,
