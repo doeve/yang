@@ -18,6 +18,7 @@ import structlog
 from eth_account import Account
 from eth_account.messages import encode_defunct
 from web3 import Web3
+from web3.middleware import ExtraDataToPOAMiddleware
 
 logger = structlog.get_logger(__name__)
 
@@ -107,6 +108,9 @@ class LiveExecutor:
         try:
             # Setup Web3
             self.w3 = Web3(Web3.HTTPProvider(self.polygon_rpc_url))
+            # Inject POA middleware for Polygon
+            self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+
             if not self.w3.is_connected():
                 logger.error("Failed to connect to Polygon RPC")
                 return False

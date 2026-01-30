@@ -62,6 +62,7 @@ class TradingConfig:
     # Environment-loaded credentials (not from config.yaml)
     polygon_rpc_url: str = ""
     polygon_ws_url: str = ""
+    public_rpc_url: str = ""  # For onchain execution
     eth_private_key: str = ""
     polymarket_api_key: str = ""
     polymarket_api_secret: str = ""
@@ -159,6 +160,7 @@ def load_config(
     # Load from environment
     config.polygon_rpc_url = os.getenv("POLYGON_RPC_URL", os.getenv("POLYGON_RPC", "http://localhost:8545"))
     config.polygon_ws_url = os.getenv("POLYGON_WS_URL", "ws://localhost:8546")
+    config.public_rpc_url = os.getenv("PUBLIC_RPC_URL", config.execution.public_rpc_url)  # From env or config.yaml
     config.eth_private_key = os.getenv("ETH_PRIVATE_KEY", "")
     config.polymarket_api_key = os.getenv("POLYMARKET_API_KEY", "")
     config.polymarket_api_secret = os.getenv("POLYMARKET_API_SECRET", os.getenv("POLYMARKET_SECRET", ""))

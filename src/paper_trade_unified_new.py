@@ -73,7 +73,7 @@ from src.models.market_predictor import (
     load_market_predictor,
 )
 from src.config import load_config, TradingConfig
-from src.execution import LiveExecutor, Redeemer
+from src.execution import LiveExecutor, Redeemer, OnchainExecutor, OnchainOrderExecutor
 from src.risk import DailyLossTracker
 
 logger = structlog.get_logger(__name__)
@@ -196,9 +196,9 @@ class UnifiedPaperTrader:
         self.ml_log_file: Optional[Path] = None
         self.ml_log_handle = None
 
-        # Live trading components
-        self.executor: Optional[LiveExecutor] = None
-        self.redeemer: Optional[Redeemer] = None
+        # Live trading components (onchain execution to avoid fees)
+        self.executor: Optional[OnchainOrderExecutor] = None
+        self.onchain_executor: Optional[OnchainExecutor] = None  # For redemption
         self.loss_tracker = DailyLossTracker(starting_balance=config.initial_balance)
 
     @property
@@ -347,33 +347,38 @@ class UnifiedPaperTrader:
 
         # Initialize live trading components if in live mode
         if self.is_live_mode and self.trading_config:
-            console.print("[bold red]🔴 LIVE TRADING MODE[/bold red]")
+            console.print("[bold red]🔴 LIVE TRADING MODE (ONCHAIN - NO POLYMARKET FEES)[/bold red]")
 
-            # Initialize executor
-            self.executor = LiveExecutor(
-                polygon_rpc_url=self.trading_config.polygon_rpc_url,
+            # Initialize onchain order executor (for fee-free trading)
+            self.executor = OnchainOrderExecutor(
+                local_rpc_url=self.trading_config.polygon_rpc_url,
                 private_key=self.trading_config.eth_private_key,
-                api_key=self.trading_config.polymarket_api_key,
-                api_secret=self.trading_config.polymarket_api_secret,
-                passphrase=self.trading_config.polymarket_passphrase,
+                public_rpc_url=self.trading_config.public_rpc_url,
+                use_public_rpc=self.trading_config.execution.use_public_rpc_for_redeem,
                 socks5_proxy=self.trading_config.socks5_proxy,
             )
             if await self.executor.connect():
+                # Ensure approvals for trading
+                await self.executor.ensure_approvals()
+
                 # Update wallet balance
                 self.state.wallet_balance = await self.executor.get_usdc_balance()
                 console.print(f"  [green]Wallet connected: ${self.state.wallet_balance:.2f} USDC[/green]")
+                console.print(f"  [cyan]Using onchain execution (bypassing CLOB fees)[/cyan]")
             else:
                 console.print("  [red]Failed to connect executor, falling back to paper mode[/red]")
                 self.config.trading_mode = "paper"
 
-            # Initialize redeemer
-            self.redeemer = Redeemer(
+            # Initialize onchain executor for redemption
+            self.onchain_executor = OnchainExecutor(
                 local_rpc_url=self.trading_config.polygon_rpc_url,
                 private_key=self.trading_config.eth_private_key,
-                public_rpc_url=self.trading_config.execution.public_rpc_url,
+                public_rpc_url=self.trading_config.public_rpc_url,
                 use_public_rpc=self.trading_config.execution.use_public_rpc_for_redeem,
+                socks5_proxy=self.trading_config.socks5_proxy,
             )
-            await self.redeemer.connect()
+            await self.onchain_executor.connect()
+            console.print(f"  [cyan]Auto-redemption enabled[/cyan]")
         else:
             console.print("[green]📝 PAPER TRADING MODE[/green]")
 
@@ -412,7 +417,10 @@ class UnifiedPaperTrader:
                         self.state.active_yes_id = clob_tokens[0]
                         self.state.active_no_id = clob_tokens[1]
                         self.state.current_candle_ts = timestamp
+                        self.state.condition_id = market.get("conditionId")  # Store for redemption
                         console.print(f"[blue]Found market: {slug}[/blue]")
+                        if self.state.condition_id:
+                            console.print(f"  [dim]Condition ID: {self.state.condition_id[:16]}...[/dim]")
                         return True
         except Exception as e:
             logger.error(f"Market discovery error: {e}")
@@ -830,7 +838,7 @@ class UnifiedPaperTrader:
         self.state.ticks_held = 0
         self.state.max_pnl_seen = 0.0
 
-    def settle_position(self):
+    async def settle_position(self):
         """Settle position at candle end."""
         if not self.state.position_side:
             return
@@ -896,40 +904,60 @@ class UnifiedPaperTrader:
         self.state.position_size = 0.0
         self.state.entry_price = 0.0
 
+        # Auto-redeem if in live mode (market is now closed/resolved)
+        if self.is_live_mode:
+            await self.auto_redeem()
+
     async def auto_redeem(self):
         """
-        Auto-redeem winning shares in live mode when time expires.
-        
-        Called when time_remaining <= 0% and holding shares.
+        Auto-redeem winning shares in live mode when market closes.
+
+        Called after each candle settlement to automatically redeem resolved positions.
+        This ensures we get our USDC back immediately after market resolution.
         """
-        if not self.is_live_mode or not self.redeemer:
+        if not self.is_live_mode or not self.onchain_executor:
             return
-        
+
         if not self.state.condition_id:
-            logger.warning("No condition_id set, cannot redeem")
+            logger.debug("No condition_id set, skipping redemption check")
             return
-        
+
         try:
             # Check if resolved
-            if await self.redeemer.check_resolution(self.state.condition_id):
-                console.print("[bold cyan]Auto-redeeming resolved position...[/bold cyan]")
-                result = await self.redeemer.redeem_positions(self.state.condition_id)
-                
+            if await self.onchain_executor.check_resolution(self.state.condition_id):
+                console.print("[bold cyan]🎁 Auto-redeeming resolved position...[/bold cyan]")
+
+                # Get token IDs for redemption
+                yes_token_id = self.state.active_yes_id
+                no_token_id = self.state.active_no_id
+
+                if not yes_token_id or not no_token_id:
+                    logger.warning("Token IDs not available for redemption")
+                    return
+
+                # Redeem position
+                result = await self.onchain_executor.redeem_position(
+                    condition_id=self.state.condition_id,
+                    yes_token_id=yes_token_id,
+                    no_token_id=no_token_id,
+                )
+
                 if result.success:
-                    if result.skipped:
-                        console.print("[dim]Position already redeemed or no winning tokens[/dim]")
-                    else:
+                    if result.skipped_reason:
+                        console.print(f"[dim]⏭️  {result.skipped_reason}[/dim]")
+                    elif result.tx_hash:
                         console.print(
-                            f"[bold green]Redeemed ${result.usdc_redeemed:.2f} USDC[/bold green] "
+                            f"[bold green]✅ Redeemed ${result.usdc_redeemed:.2f} USDC[/bold green] "
                             f"(tx: {result.tx_hash[:12]}...)"
                         )
                         # Update wallet balance
                         if self.executor:
                             self.state.wallet_balance = await self.executor.get_usdc_balance()
+                            console.print(f"  [green]Updated balance: ${self.state.wallet_balance:.2f}[/green]")
                 else:
-                    console.print(f"[red]Redemption failed: {result.error}[/red]")
+                    console.print(f"[red]❌ Redemption failed: {result.error}[/red]")
             else:
-                console.print("[dim]Market not yet resolved, waiting...[/dim]")
+                logger.debug("Market not yet resolved, skipping redemption")
         except Exception as e:
             logger.error(f"Auto-redeem error: {e}")
 
@@ -943,7 +971,7 @@ class UnifiedPaperTrader:
                 current_ts = self.get_current_candle_timestamp()
                 if self.state.current_candle_ts != current_ts:
                     if self.state.current_candle_ts is not None:
-                        self.settle_position()
+                        await self.settle_position()
 
                     found = await self.fetch_active_market(current_ts)
                     if found:

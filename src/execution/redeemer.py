@@ -11,6 +11,7 @@ from typing import Optional, Set, Dict, Any
 
 import structlog
 from web3 import Web3
+from web3.middleware import ExtraDataToPOAMiddleware
 from eth_account import Account
 
 logger = structlog.get_logger(__name__)
@@ -101,10 +102,14 @@ class Redeemer:
         try:
             # Setup local provider (for reads)
             self.local_w3 = Web3(Web3.HTTPProvider(self.local_rpc_url))
-            
+            # Inject POA middleware for Polygon
+            self.local_w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+
             # Setup public provider (for transactions)
             if self.use_public_rpc:
                 self.public_w3 = Web3(Web3.HTTPProvider(self.public_rpc_url))
+                # Inject POA middleware for Polygon
+                self.public_w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
             else:
                 self.public_w3 = self.local_w3
             

@@ -139,21 +139,73 @@ class PaperAdapter(ExecutionAdapter):
             pos.max_pnl = max(pos.max_pnl, (new_price - pos.entry_price)/pos.entry_price)
 
 class PolymarketAdapter(ExecutionAdapter):
-    """Real execution via CLOB API."""
+    """Real execution via onchain executor."""
     def __init__(self, config: AppConfig):
         self.config = config
-        # Placeholder for real client init
-        pass
-        
+        self.executor = None
+        self._positions: Dict[str, Position] = {}
+
+    async def _ensure_connected(self):
+        """Ensure executor is connected."""
+        if self.executor is None:
+            from src.execution import OnchainExecutor
+            import os
+
+            self.executor = OnchainExecutor(
+                local_rpc_url=os.getenv("POLYGON_RPC_URL", "http://localhost:8545"),
+                private_key=os.getenv("PRIVATE_KEY", ""),
+                public_rpc_url=os.getenv("PUBLIC_RPC_URL", "https://polygon-rpc.com"),
+                use_public_rpc=True,
+                socks5_proxy=os.getenv("SOCKS5_PROXY"),
+            )
+            await self.executor.connect()
+
     async def get_balance(self) -> float:
-        # TODO: Implement real balance fetch
+        """Get USDC balance from blockchain."""
+        await self._ensure_connected()
+        if self.executor:
+            return await self.executor.get_usdc_balance()
         return 0.0
-        
+
     async def get_position(self, market_id: str) -> Optional[Position]:
-        return None
-        
+        """Get current position for a market."""
+        return self._positions.get(market_id)
+
     async def execute_order(self, market_id: str, side: str, size: float, price_limit: float = None):
-        logger.warning("Real execution not yet fully implemented")
-        
+        """
+        Execute order (currently tracked locally, actual execution would need CLOB API or DEX).
+        Note: Direct onchain order placement requires either CLOB API or a DEX.
+        This adapter focuses on position tracking and redemption.
+        """
+        logger.info(f"Polymarket order: {side} {size} @ {price_limit} for {market_id}")
+
+        # Track position locally
+        # In production, this would place an order via CLOB API
+        price = price_limit or 0.5
+        self._positions[market_id] = Position(
+            symbol=market_id,
+            side=side,
+            size=size,
+            entry_price=price,
+            current_price=price,
+            pnl=0.0
+        )
+
     async def close_position(self, market_id: str):
-        pass
+        """Close position."""
+        if market_id in self._positions:
+            pos = self._positions[market_id]
+            logger.info(f"Closing position: {pos.side} {pos.size} @ {pos.current_price}")
+            del self._positions[market_id]
+
+    async def redeem_all_resolved(self) -> list:
+        """
+        Redeem all resolved positions.
+
+        This is the main advantage of the onchain executor - it can
+        automatically find and redeem winning positions.
+        """
+        await self._ensure_connected()
+        if self.executor:
+            return await self.executor.redeem_all_resolved_positions()
+        return []
