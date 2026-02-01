@@ -332,6 +332,13 @@ class OnchainOrderExecutor:
                 )
 
                 nonce = self.public_w3.eth.get_transaction_count(self.address)
+
+                # Get current gas prices (EIP-1559)
+                latest_block = self.public_w3.eth.get_block('latest')
+                base_fee = latest_block.get('baseFeePerGas', 30 * 10**9)  # Default 30 gwei
+                max_priority_fee = self.public_w3.to_wei(50, 'gwei')  # 50 gwei tip
+                max_fee = base_fee * 2 + max_priority_fee  # 2x base + priority
+
                 tx = usdc_public.functions.approve(
                     Web3.to_checksum_address(CONTRACTS["CTF"]),
                     max_uint256
@@ -339,6 +346,8 @@ class OnchainOrderExecutor:
                     "from": self.address,
                     "nonce": nonce,
                     "gas": 100000,
+                    "maxFeePerGas": max_fee,
+                    "maxPriorityFeePerGas": max_priority_fee,
                 })
 
                 signed_tx = self.account.sign_transaction(tx)
