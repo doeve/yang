@@ -353,64 +353,74 @@ class OnchainExecutor:
         Returns:
             Set of token IDs (as strings)
         """
-        if not self.local_w3 or not self.address:
+        if not self.public_w3 or not self.address:
             return set()
 
         try:
             logger.info("Querying blockchain for token transfers...")
 
-            ctf = self.local_w3.eth.contract(
+            # Use public_w3 for historical queries (local RPC may have pruned data)
+            ctf = self.public_w3.eth.contract(
                 address=Web3.to_checksum_address(CONTRACTS["CTF"]),
                 abi=CTF_ABI,
             )
 
             # If from_block is 0, use a recent block to avoid huge queries
             if from_block == 0:
-                current_block = self.local_w3.eth.block_number
-                # Look back ~30 days (assuming 2 sec blocks = ~1.3M blocks/month)
-                from_block = max(0, current_block - 1_300_000)
-                logger.info(f"Scanning from block {from_block} to {to_block}")
+                current_block = self.public_w3.eth.block_number
+                # Look back ~2 days (assuming 2 sec blocks = ~86k blocks)
+                # This is small enough for most RPCs
+                from_block = max(0, current_block - 86_400)
+                logger.info(f"Scanning from block {from_block} to {to_block} (~2 days)")
 
             token_ids = set()
 
             # Query TransferSingle events where 'to' is our address
             # event TransferSingle(address indexed operator, address indexed from, address indexed to, uint256 id, uint256 value)
 
-            # Get logs
-            # Topic 0: event signature
+            # Event signature and address topic
             event_signature = Web3.keccak(text='TransferSingle(address,address,address,uint256,uint256)')
-            # Topic 3: 'to' address (our address, padded to 32 bytes)
             to_address_topic = '0x' + self.address[2:].lower().zfill(64)
 
-            logs = self.local_w3.eth.get_logs({
-                'fromBlock': from_block,
-                'toBlock': to_block,
-                'address': Web3.to_checksum_address(CONTRACTS["CTF"]),
-                'topics': [
-                    '0x' + event_signature.hex(),
-                    None,  # operator (any)
-                    None,  # from (any)
-                    to_address_topic,  # to (our address)
-                ]
-            })
+            # Split into chunks of 10k blocks to avoid "range too large" errors
+            chunk_size = 10_000
+            current = from_block
+            end_block = self.public_w3.eth.block_number if to_block == 'latest' else int(to_block)
 
-            logger.info(f"Found {len(logs)} transfer events")
+            while current <= end_block:
+                chunk_end = min(current + chunk_size, end_block)
 
-            # Extract token IDs from logs
-            for log in logs:
-                # Token ID is the 4th topic (index 3), but it's in the data field for TransferSingle
-                # Actually for TransferSingle, id and value are in the data field
-                data_hex = log['data'].hex() if isinstance(log['data'], bytes) else log['data']
+                try:
+                    logger.debug(f"Querying blocks {current} to {chunk_end}")
 
-                if len(data_hex) >= 64:
-                    # First 32 bytes (64 hex chars) = id, next 32 bytes = value
-                    # Remove '0x' prefix if present
-                    if data_hex.startswith('0x'):
-                        data_hex = data_hex[2:]
+                    logs = self.public_w3.eth.get_logs({
+                        'fromBlock': current,
+                        'toBlock': chunk_end,
+                        'address': Web3.to_checksum_address(CONTRACTS["CTF"]),
+                        'topics': [
+                            '0x' + event_signature.hex(),
+                            None,  # operator (any)
+                            None,  # from (any)
+                            to_address_topic,  # to (our address)
+                        ]
+                    })
 
-                    token_id_hex = '0x' + data_hex[:64]  # First 32 bytes
-                    token_id = str(int(token_id_hex, 16))
-                    token_ids.add(token_id)
+                    # Extract token IDs from logs in this chunk
+                    for log in logs:
+                        data_hex = log['data'].hex() if isinstance(log['data'], bytes) else log['data']
+
+                        if len(data_hex) >= 64:
+                            if data_hex.startswith('0x'):
+                                data_hex = data_hex[2:]
+
+                            token_id_hex = '0x' + data_hex[:64]
+                            token_id = str(int(token_id_hex, 16))
+                            token_ids.add(token_id)
+
+                except Exception as e:
+                    logger.warning(f"Error querying chunk {current}-{chunk_end}: {e}")
+
+                current = chunk_end + 1
 
             logger.info(f"Found {len(token_ids)} unique token IDs")
             return token_ids

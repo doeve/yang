@@ -59,7 +59,7 @@ class LiveFlowTester:
         # Test amount
         self.test_amount_usdc = 1.0  # $1 for testing
 
-    async def setup(self) -> bool:
+    async def setup(self, skip_balance_check: bool = False) -> bool:
         """Initialize executors."""
         console.print("\n[bold cyan]Setting up test environment...[/bold cyan]")
 
@@ -100,9 +100,13 @@ class LiveFlowTester:
         balance = await self.order_executor.get_usdc_balance()
         console.print(f"[green]✅ Connected! USDC Balance: ${balance:.2f}[/green]\n")
 
-        if balance < self.test_amount_usdc:
-            console.print(f"[red]❌ Insufficient balance! Need at least ${self.test_amount_usdc}[/red]")
-            return False
+        # Only check balance if not skipping (e.g., for redeem-only mode)
+        if not skip_balance_check:
+            if balance < self.test_amount_usdc:
+                console.print(f"[red]❌ Insufficient balance! Need at least ${self.test_amount_usdc}[/red]")
+                return False
+        else:
+            console.print("[cyan]ℹ️  Skipping balance check (redemption mode)[/cyan]\n")
 
         return True
 
@@ -366,8 +370,8 @@ class LiveFlowTester:
 
     async def run_tests(self, skip_redeem: bool = False, redeem_only: bool = False, from_block: int = 0) -> bool:
         """Run all tests."""
-        # Setup
-        if not await self.setup():
+        # Setup - skip balance check for redeem-only mode since we're redeeming tokens, not buying
+        if not await self.setup(skip_balance_check=redeem_only):
             return False
 
         try:
