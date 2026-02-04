@@ -64,6 +64,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.columns import Columns
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
+from rich.prompt import Prompt, Confirm, FloatPrompt, IntPrompt
 
 from src.data.enhanced_features import EnhancedFeatureBuilder
 from src.models.market_predictor import (
@@ -193,6 +194,8 @@ class UnifiedPaperTrader:
         self._tick_count = 0
         self._mode_switch_requested = False
         self._reset_daily_limit_requested = False
+        self._config_editor_open = False
+        self._live_display = None
 
         # Logging
         self.ml_log_file: Optional[Path] = None
@@ -986,6 +989,205 @@ class UnifiedPaperTrader:
         self.state.daily_pnl = 0.0
         console.print("[bold green]✅ Daily loss limit reset! Trading resumed.[/bold green]")
 
+    def run_config_editor_sync(self):
+        """Synchronous config editor (runs outside Live context)."""
+        import yaml
+
+        console.clear()
+
+        while True:
+            # Build config menu
+            menu_table = Table(title="[bold cyan]⚙️  Configuration Editor[/bold cyan]", show_header=True, header_style="bold magenta")
+            menu_table.add_column("#", style="cyan", width=4)
+            menu_table.add_column("Setting", style="yellow")
+            menu_table.add_column("Current Value", style="green")
+
+            # RPC Settings
+            menu_table.add_row("1", "Local RPC URL", self.trading_config.polygon_rpc_url[:50] + "..." if self.trading_config and len(self.trading_config.polygon_rpc_url) > 50 else (self.trading_config.polygon_rpc_url if self.trading_config else "N/A"))
+            menu_table.add_row("2", "Public RPC URL", self.trading_config.public_rpc_url[:50] + "..." if self.trading_config and len(self.trading_config.public_rpc_url) > 50 else (self.trading_config.public_rpc_url if self.trading_config else "N/A"))
+
+            # Risk Settings
+            menu_table.add_row("3", "Max Daily Loss %", f"{self.config.max_daily_loss_pct:.1f}%")
+            menu_table.add_row("4", "Max Position Size (USDC)", f"${self.config.max_position_size_usdc:.2f}")
+            menu_table.add_row("5", "Base Position Size %", f"{self.config.base_position_size:.1%}")
+
+            # Model Settings
+            menu_table.add_row("6", "Min Confidence", f"{self.config.min_confidence:.2f}")
+            menu_table.add_row("7", "Min Expected Return", f"{self.config.min_expected_return:.2%}")
+
+            # Timing
+            menu_table.add_row("8", "Refresh Interval (sec)", f"{self.config.refresh_seconds}")
+
+            # Actions
+            menu_table.add_row("", "", "")
+            menu_table.add_row("S", "[bold]Save to config.yaml[/bold]", "")
+            menu_table.add_row("X", "[bold]Exit (without saving)[/bold]", "")
+
+            console.print(menu_table)
+
+            choice = Prompt.ask("\n[cyan]Select option[/cyan]", default="X")
+
+            try:
+                if choice.upper() == "X":
+                    console.print("[yellow]Exiting config editor...[/yellow]")
+                    break
+
+                elif choice.upper() == "S":
+                    if self.save_config_sync():
+                        console.print("[bold green]✅ Configuration saved to config.yaml[/bold green]")
+                        import time
+                        time.sleep(1.5)
+                    break
+
+                elif choice == "1":
+                    if not self.trading_config:
+                        console.print("[red]No trading config available[/red]")
+                        continue
+                    new_url = Prompt.ask("Enter Local RPC URL", default=self.trading_config.polygon_rpc_url)
+                    self.trading_config.polygon_rpc_url = new_url
+                    console.print("[green]✓ Updated[/green]")
+                    import time
+                    time.sleep(0.5)
+
+                elif choice == "2":
+                    if not self.trading_config:
+                        console.print("[red]No trading config available[/red]")
+                        continue
+                    new_url = Prompt.ask("Enter Public RPC URL", default=self.trading_config.public_rpc_url)
+                    self.trading_config.public_rpc_url = new_url
+                    # Update execution config too
+                    if self.trading_config:
+                        self.trading_config.execution.public_rpc_url = new_url
+                    console.print("[green]✓ Updated[/green]")
+                    import time
+                    time.sleep(0.3)
+
+                elif choice == "3":
+                    new_val = FloatPrompt.ask("Enter Max Daily Loss %", default=self.config.max_daily_loss_pct)
+                    self.config.max_daily_loss_pct = new_val
+                    if self.trading_config:
+                        self.trading_config.risk.max_daily_loss_pct = new_val
+                    console.print("[green]✓ Updated[/green]")
+                    import time
+                    time.sleep(0.3)
+
+                elif choice == "4":
+                    new_val = FloatPrompt.ask("Enter Max Position Size (USDC)", default=self.config.max_position_size_usdc)
+                    self.config.max_position_size_usdc = new_val
+                    if self.trading_config:
+                        self.trading_config.risk.max_position_size_usdc = new_val
+                    console.print("[green]✓ Updated[/green]")
+                    import time
+                    time.sleep(0.3)
+
+                elif choice == "5":
+                    new_val = FloatPrompt.ask("Enter Base Position Size (0.0-1.0)", default=self.config.base_position_size)
+                    self.config.base_position_size = max(0.0, min(1.0, new_val))
+                    console.print("[green]✓ Updated[/green]")
+                    import time
+                    time.sleep(0.3)
+
+                elif choice == "6":
+                    new_val = FloatPrompt.ask("Enter Min Confidence (0.0-1.0)", default=self.config.min_confidence)
+                    self.config.min_confidence = max(0.0, min(1.0, new_val))
+                    if self.trading_config:
+                        self.trading_config.model.min_confidence = new_val
+                    console.print("[green]✓ Updated[/green]")
+                    import time
+                    time.sleep(0.3)
+
+                elif choice == "7":
+                    new_val = FloatPrompt.ask("Enter Min Expected Return (0.0-1.0)", default=self.config.min_expected_return)
+                    self.config.min_expected_return = max(0.0, min(1.0, new_val))
+                    if self.trading_config:
+                        self.trading_config.model.min_expected_return = new_val
+                    console.print("[green]✓ Updated[/green]")
+                    import time
+                    time.sleep(0.3)
+
+                elif choice == "8":
+                    new_val = IntPrompt.ask("Enter Refresh Interval (seconds)", default=self.config.refresh_seconds)
+                    self.config.refresh_seconds = max(1, new_val)
+                    console.print("[green]✓ Updated[/green]")
+                    import time
+                    time.sleep(0.3)
+
+                else:
+                    console.print("[red]Invalid option[/red]")
+                    import time
+                    time.sleep(0.3)
+
+                console.clear()
+
+            except (KeyboardInterrupt, EOFError):
+                console.print("\n[yellow]Cancelled[/yellow]")
+                break
+            except Exception as e:
+                console.print(f"[red]Error: {e}[/red]")
+                import time
+                time.sleep(1)
+
+        console.clear()
+
+    async def open_config_editor(self):
+        """Open config editor (wrapper for async context)."""
+        # Stop Live display
+        if self._live_display:
+            self._live_display.stop()
+
+        await asyncio.sleep(0.3)
+
+        # Run synchronous editor
+        await asyncio.to_thread(self.run_config_editor_sync)
+
+        # Restart Live display
+        if self._live_display:
+            self._live_display.start()
+
+        console.clear()
+
+    def save_config_sync(self) -> bool:
+        """Save current configuration to config.yaml."""
+        try:
+            config_path = Path("config.yaml")
+
+            # Build config dict
+            config_data = {
+                "trading_mode": self.config.trading_mode,
+                "risk": {
+                    "max_daily_loss_pct": self.config.max_daily_loss_pct,
+                    "max_position_size_usdc": self.config.max_position_size_usdc,
+                },
+                "model": {
+                    "path": self.config.model_path,
+                    "min_confidence": self.config.min_confidence,
+                    "min_expected_return": self.config.min_expected_return,
+                },
+                "execution": {
+                    "order_timeout_seconds": 30,
+                    "poll_interval_seconds": 5,
+                },
+                "logging": {
+                    "dir": self.config.log_dir,
+                    "enable_ml_logging": self.config.enable_ml_logging,
+                },
+            }
+
+            # Add RPC URLs if trading_config exists
+            if self.trading_config:
+                config_data["execution"]["public_rpc_url"] = self.trading_config.public_rpc_url
+                config_data["execution"]["use_public_rpc_for_redeem"] = self.trading_config.execution.use_public_rpc_for_redeem
+
+            # Write to file
+            with open(config_path, 'w') as f:
+                yaml.dump(config_data, f, default_flow_style=False, sort_keys=False)
+
+            return True
+
+        except Exception as e:
+            console.print(f"[red]Failed to save config: {e}[/red]")
+            return False
+
     async def auto_redeem(self):
         """
         Auto-redeem winning shares in live mode when market closes.
@@ -1083,6 +1285,8 @@ class UnifiedPaperTrader:
 
                     if key == 'l':
                         await self.switch_trading_mode()
+                    elif key == 'c':
+                        await self.open_config_editor()
                     elif key == 'r':
                         self.reset_daily_limit()
                     elif key == 'q':
@@ -1308,9 +1512,10 @@ class UnifiedPaperTrader:
         controls_table.add_column("Key", style="cyan", width=8)
         controls_table.add_column("Action", style="dim")
         controls_table.add_row("[L]", "Switch Paper/Live mode")
+        controls_table.add_row("[C]", "Open Config Editor")
         controls_table.add_row("[R]", "Reset daily loss limit")
         controls_table.add_row("[Q]", "Quit")
-        controls_panel = Panel(controls_table, title="[bold cyan]Controls[/]", border_style="cyan")
+        controls_panel = Panel(controls_table, title="[bold cyan]⌨️  Controls[/]", border_style="cyan")
 
         layout = Columns([left_panel, right_panel], expand=True)
         from rich.console import Group
@@ -1344,8 +1549,14 @@ class UnifiedPaperTrader:
 
         try:
             with Live(self.build_display(), refresh_per_second=1) as live:
+                self._live_display = live
                 while self._running:
-                    live.update(self.build_display())
+                    try:
+                        # Update display (will be paused when config editor stops Live)
+                        live.update(self.build_display())
+                    except Exception:
+                        # Live might be stopped, skip update
+                        pass
                     await asyncio.sleep(1)
         except KeyboardInterrupt:
             console.print("\n[yellow]Shutting down...[/yellow]")
