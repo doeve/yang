@@ -191,6 +191,8 @@ class UnifiedPaperTrader:
         # Tracking
         self._running = False
         self._tick_count = 0
+        self._mode_switch_requested = False
+        self._reset_daily_limit_requested = False
 
         # Logging
         self.ml_log_file: Optional[Path] = None
@@ -812,6 +814,7 @@ class UnifiedPaperTrader:
             "pnl": pnl,
             "reason": reason,
             "ticks_held": self.state.ticks_held,
+            "mode": "live" if self.is_live_mode else "paper",
         })
 
         pnl_color = 'green' if pnl > 0 else 'red'
@@ -881,6 +884,7 @@ class UnifiedPaperTrader:
             "pnl": pnl,
             "reason": "settlement",
             "ticks_held": self.state.ticks_held,
+            "mode": "live" if self.is_live_mode else "paper",
         })
 
         console.print(
@@ -907,6 +911,80 @@ class UnifiedPaperTrader:
         # Auto-redeem if in live mode (market is now closed/resolved)
         if self.is_live_mode:
             await self.auto_redeem()
+
+    async def switch_trading_mode(self):
+        """Switch between paper and live trading mode."""
+        # Don't allow switching if there's an open position
+        if self.state.position_side is not None:
+            console.print("[bold red]❌ Cannot switch mode with open position! Exit position first.[/bold red]")
+            return
+
+        old_mode = "live" if self.is_live_mode else "paper"
+        new_mode = "paper" if self.is_live_mode else "live"
+
+        console.print(f"[bold yellow]🔄 Switching from {old_mode.upper()} to {new_mode.upper()} mode...[/bold yellow]")
+
+        # Update config
+        self.config.trading_mode = new_mode
+
+        # If switching to live mode, initialize executor
+        if new_mode == "live":
+            if not self.trading_config:
+                console.print("[bold red]❌ No trading config available! Cannot switch to live mode.[/bold red]")
+                self.config.trading_mode = "paper"
+                return
+
+            try:
+                # Validate config
+                self.trading_config.validate()
+
+                # Initialize executor if not already done
+                if not self.executor:
+                    self.executor = OnchainOrderExecutor(
+                        local_rpc_url=self.trading_config.polygon_rpc_url,
+                        private_key=self.trading_config.eth_private_key,
+                        public_rpc_url=self.trading_config.public_rpc_url,
+                        use_public_rpc=self.trading_config.execution.use_public_rpc_for_redeem,
+                        socks5_proxy=self.trading_config.socks5_proxy,
+                    )
+                    if await self.executor.connect():
+                        await self.executor.ensure_approvals()
+                        self.state.wallet_balance = await self.executor.get_usdc_balance()
+                        console.print(f"[bold green]✅ Connected to live executor. Wallet: ${self.state.wallet_balance:.2f}[/bold green]")
+                    else:
+                        console.print("[bold red]❌ Failed to connect executor! Staying in paper mode.[/bold red]")
+                        self.config.trading_mode = "paper"
+                        return
+
+                # Initialize onchain executor for redemption if needed
+                if not self.onchain_executor:
+                    self.onchain_executor = OnchainExecutor(
+                        rpc_url=self.trading_config.polygon_rpc_url,
+                        private_key=self.trading_config.eth_private_key,
+                        public_rpc_url=self.trading_config.public_rpc_url,
+                        use_public_rpc=self.trading_config.execution.use_public_rpc_for_redeem,
+                    )
+                    await self.onchain_executor.connect()
+
+                console.print("[bold green]✅ Switched to LIVE mode[/bold green]")
+
+            except ValueError as e:
+                console.print(f"[bold red]❌ Config error: {e}[/bold red]")
+                self.config.trading_mode = "paper"
+                return
+            except Exception as e:
+                console.print(f"[bold red]❌ Error switching to live mode: {e}[/bold red]")
+                self.config.trading_mode = "paper"
+                return
+        else:
+            console.print("[bold green]✅ Switched to PAPER mode[/bold green]")
+
+    def reset_daily_limit(self):
+        """Reset the daily loss tracker."""
+        console.print("[bold yellow]🔄 Resetting daily loss limit...[/bold yellow]")
+        self.loss_tracker.reset()
+        self.state.daily_pnl = 0.0
+        console.print("[bold green]✅ Daily loss limit reset! Trading resumed.[/bold green]")
 
     async def auto_redeem(self):
         """
@@ -960,6 +1038,50 @@ class UnifiedPaperTrader:
                 logger.debug("Market not yet resolved, skipping redemption")
         except Exception as e:
             logger.error(f"Auto-redeem error: {e}")
+
+    async def keyboard_handler(self):
+        """Handle keyboard input for interactive controls."""
+        try:
+            import sys
+            import termios
+            import tty
+
+            # Set terminal to raw mode for immediate key capture
+            old_settings = termios.tcgetattr(sys.stdin)
+            tty.setraw(sys.stdin.fileno())
+
+            while self._running:
+                try:
+                    # Check if input is available (non-blocking)
+                    import select
+                    if select.select([sys.stdin], [], [], 0.1)[0]:
+                        key = sys.stdin.read(1).lower()
+
+                        if key == 'l':
+                            await self.switch_trading_mode()
+                        elif key == 'r':
+                            self.reset_daily_limit()
+                        elif key == 'q':
+                            console.print("\n[yellow]Quit requested...[/yellow]")
+                            self._running = False
+                            break
+
+                    await asyncio.sleep(0.1)
+                except Exception as e:
+                    logger.debug(f"Keyboard handler error: {e}")
+                    await asyncio.sleep(0.1)
+
+        except ImportError:
+            # Fallback: no keyboard support on Windows or if termios unavailable
+            logger.warning("Keyboard controls not available on this platform")
+        except Exception as e:
+            logger.error(f"Keyboard handler setup error: {e}")
+        finally:
+            try:
+                # Restore terminal settings
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+            except:
+                pass
 
     async def trading_loop(self):
         """Main trading loop."""
@@ -1120,9 +1242,10 @@ class UnifiedPaperTrader:
             left_table.add_row("Unrealized", f"[{pnl_color}]{unrealized_pnl_pct:+.1%} (${unrealized_pnl_abs:+.2f})[/]")
             left_table.add_row("Ticks Held", f"{self.state.ticks_held}")
 
-        # Right: Trades table (with entry price column)
+        # Right: Trades table (with entry price column and mode)
         trades_table = Table(show_header=True, box=None, padding=(0, 1))
         trades_table.add_column("Time", style="dim", width=8)
+        trades_table.add_column("Mode", width=5)
         trades_table.add_column("Side", width=4)
         trades_table.add_column("Entry", width=6)
         trades_table.add_column("Exit", width=6)
@@ -1135,6 +1258,11 @@ class UnifiedPaperTrader:
             pnl_color = "green" if trade["pnl"] > 0 else "red"
             time_str = trade["time"].strftime("%H:%M:%S")
 
+            # Mode indicator
+            mode = trade.get("mode", "paper")
+            mode_icon = "🔴" if mode == "live" else "📝"
+            mode_style = "red" if mode == "live" else "green"
+
             reason_short = {
                 "model_signal": "MODEL",
                 "time_expiry": "TIME",
@@ -1143,6 +1271,7 @@ class UnifiedPaperTrader:
 
             trades_table.add_row(
                 time_str,
+                f"[{mode_style}]{mode_icon}[/]",
                 f"[{side_color}]{trade['side'].upper()[:3]}[/]",
                 f"{trade['entry']:.3f}",
                 f"{trade['exit']:.3f}",
@@ -1151,22 +1280,32 @@ class UnifiedPaperTrader:
             )
 
         if not recent_trades:
-            trades_table.add_row("", "", "[dim]No trades yet[/]", "", "", "")
+            trades_table.add_row("", "", "", "[dim]No trades yet[/]", "", "", "")
 
         # Build panels
         status_title = f"[bold cyan]Status[/] {mode_text}"
         left_panel = Panel(left_table, title=status_title, border_style="cyan", width=42)
         right_panel = Panel(trades_table, title="[bold yellow]Recent Trades[/]", border_style="yellow")
 
+        # Controls panel
+        controls_table = Table(show_header=False, box=None, padding=(0, 1))
+        controls_table.add_column("Key", style="cyan", width=8)
+        controls_table.add_column("Action", style="dim")
+        controls_table.add_row("[L]", "Switch Paper/Live mode")
+        controls_table.add_row("[R]", "Reset daily loss limit")
+        controls_table.add_row("[Q]", "Quit")
+        controls_panel = Panel(controls_table, title="[bold cyan]Controls[/]", border_style="cyan")
+
         layout = Columns([left_panel, right_panel], expand=True)
+        from rich.console import Group
+        layout = Group(controls_panel, layout)
 
         # Add loss limit warning banner if needed
         if self.loss_tracker.is_limit_hit(self.config.max_daily_loss_pct):
             warning = Panel(
-                "[bold yellow]⚠ DAILY LOSS LIMIT HIT — NEW ENTRIES PAUSED[/bold yellow]",
+                "[bold yellow]⚠ DAILY LOSS LIMIT HIT — NEW ENTRIES PAUSED (Press [R] to reset)[/bold yellow]",
                 border_style="yellow",
             )
-            from rich.console import Group
             layout = Group(warning, layout)
 
         title = "[bold blue]Unified Trading[/bold blue]"
@@ -1183,7 +1322,9 @@ class UnifiedPaperTrader:
 
         self._running = True
 
+        # Start both trading and keyboard handler tasks
         trading_task = asyncio.create_task(self.trading_loop())
+        keyboard_task = asyncio.create_task(self.keyboard_handler())
 
         try:
             with Live(self.build_display(), refresh_per_second=1) as live:
@@ -1193,8 +1334,14 @@ class UnifiedPaperTrader:
         except KeyboardInterrupt:
             console.print("\n[yellow]Shutting down...[/yellow]")
             self._running = False
-            trading_task.cancel()
         finally:
+            # Cancel tasks
+            trading_task.cancel()
+            keyboard_task.cancel()
+            try:
+                await asyncio.gather(trading_task, keyboard_task, return_exceptions=True)
+            except:
+                pass
             self._close_ml_logging()
 
 
