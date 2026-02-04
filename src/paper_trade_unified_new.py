@@ -1040,48 +1040,64 @@ class UnifiedPaperTrader:
             logger.error(f"Auto-redeem error: {e}")
 
     async def keyboard_handler(self):
-        """Handle keyboard input for interactive controls."""
-        try:
-            import sys
-            import termios
-            import tty
+        """Handle keyboard input for interactive controls using a thread."""
+        import threading
+        import queue
 
-            # Set terminal to raw mode for immediate key capture
-            old_settings = termios.tcgetattr(sys.stdin)
-            tty.setraw(sys.stdin.fileno())
+        key_queue = queue.Queue()
 
-            while self._running:
-                try:
-                    # Check if input is available (non-blocking)
-                    import select
-                    if select.select([sys.stdin], [], [], 0.1)[0]:
-                        key = sys.stdin.read(1).lower()
-
-                        if key == 'l':
-                            await self.switch_trading_mode()
-                        elif key == 'r':
-                            self.reset_daily_limit()
-                        elif key == 'q':
-                            console.print("\n[yellow]Quit requested...[/yellow]")
-                            self._running = False
-                            break
-
-                    await asyncio.sleep(0.1)
-                except Exception as e:
-                    logger.debug(f"Keyboard handler error: {e}")
-                    await asyncio.sleep(0.1)
-
-        except ImportError:
-            # Fallback: no keyboard support on Windows or if termios unavailable
-            logger.warning("Keyboard controls not available on this platform")
-        except Exception as e:
-            logger.error(f"Keyboard handler setup error: {e}")
-        finally:
+        def read_keys():
+            """Read keyboard input in a separate thread."""
             try:
-                # Restore terminal settings
-                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-            except:
-                pass
+                import sys
+                import termios
+                import tty
+
+                old_settings = termios.tcgetattr(sys.stdin)
+                try:
+                    tty.setcbreak(sys.stdin.fileno())  # Use cbreak instead of raw mode
+
+                    while self._running:
+                        try:
+                            import select
+                            if select.select([sys.stdin], [], [], 0.1)[0]:
+                                key = sys.stdin.read(1).lower()
+                                key_queue.put(key)
+                        except Exception:
+                            pass
+                finally:
+                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+            except Exception as e:
+                logger.debug(f"Keyboard thread error: {e}")
+
+        # Start keyboard reading thread
+        kbd_thread = threading.Thread(target=read_keys, daemon=True)
+        kbd_thread.start()
+
+        # Process keys from queue
+        while self._running:
+            try:
+                # Non-blocking queue check
+                try:
+                    key = key_queue.get_nowait()
+
+                    if key == 'l':
+                        await self.switch_trading_mode()
+                    elif key == 'r':
+                        self.reset_daily_limit()
+                    elif key == 'q':
+                        console.print("\n[yellow]Quit requested...[/yellow]")
+                        self._running = False
+                        break
+
+                except queue.Empty:
+                    pass
+
+                await asyncio.sleep(0.1)
+
+            except Exception as e:
+                logger.debug(f"Key processing error: {e}")
+                await asyncio.sleep(0.1)
 
     async def trading_loop(self):
         """Main trading loop."""
