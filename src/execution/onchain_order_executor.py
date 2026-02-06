@@ -591,6 +591,45 @@ class OnchainOrderExecutor:
             logger.error(f"Approval error: {e}")
             return False
 
+    async def get_market_price(self, token_id: str, side: str) -> Optional[float]:
+        """
+        Get best market price for immediate execution.
+
+        For BUY: Returns best ask (lowest SELL order price)
+        For SELL: Returns best bid (highest BUY order price)
+
+        Args:
+            token_id: Token ID
+            side: "BUY" or "SELL"
+
+        Returns:
+            Best price for immediate fill, or None if no orders
+        """
+        try:
+            # For BUY: Get SELL orderbook (we want to buy from sellers)
+            # For SELL: Get BUY orderbook (we want to sell to buyers)
+            book_side = "SELL" if side.upper() == "BUY" else "BUY"
+            orders = await self.get_orderbook(token_id, book_side)
+
+            if not orders:
+                logger.warning(f"No {book_side} orders in book for market {side}")
+                return None
+
+            # Get best price (lowest for asks, highest for bids)
+            if side.upper() == "BUY":
+                # Buy at lowest ask
+                best_price = min(order.price for order in orders)
+            else:
+                # Sell at highest bid
+                best_price = max(order.price for order in orders)
+
+            logger.info(f"Market price for {side}: {best_price:.4f}")
+            return best_price
+
+        except Exception as e:
+            logger.error(f"Error getting market price: {e}")
+            return None
+
     async def get_orderbook(self, token_id: str, side: str = "BUY") -> List[OrderbookOrder]:
         """
         Fetch orderbook from CLOB API (read-only, no fees).
@@ -1082,25 +1121,35 @@ class OnchainOrderExecutor:
                             error="CLOB client not initialized. Check py-clob-client installation."
                         )
 
+                    # CLOB market order: Get best ask price for immediate fill
+                    market_price = await self.get_market_price(token_id, "BUY")
+                    if market_price is None:
+                        logger.error("No market price available (empty orderbook)")
+                        return OrderResult(
+                            success=False,
+                            error="No liquidity in orderbook for BUY"
+                        )
+
                     # CLOB price limits: 0.01 to 0.99
-                    if price > 0.99 or price < 0.01:
+                    if market_price > 0.99 or market_price < 0.01:
                         logger.warning(
                             f"clob_price_out_of_range",
-                            price=price,
-                            message=f"Price {price:.4f} outside CLOB range (0.01-0.99). Market near-resolved."
+                            price=market_price,
+                            message=f"Market price {market_price:.4f} outside CLOB range (0.01-0.99). Market near-resolved."
                         )
                         return OrderResult(
                             success=False,
-                            error=f"Price {price:.4f} outside CLOB range (0.01-0.99). Cannot place order on near-resolved market."
+                            error=f"Market price {market_price:.4f} outside CLOB range (0.01-0.99). Cannot place order on near-resolved market."
                         )
 
-                    logger.info(f"📋 CLOB BUY: {size:.2f} shares @ {price:.3f}")
+                    logger.info(f"📋 CLOB BUY (market order): {size:.2f} shares @ {market_price:.4f}")
 
                     try:
                         # Create order via py-clob-client (handles EIP-712 signing)
+                        # Use market price for immediate fill
                         order_args = OrderArgs(
                             token_id=token_id,
-                            price=price,
+                            price=market_price,
                             size=size,
                             side=CLOB_BUY
                         )
@@ -1124,7 +1173,7 @@ class OnchainOrderExecutor:
                             success=True,
                             order_id=order_id,
                             filled_amount=size,
-                            avg_price=price
+                            avg_price=market_price
                         )
 
                     except Exception as e:
@@ -1190,27 +1239,37 @@ class OnchainOrderExecutor:
                         error="CLOB client not initialized. Check py-clob-client installation."
                     )
 
+                # CLOB market order: Get best bid price for immediate fill
+                market_price = await self.get_market_price(token_id, "SELL")
+                if market_price is None:
+                    logger.error("No market price available (empty orderbook)")
+                    return OrderResult(
+                        success=False,
+                        error="No liquidity in orderbook for SELL"
+                    )
+
                 # CLOB price limits: 0.01 to 0.99
                 # If price is outside this range, the market is near-resolved
-                if price > 0.99 or price < 0.01:
+                if market_price > 0.99 or market_price < 0.01:
                     logger.warning(
                         f"clob_price_out_of_range",
-                        price=price,
-                        message=f"Price {price:.4f} outside CLOB range (0.01-0.99). Market near-resolved. "
+                        price=market_price,
+                        message=f"Market price {market_price:.4f} outside CLOB range (0.01-0.99). Market near-resolved. "
                                 f"Holding position for redemption after resolution is more profitable."
                     )
                     return OrderResult(
                         success=False,
-                        error=f"Price {price:.4f} outside CLOB range (0.01-0.99). Hold until resolution and redeem for better payout."
+                        error=f"Market price {market_price:.4f} outside CLOB range (0.01-0.99). Hold until resolution and redeem for better payout."
                     )
 
-                logger.info(f"📋 CLOB SELL: {size:.2f} shares @ {price:.3f}")
+                logger.info(f"📋 CLOB SELL (market order): {size:.2f} shares @ {market_price:.4f}")
 
                 try:
                     # Create order via py-clob-client (handles EIP-712 signing)
+                    # Use market price for immediate fill
                     order_args = OrderArgs(
                         token_id=token_id,
-                        price=price,
+                        price=market_price,
                         size=size,
                         side=CLOB_SELL
                     )
@@ -1234,7 +1293,7 @@ class OnchainOrderExecutor:
                         success=True,
                         order_id=order_id,
                         filled_amount=size,
-                        avg_price=price
+                        avg_price=market_price
                     )
 
                 except Exception as e:
