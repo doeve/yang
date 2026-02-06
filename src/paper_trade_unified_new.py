@@ -844,6 +844,9 @@ class UnifiedPaperTrader:
         self.state.ticks_held = 0
         self.state.max_pnl_seen = 0.0
 
+        # Try immediate redemption (non-blocking)
+        await self.try_immediate_redeem()
+
     async def settle_position(self):
         """Settle position at candle end."""
         if not self.state.position_side:
@@ -911,9 +914,8 @@ class UnifiedPaperTrader:
         self.state.position_size = 0.0
         self.state.entry_price = 0.0
 
-        # Auto-redeem if in live mode (market is now closed/resolved)
-        if self.is_live_mode:
-            await self.auto_redeem()
+        # Try immediate redemption (non-blocking)
+        await self.try_immediate_redeem()
 
     async def switch_trading_mode(self):
         """Switch between paper and live trading mode."""
@@ -983,11 +985,11 @@ class UnifiedPaperTrader:
             console.print("[bold green]✅ Switched to PAPER mode[/bold green]")
 
     def reset_daily_limit(self):
-        """Reset the daily loss tracker."""
-        console.print("[bold yellow]🔄 Resetting daily loss limit...[/bold yellow]")
+        """Reset the rolling loss tracker."""
+        console.print("[bold yellow]🔄 Resetting 24H loss tracker...[/bold yellow]")
         self.loss_tracker.reset()
         self.state.daily_pnl = 0.0
-        console.print("[bold green]✅ Daily loss limit reset! Trading resumed.[/bold green]")
+        console.print("[bold green]✅ Loss tracker reset! Trading resumed.[/bold green]")
 
     def run_config_editor_sync(self):
         """Synchronous config editor (runs outside Live context)."""
@@ -1188,6 +1190,117 @@ class UnifiedPaperTrader:
             console.print(f"[red]Failed to save config: {e}[/red]")
             return False
 
+    async def try_immediate_redeem(self):
+        """
+        Immediately try to redeem current position after exit/settlement.
+
+        Uses force redemption (no resolution check) for speed.
+        Silently fails if position can't be redeemed yet.
+        """
+        if not self.is_live_mode or not self.onchain_executor:
+            return
+
+        if not self.state.condition_id:
+            return
+
+        try:
+            from web3 import Web3
+
+            # CTF contract
+            ctf = self.onchain_executor.public_w3.eth.contract(
+                address=Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"),
+                abi=[
+                    {
+                        "inputs": [
+                            {"name": "collateralToken", "type": "address"},
+                            {"name": "parentCollectionId", "type": "bytes32"},
+                            {"name": "conditionId", "type": "bytes32"},
+                            {"name": "indexSets", "type": "uint256[]"},
+                        ],
+                        "name": "redeemPositions",
+                        "outputs": [],
+                        "stateMutability": "nonpayable",
+                        "type": "function",
+                    },
+                ],
+            )
+
+            # USDC contract
+            usdc = self.onchain_executor.public_w3.eth.contract(
+                address=Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
+                abi=[
+                    {
+                        "constant": True,
+                        "inputs": [{"name": "_owner", "type": "address"}],
+                        "name": "balanceOf",
+                        "outputs": [{"name": "balance", "type": "uint256"}],
+                        "type": "function",
+                    }
+                ],
+            )
+
+            # Get balance before
+            balance_before = usdc.functions.balanceOf(self.onchain_executor.address).call()
+
+            # Prepare redemption parameters
+            condition_id = self.state.condition_id
+            if not condition_id.startswith("0x"):
+                condition_id = "0x" + condition_id
+            condition_bytes = bytes.fromhex(condition_id[2:])
+
+            parent_collection_id = bytes(32)
+            index_sets = [1, 2]  # YES, NO
+
+            # Build transaction
+            nonce = self.onchain_executor.public_w3.eth.get_transaction_count(
+                self.onchain_executor.address, "latest"
+            )
+
+            latest_block = self.onchain_executor.public_w3.eth.get_block('latest')
+            base_fee = latest_block.get('baseFeePerGas', 30 * 10**9)
+            max_priority_fee = self.onchain_executor.public_w3.to_wei(50, 'gwei')
+            max_fee = base_fee * 2 + max_priority_fee
+
+            tx = ctf.functions.redeemPositions(
+                Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
+                parent_collection_id,
+                condition_bytes,
+                index_sets,
+            ).build_transaction({
+                "from": self.onchain_executor.address,
+                "nonce": nonce,
+                "maxFeePerGas": max_fee,
+                "maxPriorityFeePerGas": max_priority_fee,
+                "gas": 300000,
+            })
+
+            # Sign and send
+            console.print(f"[dim]🔄 Attempting redemption...[/dim]")
+            signed_tx = self.onchain_executor.account.sign_transaction(tx)
+            tx_hash = self.onchain_executor.public_w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+
+            # Wait for receipt
+            receipt = self.onchain_executor.public_w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+            if receipt["status"] == 1:
+                # Calculate redeemed amount
+                balance_after = usdc.functions.balanceOf(self.onchain_executor.address).call()
+                usdc_redeemed = (balance_after - balance_before) / 1e6
+
+                if usdc_redeemed > 0.01:  # Only show if meaningful amount
+                    console.print(f"[green]✅ Redeemed ${usdc_redeemed:.2f} USDC[/green]")
+                    # Update wallet balance
+                    if self.executor:
+                        self.state.wallet_balance = await self.executor.get_usdc_balance()
+                else:
+                    logger.debug("Position redeemed but payout was zero")
+            else:
+                logger.debug("Redemption transaction reverted (position not ready)")
+
+        except Exception as e:
+            # Silently fail - position probably not resolved yet
+            logger.debug(f"Immediate redeem skipped: {e}")
+
     async def auto_redeem(self):
         """
         Auto-redeem winning shares in live mode when market closes.
@@ -1241,6 +1354,276 @@ class UnifiedPaperTrader:
         except Exception as e:
             logger.error(f"Auto-redeem error: {e}")
 
+    async def fetch_all_positions(self) -> List[Dict]:
+        """Fetch all positions from Data API."""
+        if not self.is_live_mode or not self.onchain_executor:
+            console.print("[yellow]Force redeem only available in live mode[/yellow]")
+            return []
+
+        wallet_address = self.onchain_executor.address
+        if not wallet_address:
+            console.print("[red]No wallet address available[/red]")
+            return []
+
+        try:
+            # Use SOCKS proxy if available
+            if SOCKS_AVAILABLE and self.trading_config.socks5_proxy:
+                from httpx_socks import SyncProxyTransport
+                transport = SyncProxyTransport.from_url(self.trading_config.socks5_proxy)
+                client = httpx.Client(transport=transport, verify=False, timeout=30)
+            else:
+                client = httpx.Client(verify=False, timeout=30)
+
+            base_url = "https://data-api.polymarket.com/positions"
+            all_positions = []
+            offset = 0
+            limit = 500
+
+            console.print(f"[cyan]Fetching positions for {wallet_address[:8]}...{wallet_address[-6:]}[/cyan]")
+
+            while True:
+                params = {
+                    "user": wallet_address,
+                    "limit": limit,
+                    "offset": offset,
+                    "sizeThreshold": 0.0001,
+                    "sortBy": "CURRENT",
+                    "sortDirection": "DESC",
+                }
+
+                response = client.get(base_url, params=params)
+                response.raise_for_status()
+                positions = response.json()
+
+                if not isinstance(positions, list):
+                    raise ValueError("Unexpected response format")
+
+                num_positions = len(positions)
+                all_positions.extend(positions)
+
+                if num_positions < limit:
+                    break
+
+                offset += limit
+
+            client.close()
+            console.print(f"[green]✓ Found {len(all_positions)} positions[/green]")
+            return all_positions
+
+        except Exception as e:
+            console.print(f"[red]Failed to fetch positions: {e}[/red]")
+            return []
+
+    async def force_redeem_single_position(
+        self,
+        condition_id: str,
+        title: str,
+        value: float,
+    ) -> Dict[str, Any]:
+        """
+        Force redemption attempt without checks (uses direct contract call).
+
+        This bypasses all resolution checks and attempts redemption directly.
+        """
+        if not self.onchain_executor or not self.onchain_executor.public_w3:
+            return {"success": False, "error": "Not connected"}
+
+        console.print(f"[cyan]  {title[:60]}...[/cyan]")
+        console.print(f"[dim]    Value: ${value:.2f} | Condition: {condition_id[:16]}...[/dim]")
+
+        try:
+            from web3 import Web3
+
+            # CTF contract
+            ctf = self.onchain_executor.public_w3.eth.contract(
+                address=Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"),
+                abi=[
+                    {
+                        "inputs": [
+                            {"name": "collateralToken", "type": "address"},
+                            {"name": "parentCollectionId", "type": "bytes32"},
+                            {"name": "conditionId", "type": "bytes32"},
+                            {"name": "indexSets", "type": "uint256[]"},
+                        ],
+                        "name": "redeemPositions",
+                        "outputs": [],
+                        "stateMutability": "nonpayable",
+                        "type": "function",
+                    },
+                ],
+            )
+
+            # USDC contract
+            usdc = self.onchain_executor.public_w3.eth.contract(
+                address=Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
+                abi=[
+                    {
+                        "constant": True,
+                        "inputs": [{"name": "_owner", "type": "address"}],
+                        "name": "balanceOf",
+                        "outputs": [{"name": "balance", "type": "uint256"}],
+                        "type": "function",
+                    }
+                ],
+            )
+
+            # Get balance before
+            balance_before = usdc.functions.balanceOf(self.onchain_executor.address).call()
+
+            # Prepare redemption parameters
+            if not condition_id.startswith("0x"):
+                condition_id = "0x" + condition_id
+            condition_bytes = bytes.fromhex(condition_id[2:])
+
+            parent_collection_id = bytes(32)
+            index_sets = [1, 2]  # YES, NO
+
+            # Build transaction
+            nonce = self.onchain_executor.public_w3.eth.get_transaction_count(
+                self.onchain_executor.address, "latest"
+            )
+
+            latest_block = self.onchain_executor.public_w3.eth.get_block('latest')
+            base_fee = latest_block.get('baseFeePerGas', 30 * 10**9)
+            max_priority_fee = self.onchain_executor.public_w3.to_wei(50, 'gwei')
+            max_fee = base_fee * 2 + max_priority_fee
+
+            tx = ctf.functions.redeemPositions(
+                Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
+                parent_collection_id,
+                condition_bytes,
+                index_sets,
+            ).build_transaction({
+                "from": self.onchain_executor.address,
+                "nonce": nonce,
+                "maxFeePerGas": max_fee,
+                "maxPriorityFeePerGas": max_priority_fee,
+                "gas": 300000,
+            })
+
+            # Sign and send
+            console.print(f"[yellow]    → Sending transaction...[/yellow]")
+            signed_tx = self.onchain_executor.account.sign_transaction(tx)
+            tx_hash = self.onchain_executor.public_w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            tx_hash_hex = tx_hash.hex()
+
+            console.print(f"[dim]    TX: {tx_hash_hex[:16]}...[/dim]")
+            console.print(f"[yellow]    → Waiting for confirmation...[/yellow]")
+
+            # Wait for receipt
+            receipt = self.onchain_executor.public_w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+            if receipt["status"] == 1:
+                # Calculate redeemed amount
+                balance_after = usdc.functions.balanceOf(self.onchain_executor.address).call()
+                usdc_redeemed = (balance_after - balance_before) / 1e6
+
+                console.print(f"[green]    ✓ Redeemed ${usdc_redeemed:.2f}[/green]")
+                return {
+                    "success": True,
+                    "tx_hash": tx_hash_hex,
+                    "usdc_redeemed": usdc_redeemed,
+                }
+            else:
+                console.print(f"[red]    ✗ Transaction reverted[/red]")
+                return {
+                    "success": False,
+                    "tx_hash": tx_hash_hex,
+                    "error": "Transaction reverted",
+                }
+
+        except Exception as e:
+            error_msg = str(e)
+
+            # Parse common errors
+            if "execution reverted" in error_msg.lower():
+                if "payout is zero" in error_msg.lower():
+                    console.print(f"[yellow]    ⊘ No payout (already redeemed or no value)[/yellow]")
+                else:
+                    console.print(f"[yellow]    ⊘ Reverted: {error_msg[:60]}...[/yellow]")
+            else:
+                console.print(f"[red]    ✗ Error: {error_msg[:60]}...[/red]")
+
+            return {"success": False, "error": error_msg}
+
+    async def force_redeem_all_positions(self):
+        """
+        Fetch all positions and attempt force redemption on everything.
+
+        This is useful for cleaning up all resolved positions at once.
+        """
+        if not self.is_live_mode or not self.onchain_executor:
+            console.print("[yellow]Force redeem only available in live mode[/yellow]")
+            return
+
+        console.print("\n[bold yellow]⚡ FORCE REDEEM ALL POSITIONS ⚡[/bold yellow]")
+        console.print("[dim]This will attempt to redeem ALL positions without checking resolution status[/dim]\n")
+
+        # Fetch all positions
+        positions = await self.fetch_all_positions()
+
+        if not positions:
+            console.print("[yellow]No positions found[/yellow]")
+            return
+
+        # Display summary
+        total_value = sum(float(p.get('currentValue', 0)) for p in positions)
+        console.print(f"[bold]Found {len(positions)} positions (Total Value: ${total_value:.2f})[/bold]")
+
+        # Ask for confirmation
+        console.print("\n[yellow]Press Enter to continue or Ctrl+C to cancel...[/yellow]")
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, input)
+        except KeyboardInterrupt:
+            console.print("[yellow]Cancelled[/yellow]")
+            return
+
+        # Get initial balance
+        initial_balance = await self.onchain_executor.get_usdc_balance()
+        console.print(f"\n[cyan]Initial Balance: ${initial_balance:.2f}[/cyan]\n")
+
+        # Attempt redemptions
+        results = {"success": 0, "failed": 0, "total_redeemed": 0.0}
+
+        for i, pos in enumerate(positions, 1):
+            console.print(f"[bold][{i}/{len(positions)}][/bold]")
+
+            result = await self.force_redeem_single_position(
+                condition_id=pos.get('conditionId', ''),
+                title=pos.get('title', 'Unknown'),
+                value=float(pos.get('currentValue', 0)),
+            )
+
+            if result.get("success"):
+                results["success"] += 1
+                results["total_redeemed"] += result.get("usdc_redeemed", 0)
+            else:
+                results["failed"] += 1
+
+            console.print()
+
+            # Delay between attempts
+            if i < len(positions):
+                await asyncio.sleep(2)
+
+        # Get final balance
+        final_balance = await self.onchain_executor.get_usdc_balance()
+
+        # Update wallet balance
+        if self.executor:
+            self.state.wallet_balance = await self.executor.get_usdc_balance()
+
+        # Display results
+        console.print(f"[cyan]{'═'*70}[/cyan]")
+        console.print(f"[bold green]REDEMPTION COMPLETE[/bold green]")
+        console.print(f"[cyan]{'═'*70}[/cyan]")
+        console.print(f"  Successful: [green]{results['success']}[/green]")
+        console.print(f"  Failed: [red]{results['failed']}[/red]")
+        console.print(f"  Initial Balance: ${initial_balance:.2f}")
+        console.print(f"  Final Balance: [green]${final_balance:.2f}[/green]")
+        console.print(f"  Total Redeemed: [bold green]${results['total_redeemed']:+.2f}[/bold green]")
+        console.print(f"[cyan]{'═'*70}[/cyan]\n")
+
     async def keyboard_handler(self):
         """Handle keyboard input for interactive controls using a thread."""
         import threading
@@ -1289,6 +1672,8 @@ class UnifiedPaperTrader:
                         await self.open_config_editor()
                     elif key == 'r':
                         self.reset_daily_limit()
+                    elif key == 'f':
+                        await self.force_redeem_all_positions()
                     elif key == 'q':
                         console.print("\n[yellow]Quit requested...[/yellow]")
                         self._running = False
@@ -1392,7 +1777,7 @@ class UnifiedPaperTrader:
         pnl_color = "green" if self.state.total_pnl >= 0 else "red"
         left_table.add_row("Total PnL", f"[{pnl_color}]${self.state.total_pnl:+.2f}[/]")
 
-        # Daily PnL with warning
+        # 24H Rolling PnL with warning
         daily_pnl = self.loss_tracker.get_daily_pnl()
         daily_pnl_pct = self.loss_tracker.get_daily_pnl_pct()
         if daily_pnl >= 0:
@@ -1401,7 +1786,7 @@ class UnifiedPaperTrader:
             daily_color = "yellow"  # Approaching limit
         else:
             daily_color = "red"
-        left_table.add_row("Daily PnL", f"[{daily_color}]${daily_pnl:+.2f} ({daily_pnl_pct:+.1f}%)[/]")
+        left_table.add_row("24H PnL", f"[{daily_color}]${daily_pnl:+.2f} ({daily_pnl_pct:+.1f}%)[/]")
 
         win_rate = self.state.wins / max(1, self.state.wins + self.state.losses)
         left_table.add_row("Win Rate", f"{win_rate:.1%} ({self.state.wins}/{self.state.wins + self.state.losses})")
@@ -1514,6 +1899,8 @@ class UnifiedPaperTrader:
         controls_table.add_row("[L]", "Switch Paper/Live mode")
         controls_table.add_row("[C]", "Open Config Editor")
         controls_table.add_row("[R]", "Reset daily loss limit")
+        if self.is_live_mode:
+            controls_table.add_row("[F]", "Force redeem all positions")
         controls_table.add_row("[Q]", "Quit")
         controls_panel = Panel(controls_table, title="[bold cyan]⌨️  Controls[/]", border_style="cyan")
 
