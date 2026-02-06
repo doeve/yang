@@ -1572,12 +1572,13 @@ class UnifiedPaperTrader:
         try:
             config_path = Path("config.yaml")
 
-            # Build config dict
+            # Build config dict with ALL settings
             config_data = {
                 "trading_mode": self.config.trading_mode,
                 "risk": {
                     "max_daily_loss_pct": self.config.max_daily_loss_pct,
                     "max_position_size_usdc": self.config.max_position_size_usdc,
+                    "min_balance_usdc": getattr(self.config, 'min_balance_usdc', 10.0),  # Default if missing
                 },
                 "model": {
                     "path": self.config.model_path,
@@ -1585,8 +1586,11 @@ class UnifiedPaperTrader:
                     "min_expected_return": self.config.min_expected_return,
                 },
                 "execution": {
+                    "use_clob": False,  # Default
                     "order_timeout_seconds": 30,
                     "poll_interval_seconds": 5,
+                    "use_public_rpc_for_redeem": True,
+                    "public_rpc_url": "https://polygon-rpc.com",
                 },
                 "logging": {
                     "dir": self.config.log_dir,
@@ -1594,20 +1598,78 @@ class UnifiedPaperTrader:
                 },
             }
 
-            # Add RPC URLs and execution settings if trading_config exists
+            # Override execution settings from trading_config if available
             if self.trading_config:
                 config_data["execution"]["use_clob"] = self.trading_config.execution.use_clob
-                config_data["execution"]["public_rpc_url"] = self.trading_config.public_rpc_url
+                config_data["execution"]["order_timeout_seconds"] = self.trading_config.execution.order_timeout_seconds
+                config_data["execution"]["poll_interval_seconds"] = self.trading_config.execution.poll_interval_seconds
                 config_data["execution"]["use_public_rpc_for_redeem"] = self.trading_config.execution.use_public_rpc_for_redeem
+                config_data["execution"]["public_rpc_url"] = self.trading_config.execution.public_rpc_url
 
-            # Write to file
+            # Write to file with comments
             with open(config_path, 'w') as f:
-                yaml.dump(config_data, f, default_flow_style=False, sort_keys=False)
+                # Write header comments
+                f.write("# Yang Trading Configuration\n")
+                f.write("# This file controls trading behavior and risk parameters\n\n")
+
+                # Write trading mode section
+                f.write("# Trading Mode\n")
+                f.write('# "paper" - Simulated trading (default, safe for testing)\n')
+                f.write('# "live"  - Real on-chain trading with actual funds\n')
+                f.write(f"trading_mode: {config_data['trading_mode']}\n\n")
+
+                # Write risk section
+                f.write("# Risk Controls\n")
+                f.write("risk:\n")
+                f.write("  # Maximum daily loss as percentage of starting balance\n")
+                f.write("  # Trading pauses automatically when this limit is hit\n")
+                f.write(f"  max_daily_loss_pct: {config_data['risk']['max_daily_loss_pct']}\n")
+                f.write("\n")
+                f.write("  # Maximum position size in USDC for a single trade\n")
+                f.write(f"  max_position_size_usdc: {config_data['risk']['max_position_size_usdc']}\n")
+                f.write("\n")
+                f.write("  # Minimum balance to maintain (don't trade below this)\n")
+                f.write(f"  min_balance_usdc: {config_data['risk']['min_balance_usdc']}\n\n")
+
+                # Write execution section
+                f.write("# Execution Settings\n")
+                f.write("execution:\n")
+                f.write("  # Use CLOB API for all operations (BUY and SELL)\n")
+                f.write("  # true  - Use CLOB API for both entry and exit (~2% fees, full functionality)\n")
+                f.write("  # false - Use onchain split for entry (free), hold until resolution for exit (free)\n")
+                f.write(f"  use_clob: {str(config_data['execution']['use_clob']).lower()}\n")
+                f.write("\n")
+                f.write("  # Order timeout in seconds (cancel unfilled orders after this)\n")
+                f.write(f"  order_timeout_seconds: {config_data['execution']['order_timeout_seconds']}\n")
+                f.write("\n")
+                f.write("  # Polling interval for trade confirmation (seconds)\n")
+                f.write(f"  poll_interval_seconds: {config_data['execution']['poll_interval_seconds']}\n")
+                f.write("\n")
+                f.write("  # Use public RPC for redemption (more reliable)\n")
+                f.write(f"  use_public_rpc_for_redeem: {str(config_data['execution']['use_public_rpc_for_redeem']).lower()}\n")
+                f.write("\n")
+                f.write("  # Public RPC URL (fallback for redemption)\n")
+                f.write(f'  public_rpc_url: "{config_data["execution"]["public_rpc_url"]}"\n\n')
+
+                # Write model section
+                f.write("# Model Settings (can be overridden by CLI)\n")
+                f.write("model:\n")
+                f.write(f'  path: "{config_data["model"]["path"]}"\n')
+                f.write(f"  min_confidence: {config_data['model']['min_confidence']}\n")
+                f.write(f"  min_expected_return: {config_data['model']['min_expected_return']}\n\n")
+
+                # Write logging section
+                f.write("# Logging\n")
+                f.write("logging:\n")
+                f.write(f'  dir: "{config_data["logging"]["dir"]}"\n')
+                f.write(f"  enable_ml_logging: {str(config_data['logging']['enable_ml_logging']).lower()}\n")
 
             return True
 
         except Exception as e:
             console.print(f"[red]Failed to save config: {e}[/red]")
+            import traceback
+            traceback.print_exc()
             return False
 
     async def try_immediate_redeem(self):

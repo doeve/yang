@@ -11,10 +11,10 @@ risk:
   # Maximum daily loss as percentage of starting balance
   # Trading pauses automatically when this limit is hit
   max_daily_loss_pct: 30.0
-  
+
   # Maximum position size in USDC for a single trade
   max_position_size_usdc: 100.0
-  
+
   # Minimum balance to maintain (don't trade below this)
   min_balance_usdc: 10.0
 
@@ -23,7 +23,7 @@ execution:
   # Use CLOB API for all operations (BUY and SELL)
   # true  - Use CLOB API for both entry and exit (~2% fees, full functionality)
   # false - Use onchain split for entry (free), hold until resolution for exit (free)
-  use_clob: false
+  use_clob: true
 
   # Order timeout in seconds (cancel unfilled orders after this)
   order_timeout_seconds: 30
