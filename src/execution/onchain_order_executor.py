@@ -1378,32 +1378,8 @@ class OnchainOrderExecutor:
 
                 logger.info(f"📋 CLOB SELL (market order): {size:.2f} shares @ {market_price:.4f}")
 
-                # Verify token balance before selling
+                # Try placing order first (fast path)
                 try:
-                    actual_balance = await self._get_token_balance(token_id)
-                    balance_shares = actual_balance / 1e6
-
-                    logger.info(f"Token balance check: {balance_shares:.2f} shares available, {size:.2f} requested")
-
-                    if actual_balance == 0:
-                        logger.error(f"Cannot sell: zero balance for token {token_id[:16]}...")
-                        return OrderResult(
-                            success=False,
-                            error=f"No tokens to sell (balance: 0, position tracking may be incorrect)"
-                        )
-
-                    if balance_shares < size:
-                        logger.warning(f"Insufficient token balance: have {balance_shares:.2f}, requested {size:.2f}")
-                        logger.info(f"Adjusting SELL size to available balance: {balance_shares:.2f}")
-                        size = balance_shares
-
-                except Exception as e:
-                    logger.warning(f"Could not verify token balance: {e}")
-                    # Continue anyway - let CLOB reject if insufficient
-
-                try:
-                    # Create order via py-clob-client (handles EIP-712 signing)
-                    # Use market price for immediate fill
                     order_args = OrderArgs(
                         token_id=token_id,
                         price=market_price,
@@ -1411,10 +1387,7 @@ class OnchainOrderExecutor:
                         side=CLOB_SELL
                     )
 
-                    # Sign order (EIP-712)
                     signed_order = self.clob_client.create_order(order_args)
-
-                    # Post to CLOB
                     response = self.clob_client.post_order(signed_order, OrderType.GTC)
 
                     order_id = response.get("orderID")
@@ -1425,7 +1398,6 @@ class OnchainOrderExecutor:
                         )
 
                     logger.info(f"✅ CLOB SELL order placed", order_id=order_id[:16])
-
                     return OrderResult(
                         success=True,
                         order_id=order_id,
@@ -1434,10 +1406,65 @@ class OnchainOrderExecutor:
                     )
 
                 except Exception as e:
+                    error_msg = str(e)
                     logger.error(f"CLOB SELL error: {e}")
+
+                    # If balance/allowance error, check and retry with corrected amount
+                    if "balance" in error_msg.lower() or "allowance" in error_msg.lower():
+                        try:
+                            actual_balance = await self._get_token_balance(token_id)
+                            balance_shares = actual_balance / 1e6
+
+                            logger.error(
+                                f"Balance check: {balance_shares:.2f} shares available, {size:.2f} requested",
+                                token_id=token_id[:16] + "..."
+                            )
+
+                            if actual_balance == 0:
+                                return OrderResult(
+                                    success=False,
+                                    error=f"No tokens to sell (balance: 0, position tracking incorrect)"
+                                )
+
+                            if balance_shares < size:
+                                # Retry with available balance
+                                logger.info(f"Retrying SELL with adjusted size: {size:.2f} → {balance_shares:.2f} shares")
+
+                                order_args = OrderArgs(
+                                    token_id=token_id,
+                                    price=market_price,
+                                    size=balance_shares,
+                                    side=CLOB_SELL
+                                )
+
+                                signed_order = self.clob_client.create_order(order_args)
+                                response = self.clob_client.post_order(signed_order, OrderType.GTC)
+
+                                order_id = response.get("orderID")
+                                if not order_id:
+                                    return OrderResult(
+                                        success=False,
+                                        error=f"CLOB retry failed: {response}"
+                                    )
+
+                                logger.info(f"✅ CLOB SELL retry successful", order_id=order_id[:16])
+                                return OrderResult(
+                                    success=True,
+                                    order_id=order_id,
+                                    filled_amount=balance_shares,
+                                    avg_price=market_price
+                                )
+
+                        except Exception as retry_error:
+                            logger.error(f"Retry failed: {retry_error}")
+                            return OrderResult(
+                                success=False,
+                                error=f"CLOB order failed: {error_msg}"
+                            )
+
                     return OrderResult(
                         success=False,
-                        error=f"CLOB order failed: {str(e)}"
+                        error=f"CLOB order failed: {error_msg}"
                     )
 
             else:

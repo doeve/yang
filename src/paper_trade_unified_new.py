@@ -106,7 +106,8 @@ class UnifiedTradingState:
 
     # Current position
     position_side: Optional[str] = None  # "yes" or "no"
-    position_size: float = 0.0
+    position_size: float = 0.0  # Position as % of balance (for paper trading)
+    position_shares: float = 0.0  # Actual shares owned (for live trading)
     entry_price: float = 0.0
     entry_tick: int = 0
     ticks_held: int = 0
@@ -909,6 +910,20 @@ class UnifiedPaperTrader:
         self.state.ticks_held = 0
         self.state.max_pnl_seen = 0.0
 
+        # Store actual shares for live mode (use filled_amount from order result)
+        if self.is_live_mode and self.executor:
+            # Use the actual filled amount from the order result
+            self.state.position_shares = result.filled_amount if result and result.success else quantity
+            logger.info(
+                "position_shares_stored",
+                mode="LIVE",
+                shares=self.state.position_shares,
+                side=side
+            )
+        else:
+            # Paper mode: calculate shares from position size
+            self.state.position_shares = quantity
+
         # Use correct balance for display (already calculated above)
         dollar_size = position_size * balance_to_use
 
@@ -951,10 +966,14 @@ class UnifiedPaperTrader:
             else self.state.last_no_price
         )
 
-        # Use wallet balance in live mode for calculating invested amount
-        balance_for_calc = self.state.wallet_balance if self.is_live_mode else self.state.balance
-        invested = self.state.position_size * balance_for_calc
-        shares = invested / entry_price if entry_price > 0 else 0
+        # In live mode, use stored actual shares (don't recalculate from balance!)
+        # In paper mode, calculate from position size
+        if self.is_live_mode:
+            shares = self.state.position_shares
+            invested = shares * entry_price
+        else:
+            invested = self.state.position_size * self.state.balance
+            shares = invested / entry_price if entry_price > 0 else 0
 
         logger.info(
             "execute_exit",
@@ -1135,6 +1154,7 @@ class UnifiedPaperTrader:
         # Clear position
         self.state.position_side = None
         self.state.position_size = 0.0
+        self.state.position_shares = 0.0
         self.state.entry_price = 0.0
         self.state.entry_tick = 0
         self.state.ticks_held = 0
@@ -1177,10 +1197,14 @@ class UnifiedPaperTrader:
         else:
             payout = 1.0 if not up_won else 0.0
 
-        # Use wallet balance in live mode for calculating invested amount
-        balance_for_calc = self.state.wallet_balance if self.is_live_mode else self.state.balance
-        invested = self.state.position_size * balance_for_calc
-        shares = invested / self.state.entry_price
+        # In live mode, use stored actual shares (don't recalculate from balance!)
+        # In paper mode, calculate from position size
+        if self.is_live_mode:
+            shares = self.state.position_shares
+            invested = shares * self.state.entry_price
+        else:
+            invested = self.state.position_size * self.state.balance
+            shares = invested / self.state.entry_price
         returned_capital = shares * payout
         pnl = returned_capital - invested
 
@@ -1263,6 +1287,7 @@ class UnifiedPaperTrader:
         # Clear position
         self.state.position_side = None
         self.state.position_size = 0.0
+        self.state.position_shares = 0.0
         self.state.entry_price = 0.0
 
         # Try immediate redemption (non-blocking)
