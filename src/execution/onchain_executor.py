@@ -122,6 +122,7 @@ class OnchainExecutor:
         private_key: str,
         public_rpc_url: str = "https://polygon-rpc.com",
         use_public_rpc: bool = True,
+        use_clob: bool = False,
         gamma_api_url: str = "https://gamma-api.polymarket.com",
         clob_api_url: str = "https://clob.polymarket.com",
         socks5_proxy: Optional[str] = None,
@@ -134,6 +135,7 @@ class OnchainExecutor:
             private_key: Wallet private key
             public_rpc_url: Public Polygon RPC URL (for transaction broadcast)
             use_public_rpc: Use public RPC for transactions (more reliable)
+            use_clob: Use CLOB API for trading (not used in this class, for compatibility)
             gamma_api_url: Polymarket Gamma API URL
             clob_api_url: Polymarket CLOB API URL
             socks5_proxy: Optional SOCKS5 proxy URL
@@ -142,6 +144,7 @@ class OnchainExecutor:
         self.private_key = private_key
         self.public_rpc_url = public_rpc_url
         self.use_public_rpc = use_public_rpc
+        self.use_clob = use_clob
         self.gamma_api_url = gamma_api_url
         self.clob_api_url = clob_api_url
         self.socks5_proxy = socks5_proxy

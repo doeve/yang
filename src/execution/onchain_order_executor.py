@@ -34,6 +34,63 @@ except ImportError:
     CLOB_AVAILABLE = False
 
 
+# Monkey-patch httpx to support SOCKS proxy for py-clob-client
+_original_async_client_init = None
+_original_sync_client_init = None
+_global_socks_proxy = None
+
+def _patch_httpx_with_socks(socks_proxy: str):
+    """Monkey-patch both httpx.AsyncClient and httpx.Client to use SOCKS proxy."""
+    global _original_async_client_init, _original_sync_client_init, _global_socks_proxy
+
+    if not socks_proxy or _original_async_client_init is not None:
+        return  # Already patched or no proxy
+
+    try:
+        import httpx
+        import httpx_socks
+
+        _global_socks_proxy = socks_proxy
+
+        # Patch AsyncClient (for async operations)
+        _original_async_client_init = httpx.AsyncClient.__init__
+
+        def patched_async_init(self, *args, **kwargs):
+            """Patched AsyncClient.__init__ that adds SOCKS proxy."""
+            if 'transport' not in kwargs and _global_socks_proxy:
+                try:
+                    kwargs['transport'] = httpx_socks.AsyncProxyTransport.from_url(_global_socks_proxy)
+                    kwargs['verify'] = False  # Accept self-signed certs from proxy
+                except Exception as e:
+                    logger.warning(f"Failed to add SOCKS proxy to async client: {e}")
+            _original_async_client_init(self, *args, **kwargs)
+
+        httpx.AsyncClient.__init__ = patched_async_init
+
+        # Patch Client (for sync operations - py-clob-client uses this!)
+        _original_sync_client_init = httpx.Client.__init__
+
+        def patched_sync_init(self, *args, **kwargs):
+            """Patched Client.__init__ that adds SOCKS proxy."""
+            if 'transport' not in kwargs and _global_socks_proxy:
+                try:
+                    kwargs['transport'] = httpx_socks.SyncProxyTransport.from_url(_global_socks_proxy)
+                    kwargs['verify'] = False  # Accept self-signed certs from proxy
+                except Exception as e:
+                    logger.warning(f"Failed to add SOCKS proxy to sync client: {e}")
+            _original_sync_client_init(self, *args, **kwargs)
+
+        httpx.Client.__init__ = patched_sync_init
+
+        logger.info(f"httpx (sync + async) monkey-patched with SOCKS proxy: {socks_proxy}")
+
+    except ImportError:
+        logger.error("httpx-socks not available for proxy support")
+        logger.info("Install with: pip install 'httpx-socks[asyncio]'")
+    except Exception as e:
+        logger.error(f"Failed to monkey-patch httpx: {e}")
+
+
 # Contract addresses (Polygon Mainnet)
 CONTRACTS = {
     "CTF": "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045",
@@ -304,6 +361,12 @@ class OnchainOrderExecutor:
             if self.use_clob and CLOB_AVAILABLE:
                 try:
                     logger.info("Initializing CLOB client for API trading...")
+
+                    # Monkey-patch httpx with SOCKS proxy BEFORE creating CLOB client
+                    if self.socks5_proxy:
+                        _patch_httpx_with_socks(self.socks5_proxy)
+
+                    # Create CLOB client (will now use proxied httpx)
                     self.clob_client = ClobClient(
                         host=self.clob_api_url,
                         key=self.private_key,
@@ -313,12 +376,14 @@ class OnchainOrderExecutor:
                     )
 
                     # Generate and set API credentials
+                    logger.info("Generating CLOB API credentials...")
                     api_creds = self.clob_client.create_or_derive_api_creds()
                     self.clob_client.set_api_creds(api_creds)
 
                     logger.info("CLOB client connected",
                                address=self.address,
-                               api_key=api_creds.api_key[:8] + "...")
+                               api_key=api_creds.api_key[:8] + "...",
+                               proxy_enabled=bool(self.socks5_proxy))
                 except Exception as e:
                     logger.error(f"Failed to initialize CLOB client: {e}")
                     logger.warning("Falling back to onchain-only mode")
