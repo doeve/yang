@@ -1871,8 +1871,16 @@ class UnifiedPaperTrader:
 
         Called after each candle settlement to automatically redeem resolved positions.
         This ensures we get our USDC back immediately after market resolution.
+
+        Note: When use_clob=True, positions are exited via CLOB SELL (tokens → USDC),
+        so redemption is unnecessary (user doesn't hold tokens anymore).
         """
         if not self.is_live_mode or not self.onchain_executor:
+            return
+
+        # Skip redemption when using CLOB - positions are exited via SELL orders
+        if self.trading_config and self.trading_config.execution.use_clob:
+            logger.debug("Skipping redemption check (CLOB mode - positions exited via SELL)")
             return
 
         if not self.state.condition_id:

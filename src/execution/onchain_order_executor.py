@@ -174,6 +174,26 @@ CTF_ABI = [
         "stateMutability": "nonpayable",
         "type": "function",
     },
+    {
+        "inputs": [
+            {"name": "operator", "type": "address"},
+            {"name": "approved", "type": "bool"},
+        ],
+        "name": "setApprovalForAll",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"name": "account", "type": "address"},
+            {"name": "operator", "type": "address"},
+        ],
+        "name": "isApprovedForAll",
+        "outputs": [{"name": "", "type": "bool"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
 ]
 
 CTF_EXCHANGE_ABI = [
@@ -437,7 +457,10 @@ class OnchainOrderExecutor:
 
     async def ensure_approvals(self) -> bool:
         """
-        Ensure USDC approval for CTF Exchange and CTF for splitting/merging.
+        Ensure necessary token approvals for trading.
+
+        - USDC approval for CTF Exchange (ERC-20)
+        - CTF approval for CLOB Exchange (ERC-1155) - only when use_clob=True
 
         This is required before trading.
         Uses local RPC for reading to avoid rate limits.
@@ -501,8 +524,60 @@ class OnchainOrderExecutor:
             else:
                 logger.info("USDC already approved (skipping)")
 
-            # Note: CTF tokens use setApprovalForAll (ERC1155)
-            # This would be done separately if needed
+            # Check if CTF tokens approved for CLOB Exchange (ERC-1155)
+            # This is required for CLOB to transfer user's outcome tokens when selling
+            if self.use_clob:
+                ctf_local = self.local_w3.eth.contract(
+                    address=Web3.to_checksum_address(CONTRACTS["CTF"]),
+                    abi=CTF_ABI,
+                )
+
+                is_approved = ctf_local.functions.isApprovedForAll(
+                    self.address,
+                    Web3.to_checksum_address(CONTRACTS["CTF_EXCHANGE"])
+                ).call()
+
+                if not is_approved:
+                    logger.info("Approving CTF tokens for CLOB Exchange...")
+
+                    # Use PUBLIC RPC for transaction
+                    ctf_public = self.public_w3.eth.contract(
+                        address=Web3.to_checksum_address(CONTRACTS["CTF"]),
+                        abi=CTF_ABI,
+                    )
+
+                    nonce = self.public_w3.eth.get_transaction_count(self.address)
+
+                    # Get current gas prices (EIP-1559)
+                    latest_block = self.public_w3.eth.get_block('latest')
+                    base_fee = latest_block.get('baseFeePerGas', 30 * 10**9)
+                    max_priority_fee = self.public_w3.to_wei(50, 'gwei')
+                    max_fee = base_fee * 2 + max_priority_fee
+
+                    tx = ctf_public.functions.setApprovalForAll(
+                        Web3.to_checksum_address(CONTRACTS["CTF_EXCHANGE"]),
+                        True
+                    ).build_transaction({
+                        "from": self.address,
+                        "nonce": nonce,
+                        "gas": 100000,
+                        "maxFeePerGas": max_fee,
+                        "maxPriorityFeePerGas": max_priority_fee,
+                    })
+
+                    signed_tx = self.account.sign_transaction(tx)
+                    tx_hash = self.public_w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+
+                    logger.info(f"CTF approval tx sent: {tx_hash.hex()}")
+                    receipt = self.public_w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+                    if receipt["status"] != 1:
+                        logger.error("CTF approval for CLOB Exchange failed")
+                        return False
+
+                    logger.info("CTF tokens approved for CLOB Exchange successfully")
+                else:
+                    logger.info("CTF already approved for CLOB Exchange (skipping)")
 
             return True
 
