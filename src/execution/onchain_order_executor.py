@@ -591,6 +591,41 @@ class OnchainOrderExecutor:
             logger.error(f"Approval error: {e}")
             return False
 
+    async def get_midpoint_price(self, token_id: str) -> Optional[float]:
+        """
+        Get midpoint price from CLOB API.
+
+        Args:
+            token_id: Token ID
+
+        Returns:
+            Midpoint price or None if unavailable
+        """
+        if not self.http_client:
+            return None
+
+        try:
+            url = f"{self.clob_api_url}/midpoint"
+            params = {"token_id": token_id}
+            response = await self.http_client.get(url, params=params)
+
+            if response.status_code != 200:
+                logger.warning(f"Failed to fetch midpoint: {response.status_code}")
+                return None
+
+            data = response.json()
+            midpoint = float(data.get("mid", 0))
+
+            if midpoint > 0:
+                logger.info(f"Midpoint price: {midpoint:.4f}")
+                return midpoint
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Error getting midpoint price: {e}")
+            return None
+
     async def get_market_price(self, token_id: str, side: str) -> Optional[float]:
         """
         Get best market price for immediate execution.
@@ -598,12 +633,14 @@ class OnchainOrderExecutor:
         For BUY: Returns best ask (lowest SELL order price)
         For SELL: Returns best bid (highest BUY order price)
 
+        Falls back to midpoint price if orderbook is empty.
+
         Args:
             token_id: Token ID
             side: "BUY" or "SELL"
 
         Returns:
-            Best price for immediate fill, or None if no orders
+            Best price for immediate fill, or None if unavailable
         """
         try:
             # For BUY: Get SELL orderbook (we want to buy from sellers)
@@ -611,20 +648,28 @@ class OnchainOrderExecutor:
             book_side = "SELL" if side.upper() == "BUY" else "BUY"
             orders = await self.get_orderbook(token_id, book_side)
 
-            if not orders:
-                logger.warning(f"No {book_side} orders in book for market {side}")
-                return None
+            if orders:
+                # Get best price (lowest for asks, highest for bids)
+                if side.upper() == "BUY":
+                    # Buy at lowest ask
+                    best_price = min(order.price for order in orders)
+                else:
+                    # Sell at highest bid
+                    best_price = max(order.price for order in orders)
 
-            # Get best price (lowest for asks, highest for bids)
-            if side.upper() == "BUY":
-                # Buy at lowest ask
-                best_price = min(order.price for order in orders)
-            else:
-                # Sell at highest bid
-                best_price = max(order.price for order in orders)
+                logger.info(f"Market price from orderbook for {side}: {best_price:.4f}")
+                return best_price
 
-            logger.info(f"Market price for {side}: {best_price:.4f}")
-            return best_price
+            # Fallback to midpoint if orderbook is empty
+            logger.info(f"Orderbook empty for {side}, falling back to midpoint price")
+            midpoint = await self.get_midpoint_price(token_id)
+
+            if midpoint:
+                logger.info(f"Using midpoint price for {side}: {midpoint:.4f}")
+                return midpoint
+
+            logger.warning(f"No market price available (orderbook and midpoint both unavailable)")
+            return None
 
         except Exception as e:
             logger.error(f"Error getting market price: {e}")
@@ -656,26 +701,49 @@ class OnchainOrderExecutor:
                 return []
 
             data = response.json()
+
+            # Check for API error
+            if "error" in data:
+                logger.warning(f"Orderbook API error: {data['error']}")
+                return []
+
+            # CLOB API returns "bids" and "asks", not "orders"
+            # - bids: buy orders (for selling into)
+            # - asks: sell orders (for buying from)
+            # The API returns aggregated price levels, not individual orders with signatures
+
             orders = []
 
-            for order_data in data.get("orders", []):
-                # Parse order from API response
-                # Note: Actual structure may vary, adjust as needed
+            # Determine which side to parse based on what was requested
+            # Note: The API returns both bids and asks regardless of 'side' parameter
+            if side.upper() == "BUY":
+                # For BUY orders, we want the asks (sell orders to buy from)
+                order_levels = data.get("asks", [])
+                order_side = "SELL"
+            else:
+                # For SELL orders, we want the bids (buy orders to sell into)
+                order_levels = data.get("bids", [])
+                order_side = "BUY"
+
+            for level in order_levels:
+                # Each level is just {price, size} - aggregated orderbook
+                # For CLOB API trading, we only need price and size
                 orders.append(OrderbookOrder(
-                    order_id=order_data.get("id", ""),
-                    price=float(order_data.get("price", 0)),
-                    size=float(order_data.get("size", 0)),
-                    side=order_data.get("side", "BUY"),
-                    maker=order_data.get("maker", ""),
-                    signature=order_data.get("signature", ""),
-                    salt=int(order_data.get("salt", 0)),
-                    maker_amount=int(order_data.get("maker_amount", 0)),
-                    taker_amount=int(order_data.get("taker_amount", 0)),
-                    expiration=int(order_data.get("expiration", 0)),
-                    nonce=int(order_data.get("nonce", 0)),
-                    fee_rate_bps=int(order_data.get("fee_rate_bps", 0)),
+                    order_id="",  # Not provided in aggregated book
+                    price=float(level.get("price", 0)),
+                    size=float(level.get("size", 0)),
+                    side=order_side,
+                    maker="",  # Not provided in aggregated book
+                    signature="",  # Not provided in aggregated book
+                    salt=0,
+                    maker_amount=0,
+                    taker_amount=0,
+                    expiration=0,
+                    nonce=0,
+                    fee_rate_bps=0,
                 ))
 
+            logger.debug(f"Parsed {len(orders)} orderbook levels for {side}")
             return orders
 
         except Exception as e:
@@ -1297,10 +1365,30 @@ class OnchainOrderExecutor:
                     )
 
                 except Exception as e:
+                    error_msg = str(e)
                     logger.error(f"CLOB SELL error: {e}")
+
+                    # If balance/allowance error, check actual balance for debugging
+                    if "balance" in error_msg.lower() or "allowance" in error_msg.lower():
+                        try:
+                            actual_balance = await self._get_token_balance(token_id)
+                            balance_shares = actual_balance / 1e6
+                            logger.error(
+                                f"Balance check after error: {balance_shares:.2f} shares "
+                                f"(attempted to sell {size:.2f})",
+                                token_id=token_id[:16] + "..."
+                            )
+
+                            if actual_balance == 0:
+                                error_msg = f"No tokens to sell - balance is 0 (position tracking may be incorrect)"
+                            elif balance_shares < size:
+                                error_msg = f"Insufficient balance: have {balance_shares:.2f}, tried to sell {size:.2f}"
+                        except Exception as balance_error:
+                            logger.warning(f"Could not check balance: {balance_error}")
+
                     return OrderResult(
                         success=False,
-                        error=f"CLOB order failed: {str(e)}"
+                        error=f"CLOB order failed: {error_msg}"
                     )
 
             else:
