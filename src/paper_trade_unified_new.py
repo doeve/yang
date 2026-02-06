@@ -198,8 +198,7 @@ class UnifiedPaperTrader:
         self._live_display = None
 
         # Logging
-        self.ml_log_file: Optional[Path] = None
-        self.ml_log_handle = None
+        self.log_file: Optional[Path] = None
 
         # Live trading components (onchain execution to avoid fees)
         self.executor: Optional[OnchainOrderExecutor] = None
@@ -211,35 +210,43 @@ class UnifiedPaperTrader:
         """Check if running in live trading mode."""
         return self.config.trading_mode == "live"
 
-    def _setup_ml_logging(self):
-        """Initialize ML logging file."""
-        if not self.config.enable_ml_logging:
-            return
-
+    def _setup_logging(self):
+        """Initialize structured logging to file."""
         log_dir = Path(self.config.log_dir)
         log_dir.mkdir(parents=True, exist_ok=True)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         model_name = Path(self.config.model_path).name
-        self.ml_log_file = log_dir / f"{model_name}_{timestamp}.jsonl"
+        mode = "live" if self.is_live_mode else "paper"
+        self.log_file = log_dir / f"{model_name}_{mode}_{timestamp}.jsonl"
 
-        self.ml_log_handle = open(self.ml_log_file, 'w')
-        console.print(f"[blue]ML logging to: {self.ml_log_file}[/blue]")
+        # Configure structlog to write JSON to file (no console output)
+        import structlog as struct_module
+        import logging
 
-        # Write header/metadata
-        metadata = {
-            "type": "metadata",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "model_path": self.config.model_path,
-            "config": {
-                "initial_balance": self.config.initial_balance,
-                "base_position_size": self.config.base_position_size,
-                "min_confidence": self.config.min_confidence,
-                "min_expected_return": self.config.min_expected_return,
-            }
-        }
-        self.ml_log_handle.write(json.dumps(metadata) + "\n")
-        self.ml_log_handle.flush()
+        # Setup standard logging to file only
+        root_logger = logging.getLogger()
+        root_logger.setLevel(logging.INFO)
+        root_logger.handlers = []  # Clear any existing handlers
+
+        file_handler = logging.FileHandler(str(self.log_file))
+        file_handler.setFormatter(logging.Formatter("%(message)s"))
+        root_logger.addHandler(file_handler)
+
+        # Configure structlog to write JSON only to file
+        struct_module.configure(
+            processors=[
+                struct_module.processors.TimeStamper(fmt="iso"),
+                struct_module.processors.add_log_level,
+                struct_module.processors.StackInfoRenderer(),
+                struct_module.processors.format_exc_info,
+                struct_module.processors.JSONRenderer()
+            ],
+            logger_factory=struct_module.stdlib.LoggerFactory(),
+            cache_logger_on_first_use=True,
+        )
+
+        console.print(f"[blue]Logging to: {self.log_file}[/blue]")
 
     def _log_tick(self, features: np.ndarray, position_state: np.ndarray, model_output: Dict):
         """Log tick data."""
@@ -637,13 +644,13 @@ class UnifiedPaperTrader:
         self.state.last_confidence = confidence
         self.state.last_expected_return = expected_return
 
-        # Log
-        self._log_tick(features, position_state, {
-            "action": action,
-            "q_values": q_values,
-            "confidence": confidence,
-            "expected_return": expected_return,
-        })
+        # Old ML logging removed - using structured logs instead
+        # self._log_tick(features, position_state, {
+        #     "action": action,
+        #     "q_values": q_values,
+        #     "confidence": confidence,
+        #     "expected_return": expected_return,
+        # })
 
         return {
             "action": action,
@@ -894,16 +901,17 @@ class UnifiedPaperTrader:
             f"Conf={model_output['confidence']:.1%}[/green]"
         )
 
-        self._log_trade("entry", {
-            "side": side,
-            "price": price,
-            "size": position_size,
-            "dollar_size": dollar_size,
-            "expected_return": model_output["expected_return"],
-            "confidence": model_output["confidence"],
-            "q_values": model_output["q_values"],
-            "time_remaining": self.get_time_remaining(),
-        })
+        # Old ML logging removed - using structured logs instead
+        # self._log_trade("entry", {
+        #     "side": side,
+        #     "price": price,
+        #     "size": position_size,
+        #     "dollar_size": dollar_size,
+        #     "expected_return": model_output["expected_return"],
+        #     "confidence": model_output["confidence"],
+        #     "q_values": model_output["q_values"],
+        #     "time_remaining": self.get_time_remaining(),
+        # })
 
     async def execute_exit(self, reason: str = "manual"):
         """Execute position exit."""
@@ -1092,15 +1100,16 @@ class UnifiedPaperTrader:
             f"PnL=${pnl:+.2f} | {reason} | Held {self.state.ticks_held} ticks[/]"
         )
 
-        self._log_trade("exit", {
-            "side": side,
-            "entry_price": entry_price,
-            "exit_price": current_price,
-            "pnl": pnl,
-            "reason": reason,
-            "ticks_held": self.state.ticks_held,
-            "balance_after": self.state.balance,
-        })
+        # Old ML logging removed - using structured logs instead
+        # self._log_trade("exit", {
+        #     "side": side,
+        #     "entry_price": entry_price,
+        #     "exit_price": current_price,
+        #     "pnl": pnl,
+        #     "reason": reason,
+        #     "ticks_held": self.state.ticks_held,
+        #     "balance_after": self.state.balance,
+        # })
 
         # Clear position
         self.state.position_side = None
@@ -1215,16 +1224,17 @@ class UnifiedPaperTrader:
             f"{'WIN' if pnl > 0 else 'LOSS'} | PnL=${pnl:+.2f}[/bold purple]"
         )
 
-        self._log_trade("settlement", {
-            "side": self.state.position_side,
-            "entry_price": self.state.entry_price,
-            "payout": payout,
-            "btc_open": self.state.btc_open_price,
-            "btc_close": self.state.btc_current_price,
-            "up_won": up_won,
-            "pnl": pnl,
-            "balance_after": self.state.balance,
-        })
+        # Old ML logging removed - using structured logs instead
+        # self._log_trade("settlement", {
+        #     "side": self.state.position_side,
+        #     "entry_price": self.state.entry_price,
+        #     "payout": payout,
+        #     "btc_open": self.state.btc_open_price,
+        #     "btc_close": self.state.btc_current_price,
+        #     "up_won": up_won,
+        #     "pnl": pnl,
+        #     "balance_after": self.state.balance,
+        # })
 
         # Clear position
         self.state.position_side = None
@@ -1260,13 +1270,13 @@ class UnifiedPaperTrader:
             total_pnl=self.state.total_pnl
         )
 
-        console.print(f"[bold yellow]🔄 Switching from {old_mode.upper()} to {new_mode.upper()} mode...[/bold yellow]")
+        console.print(f"[bold yellow]🔄 Switching from {old_mode} to {new_mode} mode...[/bold yellow]")
 
-        # Update config
-        self.config.trading_mode = new_mode
+        # Update config (use lowercase for config value)
+        self.config.trading_mode = new_mode.lower()
 
         # If switching to live mode, initialize executor
-        if new_mode == "live":
+        if self.config.trading_mode == "live":
             if not self.trading_config:
                 console.print("[bold red]❌ No trading config available! Cannot switch to live mode.[/bold red]")
                 self.config.trading_mode = "paper"
@@ -1313,6 +1323,9 @@ class UnifiedPaperTrader:
                     onchain_executor_connected=self.onchain_executor is not None
                 )
                 console.print("[bold green]✅ Switched to LIVE mode[/bold green]")
+                console.print(f"[bold green]   Wallet Balance: ${self.state.wallet_balance:.2f} USDC[/bold green]")
+                console.print(f"[bold green]   Paper Balance: ${self.state.balance:.2f}[/bold green]")
+                console.print("[yellow]   (Wallet balance is your real USDC, paper balance tracks performance)[/yellow]")
 
             except ValueError as e:
                 logger.error(
@@ -2394,7 +2407,7 @@ class UnifiedPaperTrader:
         logger.info(
             "session_start",
             mode=mode,
-            model_path=self.model_path,
+            model_path=self.config.model_path,
             initial_balance=self.state.balance,
             starting_balance=self.config.initial_balance,
             max_daily_loss_pct=self.config.max_daily_loss_pct,
@@ -2405,7 +2418,7 @@ class UnifiedPaperTrader:
         )
 
         self.load_model()
-        self._setup_ml_logging()
+        self._setup_logging()
         await self._setup_clients()
 
         self._running = True
@@ -2508,8 +2521,7 @@ class BacktestRunner:
         self.equity_curve: List[float] = []
 
         # Logging
-        self.ml_log_file: Optional[Path] = None
-        self.ml_log_handle = None
+        self.log_file: Optional[Path] = None
         self._tick_count = 0
 
     def _setup_logging(self):
