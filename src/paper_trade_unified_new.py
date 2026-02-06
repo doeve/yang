@@ -1524,7 +1524,7 @@ class UnifiedPaperTrader:
         # Add loss limit warning banner if needed
         if self.loss_tracker.is_limit_hit(self.config.max_daily_loss_pct):
             warning = Panel(
-                "[bold yellow]⚠ DAILY LOSS LIMIT HIT — NEW ENTRIES PAUSED (Press [R] to reset)[/bold yellow]",
+                "[bold yellow]⚠ 24H LOSS LIMIT HIT — NEW ENTRIES PAUSED (Press [R] to reset)[/bold yellow]",
                 border_style="yellow",
             )
             layout = Group(warning, layout)
