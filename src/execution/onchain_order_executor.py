@@ -1082,6 +1082,18 @@ class OnchainOrderExecutor:
                             error="CLOB client not initialized. Check py-clob-client installation."
                         )
 
+                    # CLOB price limits: 0.01 to 0.99
+                    if price > 0.99 or price < 0.01:
+                        logger.warning(
+                            f"clob_price_out_of_range",
+                            price=price,
+                            message=f"Price {price:.4f} outside CLOB range (0.01-0.99). Market near-resolved."
+                        )
+                        return OrderResult(
+                            success=False,
+                            error=f"Price {price:.4f} outside CLOB range (0.01-0.99). Cannot place order on near-resolved market."
+                        )
+
                     logger.info(f"📋 CLOB BUY: {size:.2f} shares @ {price:.3f}")
 
                     try:
@@ -1176,6 +1188,20 @@ class OnchainOrderExecutor:
                     return OrderResult(
                         success=False,
                         error="CLOB client not initialized. Check py-clob-client installation."
+                    )
+
+                # CLOB price limits: 0.01 to 0.99
+                # If price is outside this range, the market is near-resolved
+                if price > 0.99 or price < 0.01:
+                    logger.warning(
+                        f"clob_price_out_of_range",
+                        price=price,
+                        message=f"Price {price:.4f} outside CLOB range (0.01-0.99). Market near-resolved. "
+                                f"Holding position for redemption after resolution is more profitable."
+                    )
+                    return OrderResult(
+                        success=False,
+                        error=f"Price {price:.4f} outside CLOB range (0.01-0.99). Hold until resolution and redeem for better payout."
                     )
 
                 logger.info(f"📋 CLOB SELL: {size:.2f} shares @ {price:.3f}")
