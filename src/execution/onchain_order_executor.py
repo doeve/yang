@@ -23,6 +23,16 @@ from eth_account import Account
 
 logger = structlog.get_logger(__name__)
 
+# Import py-clob-client for CLOB trading
+try:
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import OrderArgs, OrderType
+    from py_clob_client.order_builder.constants import BUY as CLOB_BUY, SELL as CLOB_SELL
+    CLOB_AVAILABLE = True
+except ImportError:
+    logger.warning("py-clob-client not installed. CLOB trading will be unavailable. Install with: pip install py-clob-client")
+    CLOB_AVAILABLE = False
+
 
 # Contract addresses (Polygon Mainnet)
 CONTRACTS = {
@@ -225,6 +235,7 @@ class OnchainOrderExecutor:
         private_key: str,
         public_rpc_url: str = "https://polygon-rpc.com",
         use_public_rpc: bool = True,
+        use_clob: bool = False,
         clob_api_url: str = "https://clob.polymarket.com",
         gamma_api_url: str = "https://gamma-api.polymarket.com",
         socks5_proxy: Optional[str] = None,
@@ -234,6 +245,7 @@ class OnchainOrderExecutor:
         self.private_key = private_key
         self.public_rpc_url = public_rpc_url
         self.use_public_rpc = use_public_rpc
+        self.use_clob = use_clob
         self.clob_api_url = clob_api_url
         self.gamma_api_url = gamma_api_url
         self.socks5_proxy = socks5_proxy
@@ -246,6 +258,9 @@ class OnchainOrderExecutor:
 
         # HTTP client
         self.http_client: Optional[httpx.AsyncClient] = None
+
+        # CLOB client (for API trading)
+        self.clob_client = None
 
         # Connected state
         self._connected = False
@@ -285,7 +300,33 @@ class OnchainOrderExecutor:
             else:
                 self.http_client = httpx.AsyncClient(timeout=30)
 
-            logger.info("Onchain order executor connected", address=self.address)
+            # Initialize CLOB client if use_clob is enabled
+            if self.use_clob and CLOB_AVAILABLE:
+                try:
+                    logger.info("Initializing CLOB client for API trading...")
+                    self.clob_client = ClobClient(
+                        host=self.clob_api_url,
+                        key=self.private_key,
+                        chain_id=137,  # Polygon
+                        signature_type=0,  # EOA (standard wallet)
+                        funder=self.address
+                    )
+
+                    # Generate and set API credentials
+                    api_creds = self.clob_client.create_or_derive_api_creds()
+                    self.clob_client.set_api_creds(api_creds)
+
+                    logger.info("CLOB client connected",
+                               address=self.address,
+                               api_key=api_creds.api_key[:8] + "...")
+                except Exception as e:
+                    logger.error(f"Failed to initialize CLOB client: {e}")
+                    logger.warning("Falling back to onchain-only mode")
+                    self.use_clob = False
+
+            logger.info("Onchain order executor connected",
+                       address=self.address,
+                       mode="CLOB" if self.use_clob else "Onchain")
             self._connected = True
             return True
 
@@ -863,7 +904,56 @@ class OnchainOrderExecutor:
 
         try:
             if side.upper() == "BUY":
-                # BUY: Split USDC into YES/NO tokens
+                # Check mode
+                if self.use_clob:
+                    # CLOB mode: Use CLOB API with EIP-712 signing
+                    if not self.clob_client:
+                        return OrderResult(
+                            success=False,
+                            error="CLOB client not initialized. Check py-clob-client installation."
+                        )
+
+                    logger.info(f"📋 CLOB BUY: {size:.2f} shares @ {price:.3f}")
+
+                    try:
+                        # Create order via py-clob-client (handles EIP-712 signing)
+                        order_args = OrderArgs(
+                            token_id=token_id,
+                            price=price,
+                            size=size,
+                            side=CLOB_BUY
+                        )
+
+                        # Sign order (EIP-712)
+                        signed_order = self.clob_client.create_order(order_args)
+
+                        # Post to CLOB
+                        response = self.clob_client.post_order(signed_order, OrderType.GTC)
+
+                        order_id = response.get("orderID")
+                        if not order_id:
+                            return OrderResult(
+                                success=False,
+                                error=f"CLOB order failed: {response}"
+                            )
+
+                        logger.info(f"✅ CLOB BUY order placed", order_id=order_id[:16])
+
+                        return OrderResult(
+                            success=True,
+                            order_id=order_id,
+                            filled_amount=size,
+                            avg_price=price
+                        )
+
+                    except Exception as e:
+                        logger.error(f"CLOB BUY error: {e}")
+                        return OrderResult(
+                            success=False,
+                            error=f"CLOB order failed: {str(e)}"
+                        )
+
+                # Onchain mode: Split USDC into YES/NO tokens (fee-free)
                 # Calculate USDC needed: shares * price
                 usdc_amount = size * price
 
@@ -877,7 +967,7 @@ class OnchainOrderExecutor:
                         error="Could not determine condition_id for token"
                     )
 
-                logger.info(f"💰 Splitting ${usdc_amount:.2f} USDC into tokens")
+                logger.info(f"💰 Splitting ${usdc_amount:.2f} USDC into tokens (onchain, fee-free)")
 
                 result = await self.split_position(
                     condition_id=condition_id,
@@ -900,54 +990,64 @@ class OnchainOrderExecutor:
                     return result
 
             elif side.upper() == "SELL":
-                # SELL: Query orderbook and fill buy orders via CTF Exchange
-                logger.info(
-                    f"💰 Selling {size:.2f} tokens @ {price:.3f}",
-                    token_id=token_id[:16] if len(token_id) > 16 else token_id,
-                )
-
-                # Get orderbook (people wanting to BUY what we're selling)
-                buy_orders = await self.get_orderbook(token_id, side="BUY")
-
-                if not buy_orders:
+                # SELL: Not supported in pure onchain mode due to operator restrictions
+                if not self.use_clob:
+                    logger.warning(
+                        "sell_not_supported_onchain",
+                        message="Cannot exit positions in pure onchain mode (use_clob=false). "
+                                "Options: (1) Enable CLOB mode via config, or (2) Hold until resolution and redeem."
+                    )
                     return OrderResult(
                         success=False,
-                        error="No buy orders available in orderbook"
+                        error="SELL not supported in pure onchain mode. Enable --clob flag or wait for resolution to redeem."
                     )
 
-                # Find best buy order (highest price)
-                best_order = max(buy_orders, key=lambda o: o.price)
-
-                # Check if price is acceptable
-                if best_order.price < price * 0.95:  # Allow 5% slippage
+                # CLOB mode: Use CLOB API with EIP-712 signing
+                if not self.clob_client:
                     return OrderResult(
                         success=False,
-                        error=f"Best buy order price {best_order.price:.3f} too low (wanted {price:.3f})"
+                        error="CLOB client not initialized. Check py-clob-client installation."
                     )
 
-                # Determine how much we can fill
-                fill_size = min(size, best_order.size)
+                logger.info(f"📋 CLOB SELL: {size:.2f} shares @ {price:.3f}")
 
-                logger.info(
-                    f"📋 Filling buy order @ {best_order.price:.3f} for {fill_size:.2f} tokens",
-                    order_id=best_order.order_id[:16],
-                )
-
-                # Fill the order via CTF Exchange
-                result = await self._fill_order_onchain(
-                    order=best_order,
-                    fill_amount=fill_size,
-                    token_id=token_id,
-                )
-
-                if result.success:
-                    logger.info(
-                        f"✅ Sold {fill_size:.2f} tokens @ {best_order.price:.3f}",
-                        tx_hash=result.tx_hash[:16] if result.tx_hash else None,
-                        usdc_received=fill_size * best_order.price,
+                try:
+                    # Create order via py-clob-client (handles EIP-712 signing)
+                    order_args = OrderArgs(
+                        token_id=token_id,
+                        price=price,
+                        size=size,
+                        side=CLOB_SELL
                     )
 
-                return result
+                    # Sign order (EIP-712)
+                    signed_order = self.clob_client.create_order(order_args)
+
+                    # Post to CLOB
+                    response = self.clob_client.post_order(signed_order, OrderType.GTC)
+
+                    order_id = response.get("orderID")
+                    if not order_id:
+                        return OrderResult(
+                            success=False,
+                            error=f"CLOB order failed: {response}"
+                        )
+
+                    logger.info(f"✅ CLOB SELL order placed", order_id=order_id[:16])
+
+                    return OrderResult(
+                        success=True,
+                        order_id=order_id,
+                        filled_amount=size,
+                        avg_price=price
+                    )
+
+                except Exception as e:
+                    logger.error(f"CLOB SELL error: {e}")
+                    return OrderResult(
+                        success=False,
+                        error=f"CLOB order failed: {str(e)}"
+                    )
 
             else:
                 return OrderResult(
@@ -994,38 +1094,83 @@ class OnchainOrderExecutor:
 
     async def wait_for_fill(self, order_id: str, timeout: int = 30) -> bool:
         """
-        Wait for order fill (compatible interface with LiveExecutor).
+        Wait for order fill.
 
-        For onchain execution, orders are typically filled immediately
-        via position splitting or direct contract interaction.
+        For onchain execution, orders are filled immediately.
+        For CLOB mode, polls the CLOB API for fill status.
 
         Args:
-            order_id: Order ID (not used in onchain mode)
-            timeout: Timeout in seconds (not used)
+            order_id: Order ID
+            timeout: Timeout in seconds
 
         Returns:
-            True (assumes immediate fill)
+            True if filled, False otherwise
         """
-        # In onchain mode, execution is typically immediate
-        # No need to wait for fills like with CLOB orderbook
-        logger.debug("Onchain: Order filled immediately")
-        return True
+        if not self.use_clob:
+            # Onchain mode: immediate fill
+            logger.debug("Onchain: Order filled immediately")
+            return True
+
+        # CLOB mode: poll for fill
+        if not self.clob_client:
+            logger.error("CLOB client not available")
+            return False
+
+        start_time = time.time()
+        poll_interval = 2  # seconds
+
+        while time.time() - start_time < timeout:
+            try:
+                # Check order status
+                order_info = self.clob_client.get_order(order_id)
+                status = order_info.get("status", "").upper()
+
+                if status == "MATCHED":
+                    logger.info(f"Order filled", order_id=order_id[:16])
+                    return True
+                elif status in ["CANCELLED", "EXPIRED", "FAILED"]:
+                    logger.warning(f"Order {status}", order_id=order_id[:16])
+                    return False
+
+                await asyncio.sleep(poll_interval)
+
+            except Exception as e:
+                logger.error(f"Poll error: {e}")
+                await asyncio.sleep(poll_interval)
+
+        logger.warning(f"Order fill timeout", order_id=order_id[:16])
+        return False
 
     async def cancel_order(self, order_id: str) -> bool:
         """
-        Cancel an order (compatible interface with LiveExecutor).
+        Cancel an order.
 
-        For onchain execution, there's no order to cancel as
-        execution is typically immediate.
+        For onchain execution, there's no order to cancel (immediate fill).
+        For CLOB mode, cancels the order via CLOB API.
 
         Args:
-            order_id: Order ID (not used)
+            order_id: Order ID
 
         Returns:
-            True
+            True if successful
         """
-        logger.debug("Onchain: No order to cancel (immediate execution)")
-        return True
+        if not self.use_clob:
+            # Onchain mode: no order to cancel
+            logger.debug("Onchain: No order to cancel (immediate execution)")
+            return True
+
+        # CLOB mode: cancel via API
+        if not self.clob_client:
+            logger.error("CLOB client not available")
+            return False
+
+        try:
+            self.clob_client.cancel(order_id)
+            logger.info(f"Order cancelled", order_id=order_id[:16])
+            return True
+        except Exception as e:
+            logger.error(f"Cancel failed: {e}")
+            return False
 
     async def close_position(
         self,

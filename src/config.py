@@ -27,6 +27,7 @@ class RiskConfig:
 @dataclass
 class ExecutionConfig:
     """Execution settings."""
+    use_clob: bool = False  # Use CLOB API for all operations (vs onchain split/merge)
     order_timeout_seconds: int = 30
     poll_interval_seconds: int = 5
     use_public_rpc_for_redeem: bool = True
@@ -136,6 +137,7 @@ def load_config(
         if "execution" in yaml_data:
             exec_data = yaml_data["execution"]
             config.execution = ExecutionConfig(
+                use_clob=exec_data.get("use_clob", False),
                 order_timeout_seconds=exec_data.get("order_timeout_seconds", 30),
                 poll_interval_seconds=exec_data.get("poll_interval_seconds", 5),
                 use_public_rpc_for_redeem=exec_data.get("use_public_rpc_for_redeem", True),
@@ -171,6 +173,8 @@ def load_config(
     if cli_args:
         if cli_args.get("live"):
             config.trading_mode = "live"
+        if cli_args.get("clob"):
+            config.execution.use_clob = True
         if cli_args.get("model"):
             config.model.path = cli_args["model"]
         if cli_args.get("min_confidence") is not None:

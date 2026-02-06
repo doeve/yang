@@ -20,15 +20,20 @@ risk:
 
 # Execution Settings
 execution:
+  # Use CLOB API for all operations (BUY and SELL)
+  # true  - Use CLOB API for both entry and exit (~2% fees, full functionality)
+  # false - Use onchain split for entry (free), hold until resolution for exit (free)
+  use_clob: false
+
   # Order timeout in seconds (cancel unfilled orders after this)
   order_timeout_seconds: 30
-  
+
   # Polling interval for trade confirmation (seconds)
   poll_interval_seconds: 5
-  
+
   # Use public RPC for redemption (more reliable)
   use_public_rpc_for_redeem: true
-  
+
   # Public RPC URL (fallback for redemption)
   public_rpc_url: "https://polygon-rpc.com"
 

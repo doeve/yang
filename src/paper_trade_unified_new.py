@@ -376,6 +376,7 @@ class UnifiedPaperTrader:
                     private_key=self.trading_config.eth_private_key,
                     public_rpc_url=self.trading_config.public_rpc_url,
                     use_public_rpc=self.trading_config.execution.use_public_rpc_for_redeem,
+                    use_clob=self.trading_config.execution.use_clob,
                     socks5_proxy=self.trading_config.socks5_proxy,
                 )
 
@@ -413,6 +414,7 @@ class UnifiedPaperTrader:
                     private_key=self.trading_config.eth_private_key,
                     public_rpc_url=self.trading_config.public_rpc_url,
                     use_public_rpc=self.trading_config.execution.use_public_rpc_for_redeem,
+                    use_clob=self.trading_config.execution.use_clob,
                     socks5_proxy=self.trading_config.socks5_proxy,
                 )
                 await self.onchain_executor.connect()
@@ -1303,6 +1305,7 @@ class UnifiedPaperTrader:
                         private_key=self.trading_config.eth_private_key,
                         public_rpc_url=self.trading_config.public_rpc_url,
                         use_public_rpc=self.trading_config.execution.use_public_rpc_for_redeem,
+                        use_clob=self.trading_config.execution.use_clob,
                         socks5_proxy=self.trading_config.socks5_proxy,
                     )
                     if await self.executor.connect():
@@ -1321,6 +1324,7 @@ class UnifiedPaperTrader:
                         private_key=self.trading_config.eth_private_key,
                         public_rpc_url=self.trading_config.public_rpc_url,
                         use_public_rpc=self.trading_config.execution.use_public_rpc_for_redeem,
+                        use_clob=self.trading_config.execution.use_clob,
                         socks5_proxy=self.trading_config.socks5_proxy,
                     )
                     await self.onchain_executor.connect()
@@ -1413,6 +1417,10 @@ class UnifiedPaperTrader:
 
             # Timing
             menu_table.add_row("8", "Refresh Interval (sec)", f"{self.config.refresh_seconds}")
+
+            # Execution
+            use_clob_str = "✓ Enabled" if (self.trading_config and self.trading_config.execution.use_clob) else "✗ Disabled"
+            menu_table.add_row("9", "Use CLOB API (vs onchain)", use_clob_str)
 
             # Actions
             menu_table.add_row("", "", "")
@@ -1508,6 +1516,23 @@ class UnifiedPaperTrader:
                     import time
                     time.sleep(0.3)
 
+                elif choice == "9":
+                    if not self.trading_config:
+                        console.print("[red]No trading config available[/red]")
+                        continue
+                    current_val = self.trading_config.execution.use_clob
+                    new_val = Confirm.ask(
+                        f"Use CLOB API for all operations?\n"
+                        f"  • Enabled: BUY and SELL via CLOB API (~2% fees, full functionality)\n"
+                        f"  • Disabled: BUY via onchain split (free), hold until resolution for exit (free)\n"
+                        f"Current: {'Enabled' if current_val else 'Disabled'}",
+                        default=current_val
+                    )
+                    self.trading_config.execution.use_clob = new_val
+                    console.print(f"[green]✓ Updated to {'Enabled' if new_val else 'Disabled'}[/green]")
+                    import time
+                    time.sleep(0.5)
+
                 else:
                     console.print("[red]Invalid option[/red]")
                     import time
@@ -1569,8 +1594,9 @@ class UnifiedPaperTrader:
                 },
             }
 
-            # Add RPC URLs if trading_config exists
+            # Add RPC URLs and execution settings if trading_config exists
             if self.trading_config:
+                config_data["execution"]["use_clob"] = self.trading_config.execution.use_clob
                 config_data["execution"]["public_rpc_url"] = self.trading_config.public_rpc_url
                 config_data["execution"]["use_public_rpc_for_redeem"] = self.trading_config.execution.use_public_rpc_for_redeem
 
@@ -3410,6 +3436,7 @@ async def main():
 
     # Live trading mode
     parser.add_argument("--live", action="store_true", help="Enable live trading mode (requires .env credentials)")
+    parser.add_argument("--clob", action="store_true", help="Use CLOB API for all operations (BUY and SELL) instead of onchain split/merge")
 
     # Backtest mode
     parser.add_argument("--backtest", action="store_true", help="Run backtest instead of live trading")
@@ -3453,6 +3480,7 @@ async def main():
         # Load trading config from file + env + CLI
         cli_args = {
             "live": args.live,
+            "clob": args.clob,
             "model": args.model,
             "min_confidence": args.min_confidence,
             "min_return": args.min_return,

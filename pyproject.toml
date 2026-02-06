@@ -46,6 +46,7 @@ dependencies = [
     # Web3 / Blockchain
     "web3>=6.0.0",
     "eth-account>=0.10.0",
+    "py-clob-client>=0.25.0",  # Polymarket CLOB API with EIP-712 signing
     
     # Technical Analysis
     "ta>=0.11.0",
