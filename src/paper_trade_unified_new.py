@@ -898,7 +898,8 @@ class UnifiedPaperTrader:
         self.state.ticks_held = 0
         self.state.max_pnl_seen = 0.0
 
-        dollar_size = position_size * self.state.balance
+        # Use correct balance for display (already calculated above)
+        dollar_size = position_size * balance_to_use
 
         console.print(
             f"[green]ENTRY: {side.upper()} @ {price:.3f} | "
@@ -2414,8 +2415,9 @@ class UnifiedPaperTrader:
                 else self.state.last_no_price
             )
             unrealized_pnl_pct = (current_price - self.state.entry_price) / self.state.entry_price
-            # Calculate absolute unrealized PnL
-            invested = self.state.position_size * self.state.balance
+            # Calculate absolute unrealized PnL (use wallet_balance in live mode)
+            balance_for_display = self.state.wallet_balance if self.is_live_mode else self.state.balance
+            invested = self.state.position_size * balance_for_display
             shares = invested / self.state.entry_price if self.state.entry_price > 0 else 0
             unrealized_pnl_abs = shares * (current_price - self.state.entry_price)
             pnl_color = "green" if unrealized_pnl_pct > 0 else "red"

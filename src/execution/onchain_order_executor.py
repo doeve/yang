@@ -23,21 +23,44 @@ from eth_account import Account
 
 logger = structlog.get_logger(__name__)
 
-# Import py-clob-client for CLOB trading
-try:
-    from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs, OrderType
-    from py_clob_client.order_builder.constants import BUY as CLOB_BUY, SELL as CLOB_SELL
-    CLOB_AVAILABLE = True
-except ImportError:
-    logger.warning("py-clob-client not installed. CLOB trading will be unavailable. Install with: pip install py-clob-client")
-    CLOB_AVAILABLE = False
+# DO NOT import py-clob-client here - must import AFTER monkey-patching httpx
+# Imports are done in _ensure_clob_imports() after proxy is configured
+CLOB_AVAILABLE = False
+ClobClient = None
+OrderArgs = None
+OrderType = None
+CLOB_BUY = None
+CLOB_SELL = None
 
 
 # Monkey-patch httpx to support SOCKS proxy for py-clob-client
 _original_async_client_init = None
 _original_sync_client_init = None
 _global_socks_proxy = None
+
+def _ensure_clob_imports():
+    """Import py-clob-client modules (must be called AFTER monkey-patching)."""
+    global CLOB_AVAILABLE, ClobClient, OrderArgs, OrderType, CLOB_BUY, CLOB_SELL
+
+    if CLOB_AVAILABLE:
+        return  # Already imported
+
+    try:
+        from py_clob_client.client import ClobClient as _ClobClient
+        from py_clob_client.clob_types import OrderArgs as _OrderArgs, OrderType as _OrderType
+        from py_clob_client.order_builder.constants import BUY as _CLOB_BUY, SELL as _CLOB_SELL
+
+        ClobClient = _ClobClient
+        OrderArgs = _OrderArgs
+        OrderType = _OrderType
+        CLOB_BUY = _CLOB_BUY
+        CLOB_SELL = _CLOB_SELL
+        CLOB_AVAILABLE = True
+
+        logger.info("py-clob-client imported successfully (after proxy patch)")
+    except ImportError as e:
+        logger.warning(f"py-clob-client not installed: {e}")
+        logger.info("Install with: pip install py-clob-client")
 
 def _patch_httpx_with_socks(socks_proxy: str):
     """Monkey-patch both httpx.AsyncClient and httpx.Client to use SOCKS proxy."""
@@ -358,15 +381,21 @@ class OnchainOrderExecutor:
                 self.http_client = httpx.AsyncClient(timeout=30)
 
             # Initialize CLOB client if use_clob is enabled
-            if self.use_clob and CLOB_AVAILABLE:
+            if self.use_clob:
                 try:
                     logger.info("Initializing CLOB client for API trading...")
 
-                    # Monkey-patch httpx with SOCKS proxy BEFORE creating CLOB client
+                    # Step 1: Monkey-patch httpx with SOCKS proxy BEFORE importing py-clob-client
                     if self.socks5_proxy:
                         _patch_httpx_with_socks(self.socks5_proxy)
 
-                    # Create CLOB client (will now use proxied httpx)
+                    # Step 2: Import py-clob-client AFTER monkey-patch is applied
+                    _ensure_clob_imports()
+
+                    if not CLOB_AVAILABLE:
+                        raise ImportError("py-clob-client not available")
+
+                    # Step 3: Create CLOB client (will now use proxied httpx)
                     self.clob_client = ClobClient(
                         host=self.clob_api_url,
                         key=self.private_key,
