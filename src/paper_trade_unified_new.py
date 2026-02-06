@@ -352,39 +352,83 @@ class UnifiedPaperTrader:
 
         # Initialize live trading components if in live mode
         if self.is_live_mode and self.trading_config:
+            logger.info(
+                "initializing_live_mode",
+                mode="LIVE",
+                polygon_rpc=self.trading_config.polygon_rpc_url,
+                public_rpc=self.trading_config.public_rpc_url,
+                use_public_rpc=self.trading_config.execution.use_public_rpc_for_redeem,
+                has_socks5=bool(self.trading_config.socks5_proxy)
+            )
             console.print("[bold red]🔴 LIVE TRADING MODE (ONCHAIN - NO POLYMARKET FEES)[/bold red]")
 
             # Initialize onchain order executor (for fee-free trading)
-            self.executor = OnchainOrderExecutor(
-                local_rpc_url=self.trading_config.polygon_rpc_url,
-                private_key=self.trading_config.eth_private_key,
-                public_rpc_url=self.trading_config.public_rpc_url,
-                use_public_rpc=self.trading_config.execution.use_public_rpc_for_redeem,
-                socks5_proxy=self.trading_config.socks5_proxy,
-            )
-            if await self.executor.connect():
-                # Ensure approvals for trading
-                await self.executor.ensure_approvals()
+            try:
+                self.executor = OnchainOrderExecutor(
+                    local_rpc_url=self.trading_config.polygon_rpc_url,
+                    private_key=self.trading_config.eth_private_key,
+                    public_rpc_url=self.trading_config.public_rpc_url,
+                    use_public_rpc=self.trading_config.execution.use_public_rpc_for_redeem,
+                    socks5_proxy=self.trading_config.socks5_proxy,
+                )
 
-                # Update wallet balance
-                self.state.wallet_balance = await self.executor.get_usdc_balance()
-                console.print(f"  [green]Wallet connected: ${self.state.wallet_balance:.2f} USDC[/green]")
-                console.print(f"  [cyan]Using onchain execution (bypassing CLOB fees)[/cyan]")
-            else:
-                console.print("  [red]Failed to connect executor, falling back to paper mode[/red]")
+                logger.info("connecting_order_executor", mode="LIVE")
+                if await self.executor.connect():
+                    logger.info("order_executor_connected", mode="LIVE")
+
+                    # Ensure approvals for trading
+                    logger.info("ensuring_token_approvals", mode="LIVE")
+                    await self.executor.ensure_approvals()
+
+                    # Update wallet balance
+                    self.state.wallet_balance = await self.executor.get_usdc_balance()
+                    logger.info(
+                        "live_mode_initialized",
+                        mode="LIVE",
+                        wallet_balance=self.state.wallet_balance,
+                        executor_type="OnchainOrderExecutor"
+                    )
+                    console.print(f"  [green]Wallet connected: ${self.state.wallet_balance:.2f} USDC[/green]")
+                    console.print(f"  [cyan]Using onchain execution (bypassing CLOB fees)[/cyan]")
+                else:
+                    logger.error(
+                        "order_executor_connection_failed",
+                        mode="LIVE",
+                        reason="Failed to connect to blockchain"
+                    )
+                    console.print("  [red]Failed to connect executor, falling back to paper mode[/red]")
+                    self.config.trading_mode = "paper"
+
+                # Initialize onchain executor for redemption
+                logger.info("connecting_redemption_executor", mode="LIVE")
+                self.onchain_executor = OnchainExecutor(
+                    local_rpc_url=self.trading_config.polygon_rpc_url,
+                    private_key=self.trading_config.eth_private_key,
+                    public_rpc_url=self.trading_config.public_rpc_url,
+                    use_public_rpc=self.trading_config.execution.use_public_rpc_for_redeem,
+                    socks5_proxy=self.trading_config.socks5_proxy,
+                )
+                await self.onchain_executor.connect()
+                logger.info("redemption_executor_connected", mode="LIVE")
+                console.print(f"  [cyan]Auto-redemption enabled[/cyan]")
+
+            except Exception as e:
+                logger.error(
+                    "live_mode_initialization_error",
+                    mode="LIVE",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    reason="Failed to initialize live trading components"
+                )
+                import traceback
+                logger.error(
+                    "live_mode_init_traceback",
+                    traceback=traceback.format_exc()
+                )
+                console.print(f"  [red]Failed to initialize live mode: {e}[/red]")
                 self.config.trading_mode = "paper"
-
-            # Initialize onchain executor for redemption
-            self.onchain_executor = OnchainExecutor(
-                local_rpc_url=self.trading_config.polygon_rpc_url,
-                private_key=self.trading_config.eth_private_key,
-                public_rpc_url=self.trading_config.public_rpc_url,
-                use_public_rpc=self.trading_config.execution.use_public_rpc_for_redeem,
-                socks5_proxy=self.trading_config.socks5_proxy,
-            )
-            await self.onchain_executor.connect()
-            console.print(f"  [cyan]Auto-redemption enabled[/cyan]")
         else:
+            logger.info("initializing_paper_mode", mode="PAPER")
             console.print("[green]📝 PAPER TRADING MODE[/green]")
 
     def get_current_candle_timestamp(self) -> int:
@@ -428,7 +472,13 @@ class UnifiedPaperTrader:
                             console.print(f"  [dim]Condition ID: {self.state.condition_id[:16]}...[/dim]")
                         return True
         except Exception as e:
-            logger.error(f"Market discovery error: {e}")
+            logger.error(
+                "market_discovery_error",
+                timestamp=timestamp,
+                error=str(e),
+                error_type=type(e).__name__,
+                reason="Failed to discover active market"
+            )
         return False
 
     async def fetch_polymarket_prices(self) -> Optional[Dict[str, float]]:
@@ -471,7 +521,14 @@ class UnifiedPaperTrader:
                 return {"yes_price": yes_price, "no_price": 1.0 - yes_price}
 
         except Exception as e:
-            logger.error(f"Polymarket fetch error: {e}")
+            logger.error(
+                "polymarket_price_fetch_error",
+                yes_id=self.state.active_yes_id,
+                no_id=self.state.active_no_id,
+                error=str(e),
+                error_type=type(e).__name__,
+                reason="Failed to fetch Polymarket prices"
+            )
         return None
 
     async def fetch_btc_price(self) -> Optional[float]:
@@ -485,7 +542,12 @@ class UnifiedPaperTrader:
                 data = response.json()
                 return float(data["price"])
         except Exception as e:
-            logger.error(f"Binance fetch error: {e}")
+            logger.error(
+                "binance_price_fetch_error",
+                error=str(e),
+                error_type=type(e).__name__,
+                reason="Failed to fetch BTC price from Binance"
+            )
         return None
 
     async def fetch_btc_candle_open(self) -> Optional[float]:
@@ -618,6 +680,16 @@ class UnifiedPaperTrader:
         # Risk check: pause trading if daily loss limit hit
         if self.loss_tracker.is_limit_hit(self.config.max_daily_loss_pct):
             if action in [Action.BUY_YES, Action.BUY_NO]:
+                mode = "LIVE" if self.is_live_mode else "PAPER"
+                logger.warning(
+                    "loss_limit_hit_blocking_entry",
+                    mode=mode,
+                    action=Action(action).name,
+                    daily_pnl=self.loss_tracker.get_daily_pnl(),
+                    daily_pnl_pct=self.loss_tracker.get_daily_pnl_pct(),
+                    max_loss_pct=self.config.max_daily_loss_pct,
+                    reason="24H loss limit exceeded, blocking new positions"
+                )
                 # Don't open new positions, but allow exits
                 return
 
@@ -681,12 +753,29 @@ class UnifiedPaperTrader:
 
     async def execute_entry(self, side: str, position_size: float, model_output: Dict):
         """Execute position entry."""
+        mode = "LIVE" if self.is_live_mode else "PAPER"
+        logger.info(
+            f"execute_entry",
+            mode=mode,
+            side=side,
+            position_size=position_size,
+            balance=self.state.balance,
+            expected_return=model_output.get('expected_return'),
+            confidence=model_output.get('confidence')
+        )
+
         price = self.state.last_yes_price if side == "yes" else self.state.last_no_price
         dollar_size = position_size * self.state.balance
-        
+
         # Calculate quantity (shares) = investment / price
         if price <= 0:
-            logger.error("Price is 0, cannot enter")
+            logger.error(
+                "execute_entry_failed_zero_price",
+                mode=mode,
+                side=side,
+                price=price,
+                reason="Price is zero or negative"
+            )
             return
         quantity = dollar_size / price
 
@@ -695,34 +784,99 @@ class UnifiedPaperTrader:
             # Determine token ID
             token_id = self.state.active_yes_id if side == "yes" else self.state.active_no_id
             if not token_id:
-                logger.error("No active token ID for entry")
+                logger.error(
+                    "execute_entry_failed_no_token",
+                    mode=mode,
+                    side=side,
+                    yes_id=self.state.active_yes_id,
+                    no_id=self.state.active_no_id,
+                    reason="No active token ID available"
+                )
                 return
 
-            console.print(f"[bold yellow]Executing LIVE BUY {side.upper()}: ${dollar_size:.2f} ({quantity:.1f} shares) @ {price:.3f}[/bold yellow]")
-            
-            # Place order
-            result = await self.executor.place_order(
+            logger.info(
+                "live_order_placing",
+                mode="LIVE",
+                side=side,
                 token_id=token_id,
-                side="BUY",
-                size=quantity,
-                price=price
+                quantity=quantity,
+                price=price,
+                dollar_size=dollar_size
             )
-            
-            if not result.success:
-                console.print(f"[bold red]Order Execution Failed: {result.error}[/bold red]")
+            console.print(f"[bold yellow]Executing LIVE BUY {side.upper()}: ${dollar_size:.2f} ({quantity:.1f} shares) @ {price:.3f}[/bold yellow]")
+
+            # Place order
+            try:
+                result = await self.executor.place_order(
+                    token_id=token_id,
+                    side="BUY",
+                    size=quantity,
+                    price=price
+                )
+
+                if not result.success:
+                    logger.error(
+                        "live_order_failed",
+                        mode="LIVE",
+                        side=side,
+                        token_id=token_id,
+                        error=result.error,
+                        reason="Order placement failed"
+                    )
+                    console.print(f"[bold red]Order Execution Failed: {result.error}[/bold red]")
+                    return
+
+                logger.info(
+                    "live_order_placed",
+                    mode="LIVE",
+                    side=side,
+                    order_id=result.order_id,
+                    token_id=token_id
+                )
+
+                # Wait for fill (optional but recommended)
+                if result.order_id:
+                    filled = await self.executor.wait_for_fill(result.order_id)
+                    if not filled:
+                        logger.warning(
+                            "live_order_not_filled",
+                            mode="LIVE",
+                            side=side,
+                            order_id=result.order_id,
+                            reason="Order not filled within timeout"
+                        )
+                        console.print("[red]Order not filled within timeout[/red]")
+                    else:
+                        logger.info(
+                            "live_order_filled",
+                            mode="LIVE",
+                            side=side,
+                            order_id=result.order_id
+                        )
+
+                # Update wallet balance
+                old_balance = self.state.wallet_balance
+                self.state.wallet_balance = await self.executor.get_usdc_balance()
+                logger.info(
+                    "wallet_balance_updated",
+                    mode="LIVE",
+                    old_balance=old_balance,
+                    new_balance=self.state.wallet_balance,
+                    change=self.state.wallet_balance - old_balance
+                )
+
+            except Exception as e:
+                logger.error(
+                    "live_order_exception",
+                    mode="LIVE",
+                    side=side,
+                    token_id=token_id,
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    reason="Exception during order execution"
+                )
+                console.print(f"[bold red]Order Exception: {e}[/bold red]")
                 return
-            
-            # Wait for fill (optional but recommended)
-            if result.order_id:
-                filled = await self.executor.wait_for_fill(result.order_id)
-                if not filled:
-                    console.print("[red]Order not filled within timeout[/red]")
-                    # In real logic you might cancel here or keep tracking. 
-                    # For now we assume partial fill or proceed to track it.
-                    # Upgrading state anyway to track intent, but warning user.
-            
-            # Update wallet balance
-            self.state.wallet_balance = await self.executor.get_usdc_balance()
 
         self.state.position_side = side
         self.state.position_size = position_size
@@ -753,7 +907,15 @@ class UnifiedPaperTrader:
 
     async def execute_exit(self, reason: str = "manual"):
         """Execute position exit."""
+        mode = "LIVE" if self.is_live_mode else "PAPER"
+
         if self.state.position_side is None:
+            logger.warning(
+                "execute_exit_no_position",
+                mode=mode,
+                reason=reason,
+                message="Exit called but no position open"
+            )
             return
 
         side = self.state.position_side
@@ -765,49 +927,153 @@ class UnifiedPaperTrader:
 
         invested = self.state.position_size * self.state.balance
         shares = invested / entry_price if entry_price > 0 else 0
-        
+
+        logger.info(
+            "execute_exit",
+            mode=mode,
+            side=side,
+            reason=reason,
+            entry_price=entry_price,
+            current_price=current_price,
+            shares=shares,
+            invested=invested,
+            ticks_held=self.state.ticks_held
+        )
+
         # Live Execution
         if self.is_live_mode and self.executor:
             # Determine token ID
             token_id = self.state.active_yes_id if side == "yes" else self.state.active_no_id
             if token_id:
-                console.print(f"[bold yellow]Executing LIVE SELL {side.upper()}: {shares:.1f} shares @ {current_price:.3f}[/bold yellow]")
-                
-                # Place order
-                result = await self.executor.place_order(
+                logger.info(
+                    "live_exit_placing",
+                    mode="LIVE",
+                    side=side,
                     token_id=token_id,
-                    side="SELL",
-                    size=shares,
-                    price=current_price
+                    shares=shares,
+                    price=current_price,
+                    reason=reason
                 )
-                
-                if not result.success:
-                    console.print(f"[bold red]Exit Order Failed: {result.error}[/bold red]")
-                    # For exit, we might want to retry or mark as stuck?
-                    # For now, we return and don't clear the position so we try again next tick
+                console.print(f"[bold yellow]Executing LIVE SELL {side.upper()}: {shares:.1f} shares @ {current_price:.3f}[/bold yellow]")
+
+                try:
+                    # Place order
+                    result = await self.executor.place_order(
+                        token_id=token_id,
+                        side="SELL",
+                        size=shares,
+                        price=current_price
+                    )
+
+                    if not result.success:
+                        logger.error(
+                            "live_exit_failed",
+                            mode="LIVE",
+                            side=side,
+                            token_id=token_id,
+                            error=result.error,
+                            reason=reason,
+                            message="Exit order failed, position still open"
+                        )
+                        console.print(f"[bold red]Exit Order Failed: {result.error}[/bold red]")
+                        # For exit, we might want to retry or mark as stuck?
+                        # For now, we return and don't clear the position so we try again next tick
+                        return
+
+                    logger.info(
+                        "live_exit_placed",
+                        mode="LIVE",
+                        side=side,
+                        order_id=result.order_id,
+                        token_id=token_id
+                    )
+
+                    # Wait for fill
+                    if result.order_id:
+                        filled = await self.executor.wait_for_fill(result.order_id)
+                        if not filled:
+                            logger.warning(
+                                "live_exit_not_filled",
+                                mode="LIVE",
+                                side=side,
+                                order_id=result.order_id,
+                                reason="Exit order not filled within timeout"
+                            )
+                        else:
+                            logger.info(
+                                "live_exit_filled",
+                                mode="LIVE",
+                                side=side,
+                                order_id=result.order_id
+                            )
+
+                    # Update wallet balance
+                    old_balance = self.state.wallet_balance
+                    self.state.wallet_balance = await self.executor.get_usdc_balance()
+                    logger.info(
+                        "wallet_balance_updated_exit",
+                        mode="LIVE",
+                        old_balance=old_balance,
+                        new_balance=self.state.wallet_balance,
+                        change=self.state.wallet_balance - old_balance
+                    )
+
+                except Exception as e:
+                    logger.error(
+                        "live_exit_exception",
+                        mode="LIVE",
+                        side=side,
+                        token_id=token_id,
+                        error=str(e),
+                        error_type=type(e).__name__,
+                        reason="Exception during exit execution",
+                        position_still_open=True
+                    )
+                    console.print(f"[bold red]Exit Exception: {e}[/bold red]")
                     return
-                
-                # Wait for fill
-                if result.order_id:
-                    await self.executor.wait_for_fill(result.order_id)
-                
-                # Update wallet balance
-                self.state.wallet_balance = await self.executor.get_usdc_balance()
+            else:
+                logger.error(
+                    "live_exit_no_token",
+                    mode="LIVE",
+                    side=side,
+                    yes_id=self.state.active_yes_id,
+                    no_id=self.state.active_no_id,
+                    reason="No token ID available for exit"
+                )
 
         exit_value = shares * current_price
         pnl = exit_value - invested
 
+        old_balance = self.state.balance
         self.state.balance += pnl
         self.state.total_pnl += pnl
 
         # Record in loss tracker
         self.loss_tracker.record_trade(pnl)
+        old_daily_pnl = self.state.daily_pnl
         self.state.daily_pnl = self.loss_tracker.get_daily_pnl()
 
         if pnl > 0:
             self.state.wins += 1
         else:
             self.state.losses += 1
+
+        logger.info(
+            "trade_pnl_calculated",
+            mode=mode,
+            side=side,
+            reason=reason,
+            pnl=pnl,
+            pnl_pct=(pnl / invested * 100) if invested > 0 else 0,
+            old_balance=old_balance,
+            new_balance=self.state.balance,
+            total_pnl=self.state.total_pnl,
+            old_24h_pnl=old_daily_pnl,
+            new_24h_pnl=self.state.daily_pnl,
+            wins=self.state.wins,
+            losses=self.state.losses,
+            win_rate=(self.state.wins / max(1, self.state.wins + self.state.losses))
+        )
 
         self.state.trades.append({
             "time": datetime.now(timezone.utc),
@@ -849,13 +1115,29 @@ class UnifiedPaperTrader:
 
     async def settle_position(self):
         """Settle position at candle end."""
+        mode = "LIVE" if self.is_live_mode else "PAPER"
+
         if not self.state.position_side:
+            logger.debug(
+                "settle_no_position",
+                mode=mode,
+                reason="No position to settle"
+            )
             return
 
         if not self.state.btc_open_price or not self.state.btc_current_price:
+            logger.error(
+                "settle_missing_btc_price",
+                mode=mode,
+                position_side=self.state.position_side,
+                btc_open=self.state.btc_open_price,
+                btc_current=self.state.btc_current_price,
+                reason="Missing BTC price data for settlement"
+            )
             return
 
         btc_move = self.state.btc_current_price - self.state.btc_open_price
+        btc_move_pct = (btc_move / self.state.btc_open_price) * 100 if self.state.btc_open_price > 0 else 0
         up_won = btc_move > 0
 
         # Settlement payout
@@ -870,17 +1152,52 @@ class UnifiedPaperTrader:
         returned_capital = shares * payout
         pnl = returned_capital - invested
 
+        logger.info(
+            "settlement_start",
+            mode=mode,
+            position_side=self.state.position_side,
+            btc_open=self.state.btc_open_price,
+            btc_close=self.state.btc_current_price,
+            btc_move=btc_move,
+            btc_move_pct=btc_move_pct,
+            up_won=up_won,
+            payout=payout,
+            invested=invested,
+            shares=shares,
+            returned=returned_capital,
+            pnl=pnl,
+            ticks_held=self.state.ticks_held
+        )
+
+        old_balance = self.state.balance
         self.state.balance += pnl
         self.state.total_pnl += pnl
 
         # Record in loss tracker
         self.loss_tracker.record_trade(pnl)
+        old_daily_pnl = self.state.daily_pnl
         self.state.daily_pnl = self.loss_tracker.get_daily_pnl()
 
         if pnl > 0:
             self.state.wins += 1
         else:
             self.state.losses += 1
+
+        logger.info(
+            "settlement_pnl",
+            mode=mode,
+            position_side=self.state.position_side,
+            won=pnl > 0,
+            pnl=pnl,
+            pnl_pct=(pnl / invested * 100) if invested > 0 else 0,
+            old_balance=old_balance,
+            new_balance=self.state.balance,
+            total_pnl=self.state.total_pnl,
+            old_24h_pnl=old_daily_pnl,
+            new_24h_pnl=self.state.daily_pnl,
+            wins=self.state.wins,
+            losses=self.state.losses
+        )
 
         self.state.trades.append({
             "time": datetime.now(timezone.utc),
@@ -919,13 +1236,29 @@ class UnifiedPaperTrader:
 
     async def switch_trading_mode(self):
         """Switch between paper and live trading mode."""
+        old_mode = "LIVE" if self.is_live_mode else "PAPER"
+        new_mode = "PAPER" if self.is_live_mode else "LIVE"
+
         # Don't allow switching if there's an open position
         if self.state.position_side is not None:
+            logger.warning(
+                "mode_switch_blocked",
+                old_mode=old_mode,
+                new_mode=new_mode,
+                position_side=self.state.position_side,
+                position_size=self.state.position_size,
+                reason="Cannot switch mode with open position"
+            )
             console.print("[bold red]❌ Cannot switch mode with open position! Exit position first.[/bold red]")
             return
 
-        old_mode = "live" if self.is_live_mode else "paper"
-        new_mode = "paper" if self.is_live_mode else "live"
+        logger.info(
+            "mode_switch_start",
+            old_mode=old_mode,
+            new_mode=new_mode,
+            balance=self.state.balance,
+            total_pnl=self.state.total_pnl
+        )
 
         console.print(f"[bold yellow]🔄 Switching from {old_mode.upper()} to {new_mode.upper()} mode...[/bold yellow]")
 
@@ -971,17 +1304,51 @@ class UnifiedPaperTrader:
                     )
                     await self.onchain_executor.connect()
 
+                logger.info(
+                    "mode_switch_success",
+                    old_mode="PAPER",
+                    new_mode="LIVE",
+                    wallet_balance=self.state.wallet_balance,
+                    executor_connected=self.executor is not None,
+                    onchain_executor_connected=self.onchain_executor is not None
+                )
                 console.print("[bold green]✅ Switched to LIVE mode[/bold green]")
 
             except ValueError as e:
+                logger.error(
+                    "mode_switch_config_error",
+                    old_mode="PAPER",
+                    new_mode="LIVE",
+                    error=str(e),
+                    error_type="ValueError",
+                    reason="Configuration error during mode switch"
+                )
                 console.print(f"[bold red]❌ Config error: {e}[/bold red]")
                 self.config.trading_mode = "paper"
                 return
             except Exception as e:
+                logger.error(
+                    "mode_switch_error",
+                    old_mode="PAPER",
+                    new_mode="LIVE",
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    reason="Failed to switch to live mode"
+                )
+                import traceback
+                logger.error(
+                    "mode_switch_traceback",
+                    traceback=traceback.format_exc()
+                )
                 console.print(f"[bold red]❌ Error switching to live mode: {e}[/bold red]")
                 self.config.trading_mode = "paper"
                 return
         else:
+            logger.info(
+                "mode_switch_success",
+                old_mode="LIVE",
+                new_mode="PAPER"
+            )
             console.print("[bold green]✅ Switched to PAPER mode[/bold green]")
 
     def reset_daily_limit(self):
@@ -1197,11 +1564,37 @@ class UnifiedPaperTrader:
         Uses force redemption (no resolution check) for speed.
         Silently fails if position can't be redeemed yet.
         """
-        if not self.is_live_mode or not self.onchain_executor:
+        if not self.is_live_mode:
+            logger.debug(
+                "redeem_skipped_paper_mode",
+                mode="PAPER",
+                reason="Redemption only available in live mode"
+            )
+            return
+
+        if not self.onchain_executor:
+            logger.error(
+                "redeem_skipped_no_executor",
+                mode="LIVE",
+                reason="Onchain executor not initialized"
+            )
             return
 
         if not self.state.condition_id:
+            logger.debug(
+                "redeem_skipped_no_condition",
+                mode="LIVE",
+                reason="No condition_id set"
+            )
             return
+
+        logger.info(
+            "redeem_attempt_start",
+            mode="LIVE",
+            condition_id=self.state.condition_id[:16] + "...",
+            yes_id=self.state.active_yes_id[:16] + "..." if self.state.active_yes_id else None,
+            no_id=self.state.active_no_id[:16] + "..." if self.state.active_no_id else None
+        )
 
         try:
             from web3 import Web3
@@ -1275,9 +1668,26 @@ class UnifiedPaperTrader:
             })
 
             # Sign and send
+            logger.info(
+                "redeem_tx_building",
+                mode="LIVE",
+                condition_id=self.state.condition_id[:16] + "...",
+                nonce=nonce,
+                max_fee=max_fee,
+                gas_limit=300000
+            )
             console.print(f"[dim]🔄 Attempting redemption...[/dim]")
+
             signed_tx = self.onchain_executor.account.sign_transaction(tx)
             tx_hash = self.onchain_executor.public_w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            tx_hash_hex = tx_hash.hex()
+
+            logger.info(
+                "redeem_tx_sent",
+                mode="LIVE",
+                tx_hash=tx_hash_hex,
+                condition_id=self.state.condition_id[:16] + "..."
+            )
 
             # Wait for receipt
             receipt = self.onchain_executor.public_w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
@@ -1287,19 +1697,57 @@ class UnifiedPaperTrader:
                 balance_after = usdc.functions.balanceOf(self.onchain_executor.address).call()
                 usdc_redeemed = (balance_after - balance_before) / 1e6
 
+                logger.info(
+                    "redeem_success",
+                    mode="LIVE",
+                    tx_hash=tx_hash_hex,
+                    condition_id=self.state.condition_id[:16] + "...",
+                    balance_before=balance_before / 1e6,
+                    balance_after=balance_after / 1e6,
+                    usdc_redeemed=usdc_redeemed,
+                    gas_used=receipt.get("gasUsed")
+                )
+
                 if usdc_redeemed > 0.01:  # Only show if meaningful amount
                     console.print(f"[green]✅ Redeemed ${usdc_redeemed:.2f} USDC[/green]")
                     # Update wallet balance
                     if self.executor:
+                        old_wallet = self.state.wallet_balance
                         self.state.wallet_balance = await self.executor.get_usdc_balance()
+                        logger.info(
+                            "wallet_balance_updated_redeem",
+                            mode="LIVE",
+                            old_balance=old_wallet,
+                            new_balance=self.state.wallet_balance,
+                            change=self.state.wallet_balance - old_wallet
+                        )
                 else:
-                    logger.debug("Position redeemed but payout was zero")
+                    logger.warning(
+                        "redeem_zero_payout",
+                        mode="LIVE",
+                        tx_hash=tx_hash_hex,
+                        condition_id=self.state.condition_id[:16] + "...",
+                        reason="Position redeemed but payout was zero"
+                    )
             else:
-                logger.debug("Redemption transaction reverted (position not ready)")
+                logger.warning(
+                    "redeem_tx_reverted",
+                    mode="LIVE",
+                    tx_hash=tx_hash_hex,
+                    condition_id=self.state.condition_id[:16] + "...",
+                    reason="Transaction reverted - position not ready for redemption"
+                )
 
         except Exception as e:
             # Silently fail - position probably not resolved yet
-            logger.debug(f"Immediate redeem skipped: {e}")
+            logger.debug(
+                "redeem_exception",
+                mode="LIVE",
+                condition_id=self.state.condition_id[:16] + "..." if self.state.condition_id else None,
+                error=str(e),
+                error_type=type(e).__name__,
+                reason="Exception during redemption attempt"
+            )
 
     async def auto_redeem(self):
         """
@@ -1751,7 +2199,24 @@ class UnifiedPaperTrader:
                 await asyncio.sleep(self.config.refresh_seconds)
 
             except Exception as e:
-                logger.error(f"Trading loop error: {e}")
+                mode = "LIVE" if self.is_live_mode else "PAPER"
+                logger.error(
+                    "trading_loop_error",
+                    mode=mode,
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    position_side=self.state.position_side,
+                    position_size=self.state.position_size,
+                    balance=self.state.balance,
+                    total_pnl=self.state.total_pnl,
+                    reason="Unexpected error in trading loop"
+                )
+                import traceback
+                logger.error(
+                    "trading_loop_traceback",
+                    mode=mode,
+                    traceback=traceback.format_exc()
+                )
                 await asyncio.sleep(5)
 
     def build_display(self) -> Panel:
@@ -1924,11 +2389,35 @@ class UnifiedPaperTrader:
 
     async def run(self):
         """Run paper trading with live display."""
+        mode = "LIVE" if self.is_live_mode else "PAPER"
+
+        logger.info(
+            "session_start",
+            mode=mode,
+            model_path=self.model_path,
+            initial_balance=self.state.balance,
+            starting_balance=self.config.initial_balance,
+            max_daily_loss_pct=self.config.max_daily_loss_pct,
+            base_position_size=self.config.base_position_size,
+            min_position_size=self.config.min_position_size,
+            max_position_size=self.config.max_position_size,
+            enable_ml_logging=self.config.enable_ml_logging
+        )
+
         self.load_model()
         self._setup_ml_logging()
         await self._setup_clients()
 
         self._running = True
+
+        logger.info(
+            "session_initialized",
+            mode=mode,
+            model_loaded=self.model is not None,
+            clients_setup=True,
+            executor_connected=self.executor is not None if self.is_live_mode else None,
+            onchain_executor_connected=self.onchain_executor is not None if self.is_live_mode else None
+        )
 
         # Start both trading and keyboard handler tasks
         trading_task = asyncio.create_task(self.trading_loop())
