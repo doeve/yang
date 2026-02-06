@@ -676,20 +676,41 @@ class OnchainOrderExecutor:
         )
 
     async def get_usdc_balance(self) -> float:
-        """Get USDC balance."""
-        if not self.local_w3 or not self.address:
+        """Get USDC balance (tries local RPC first, falls back to public)."""
+        if not self.address:
+            logger.error("get_usdc_balance: No address available")
             return 0.0
 
-        try:
-            usdc = self.local_w3.eth.contract(
-                address=Web3.to_checksum_address(CONTRACTS["USDC"]),
-                abi=ERC20_ABI,
-            )
-            balance_wei = usdc.functions.balanceOf(self.address).call()
-            return balance_wei / 1e6
-        except Exception as e:
-            logger.error(f"Failed to get USDC balance: {e}")
-            return 0.0
+        # Try local RPC first (faster, no rate limits)
+        if self.local_w3:
+            try:
+                usdc = self.local_w3.eth.contract(
+                    address=Web3.to_checksum_address(CONTRACTS["USDC"]),
+                    abi=ERC20_ABI,
+                )
+                balance_wei = usdc.functions.balanceOf(self.address).call()
+                balance = balance_wei / 1e6
+                logger.debug(f"USDC balance from local RPC: ${balance:.2f}")
+                return balance
+            except Exception as e:
+                logger.warning(f"Failed to get USDC balance from local RPC: {e}, trying public RPC...")
+
+        # Fallback to public RPC
+        if self.public_w3:
+            try:
+                usdc = self.public_w3.eth.contract(
+                    address=Web3.to_checksum_address(CONTRACTS["USDC"]),
+                    abi=ERC20_ABI,
+                )
+                balance_wei = usdc.functions.balanceOf(self.address).call()
+                balance = balance_wei / 1e6
+                logger.info(f"USDC balance from public RPC: ${balance:.2f}")
+                return balance
+            except Exception as e:
+                logger.error(f"Failed to get USDC balance from public RPC: {e}")
+
+        logger.error("No working RPC available for balance query")
+        return 0.0
 
     async def place_order(
         self,

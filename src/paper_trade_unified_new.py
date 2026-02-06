@@ -772,7 +772,10 @@ class UnifiedPaperTrader:
         )
 
         price = self.state.last_yes_price if side == "yes" else self.state.last_no_price
-        dollar_size = position_size * self.state.balance
+
+        # Use wallet balance in live mode, paper balance otherwise
+        balance_to_use = self.state.wallet_balance if self.is_live_mode else self.state.balance
+        dollar_size = position_size * balance_to_use
 
         # Calculate quantity (shares) = investment / price
         if price <= 0:
@@ -933,7 +936,9 @@ class UnifiedPaperTrader:
             else self.state.last_no_price
         )
 
-        invested = self.state.position_size * self.state.balance
+        # Use wallet balance in live mode for calculating invested amount
+        balance_for_calc = self.state.wallet_balance if self.is_live_mode else self.state.balance
+        invested = self.state.position_size * balance_for_calc
         shares = invested / entry_price if entry_price > 0 else 0
 
         logger.info(
@@ -1156,7 +1161,9 @@ class UnifiedPaperTrader:
         else:
             payout = 1.0 if not up_won else 0.0
 
-        invested = self.state.position_size * self.state.balance
+        # Use wallet balance in live mode for calculating invested amount
+        balance_for_calc = self.state.wallet_balance if self.is_live_mode else self.state.balance
+        invested = self.state.position_size * balance_for_calc
         shares = invested / self.state.entry_price
         returned_capital = shares * payout
         pnl = returned_capital - invested
@@ -1307,12 +1314,14 @@ class UnifiedPaperTrader:
                 # Initialize onchain executor for redemption if needed
                 if not self.onchain_executor:
                     self.onchain_executor = OnchainExecutor(
-                        rpc_url=self.trading_config.polygon_rpc_url,
+                        local_rpc_url=self.trading_config.polygon_rpc_url,
                         private_key=self.trading_config.eth_private_key,
                         public_rpc_url=self.trading_config.public_rpc_url,
                         use_public_rpc=self.trading_config.execution.use_public_rpc_for_redeem,
+                        socks5_proxy=self.trading_config.socks5_proxy,
                     )
                     await self.onchain_executor.connect()
+                    logger.info("redemption_executor_connected_on_switch", mode="LIVE")
 
                 logger.info(
                     "mode_switch_success",
