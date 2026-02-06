@@ -780,6 +780,17 @@ class UnifiedPaperTrader:
         balance_to_use = self.state.wallet_balance if self.is_live_mode else self.state.balance
         dollar_size = position_size * balance_to_use
 
+        # Enforce max position size limit
+        if dollar_size > self.config.max_position_size_usdc:
+            logger.warning(
+                "position_size_capped",
+                mode=mode,
+                calculated_size=dollar_size,
+                max_allowed=self.config.max_position_size_usdc,
+                message=f"Position size ${dollar_size:.2f} exceeds max ${self.config.max_position_size_usdc:.2f}, capping"
+            )
+            dollar_size = self.config.max_position_size_usdc
+
         # Calculate quantity (shares) = investment / price
         if price <= 0:
             logger.error(

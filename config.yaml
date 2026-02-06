@@ -13,7 +13,7 @@ risk:
   max_daily_loss_pct: 30.0
 
   # Maximum position size in USDC for a single trade
-  max_position_size_usdc: 100.0
+  max_position_size_usdc: 10.0
 
   # Minimum balance to maintain (don't trade below this)
   min_balance_usdc: 10.0

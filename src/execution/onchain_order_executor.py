@@ -708,22 +708,21 @@ class OnchainOrderExecutor:
                 return []
 
             # CLOB API returns "bids" and "asks", not "orders"
-            # - bids: buy orders (for selling into)
-            # - asks: sell orders (for buying from)
+            # - bids: buy orders
+            # - asks: sell orders
             # The API returns aggregated price levels, not individual orders with signatures
 
             orders = []
 
-            # Determine which side to parse based on what was requested
-            # Note: The API returns both bids and asks regardless of 'side' parameter
+            # The 'side' parameter indicates which side of the book to retrieve:
+            # - "BUY" side = bids (buy orders)
+            # - "SELL" side = asks (sell orders)
             if side.upper() == "BUY":
-                # For BUY orders, we want the asks (sell orders to buy from)
-                order_levels = data.get("asks", [])
-                order_side = "SELL"
-            else:
-                # For SELL orders, we want the bids (buy orders to sell into)
                 order_levels = data.get("bids", [])
                 order_side = "BUY"
+            else:
+                order_levels = data.get("asks", [])
+                order_side = "SELL"
 
             for level in order_levels:
                 # Each level is just {price, size} - aggregated orderbook
@@ -1212,9 +1211,8 @@ class OnchainOrderExecutor:
 
                     logger.info(f"📋 CLOB BUY (market order): {size:.2f} shares @ {market_price:.4f}")
 
+                    # Try placing order first (fast path)
                     try:
-                        # Create order via py-clob-client (handles EIP-712 signing)
-                        # Use market price for immediate fill
                         order_args = OrderArgs(
                             token_id=token_id,
                             price=market_price,
@@ -1222,10 +1220,7 @@ class OnchainOrderExecutor:
                             side=CLOB_BUY
                         )
 
-                        # Sign order (EIP-712)
                         signed_order = self.clob_client.create_order(order_args)
-
-                        # Post to CLOB
                         response = self.clob_client.post_order(signed_order, OrderType.GTC)
 
                         order_id = response.get("orderID")
@@ -1236,7 +1231,6 @@ class OnchainOrderExecutor:
                             )
 
                         logger.info(f"✅ CLOB BUY order placed", order_id=order_id[:16])
-
                         return OrderResult(
                             success=True,
                             order_id=order_id,
@@ -1245,10 +1239,62 @@ class OnchainOrderExecutor:
                         )
 
                     except Exception as e:
+                        error_msg = str(e)
                         logger.error(f"CLOB BUY error: {e}")
+
+                        # If balance error, check and retry with corrected amount
+                        if "balance" in error_msg.lower() or "allowance" in error_msg.lower():
+                            try:
+                                usdc_balance = await self.get_usdc_balance()
+                                usdc_needed = size * market_price
+
+                                logger.error(f"Balance check: ${usdc_balance:.2f} available, ${usdc_needed:.2f} needed")
+
+                                if usdc_balance < 5.0:  # Min order size
+                                    return OrderResult(
+                                        success=False,
+                                        error=f"Insufficient USDC: ${usdc_balance:.2f} (need ${usdc_needed:.2f})"
+                                    )
+
+                                # Retry with adjusted size
+                                adjusted_size = (usdc_balance * 0.99) / market_price
+                                logger.info(f"Retrying BUY with adjusted size: {size:.2f} → {adjusted_size:.2f} shares")
+
+                                order_args = OrderArgs(
+                                    token_id=token_id,
+                                    price=market_price,
+                                    size=adjusted_size,
+                                    side=CLOB_BUY
+                                )
+
+                                signed_order = self.clob_client.create_order(order_args)
+                                response = self.clob_client.post_order(signed_order, OrderType.GTC)
+
+                                order_id = response.get("orderID")
+                                if not order_id:
+                                    return OrderResult(
+                                        success=False,
+                                        error=f"CLOB retry failed: {response}"
+                                    )
+
+                                logger.info(f"✅ CLOB BUY retry successful", order_id=order_id[:16])
+                                return OrderResult(
+                                    success=True,
+                                    order_id=order_id,
+                                    filled_amount=adjusted_size,
+                                    avg_price=market_price
+                                )
+
+                            except Exception as retry_error:
+                                logger.error(f"Retry failed: {retry_error}")
+                                return OrderResult(
+                                    success=False,
+                                    error=f"CLOB order failed: {error_msg}"
+                                )
+
                         return OrderResult(
                             success=False,
-                            error=f"CLOB order failed: {str(e)}"
+                            error=f"CLOB order failed: {error_msg}"
                         )
 
                 # Onchain mode: Split USDC into YES/NO tokens (fee-free)
@@ -1332,6 +1378,29 @@ class OnchainOrderExecutor:
 
                 logger.info(f"📋 CLOB SELL (market order): {size:.2f} shares @ {market_price:.4f}")
 
+                # Verify token balance before selling
+                try:
+                    actual_balance = await self._get_token_balance(token_id)
+                    balance_shares = actual_balance / 1e6
+
+                    logger.info(f"Token balance check: {balance_shares:.2f} shares available, {size:.2f} requested")
+
+                    if actual_balance == 0:
+                        logger.error(f"Cannot sell: zero balance for token {token_id[:16]}...")
+                        return OrderResult(
+                            success=False,
+                            error=f"No tokens to sell (balance: 0, position tracking may be incorrect)"
+                        )
+
+                    if balance_shares < size:
+                        logger.warning(f"Insufficient token balance: have {balance_shares:.2f}, requested {size:.2f}")
+                        logger.info(f"Adjusting SELL size to available balance: {balance_shares:.2f}")
+                        size = balance_shares
+
+                except Exception as e:
+                    logger.warning(f"Could not verify token balance: {e}")
+                    # Continue anyway - let CLOB reject if insufficient
+
                 try:
                     # Create order via py-clob-client (handles EIP-712 signing)
                     # Use market price for immediate fill
@@ -1365,30 +1434,10 @@ class OnchainOrderExecutor:
                     )
 
                 except Exception as e:
-                    error_msg = str(e)
                     logger.error(f"CLOB SELL error: {e}")
-
-                    # If balance/allowance error, check actual balance for debugging
-                    if "balance" in error_msg.lower() or "allowance" in error_msg.lower():
-                        try:
-                            actual_balance = await self._get_token_balance(token_id)
-                            balance_shares = actual_balance / 1e6
-                            logger.error(
-                                f"Balance check after error: {balance_shares:.2f} shares "
-                                f"(attempted to sell {size:.2f})",
-                                token_id=token_id[:16] + "..."
-                            )
-
-                            if actual_balance == 0:
-                                error_msg = f"No tokens to sell - balance is 0 (position tracking may be incorrect)"
-                            elif balance_shares < size:
-                                error_msg = f"Insufficient balance: have {balance_shares:.2f}, tried to sell {size:.2f}"
-                        except Exception as balance_error:
-                            logger.warning(f"Could not check balance: {balance_error}")
-
                     return OrderResult(
                         success=False,
-                        error=f"CLOB order failed: {error_msg}"
+                        error=f"CLOB order failed: {str(e)}"
                     )
 
             else:
