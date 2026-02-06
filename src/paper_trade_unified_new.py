@@ -685,15 +685,16 @@ class UnifiedPaperTrader:
         time_remaining = self.get_time_remaining()
 
         # Risk check: pause trading if daily loss limit hit
-        if self.loss_tracker.is_limit_hit(self.config.max_daily_loss_pct):
+        mode_str = "live" if self.is_live_mode else "paper"
+        if self.loss_tracker.is_limit_hit(self.config.max_daily_loss_pct, mode=mode_str):
             if action in [Action.BUY_YES, Action.BUY_NO]:
                 mode = "LIVE" if self.is_live_mode else "PAPER"
                 logger.warning(
                     "loss_limit_hit_blocking_entry",
                     mode=mode,
                     action=Action(action).name,
-                    daily_pnl=self.loss_tracker.get_daily_pnl(),
-                    daily_pnl_pct=self.loss_tracker.get_daily_pnl_pct(),
+                    daily_pnl=self.loss_tracker.get_daily_pnl(mode=mode_str),
+                    daily_pnl_pct=self.loss_tracker.get_daily_pnl_pct(mode=mode_str),
                     max_loss_pct=self.config.max_daily_loss_pct,
                     reason="24H loss limit exceeded, blocking new positions"
                 )
@@ -1062,9 +1063,10 @@ class UnifiedPaperTrader:
         self.state.total_pnl += pnl
 
         # Record in loss tracker
-        self.loss_tracker.record_trade(pnl)
+        mode_str = "live" if self.is_live_mode else "paper"
+        self.loss_tracker.record_trade(pnl, mode=mode_str)
         old_daily_pnl = self.state.daily_pnl
-        self.state.daily_pnl = self.loss_tracker.get_daily_pnl()
+        self.state.daily_pnl = self.loss_tracker.get_daily_pnl(mode=mode_str)
 
         if pnl > 0:
             self.state.wins += 1
@@ -1190,9 +1192,10 @@ class UnifiedPaperTrader:
         self.state.total_pnl += pnl
 
         # Record in loss tracker
-        self.loss_tracker.record_trade(pnl)
+        mode_str = "live" if self.is_live_mode else "paper"
+        self.loss_tracker.record_trade(pnl, mode=mode_str)
         old_daily_pnl = self.state.daily_pnl
-        self.state.daily_pnl = self.loss_tracker.get_daily_pnl()
+        self.state.daily_pnl = self.loss_tracker.get_daily_pnl(mode=mode_str)
 
         if pnl > 0:
             self.state.wins += 1
@@ -1374,11 +1377,13 @@ class UnifiedPaperTrader:
             console.print("[bold green]✅ Switched to PAPER mode[/bold green]")
 
     def reset_daily_limit(self):
-        """Reset the rolling loss tracker."""
-        console.print("[bold yellow]🔄 Resetting 24H loss tracker...[/bold yellow]")
-        self.loss_tracker.reset()
-        self.state.daily_pnl = 0.0
-        console.print("[bold green]✅ Loss tracker reset! Trading resumed.[/bold green]")
+        """Reset the rolling loss tracker for the current mode only."""
+        mode_str = "live" if self.is_live_mode else "paper"
+        mode_display = "LIVE" if self.is_live_mode else "PAPER"
+        console.print(f"[bold yellow]🔄 Resetting 24H loss tracker for {mode_display} mode...[/bold yellow]")
+        self.loss_tracker.reset(mode=mode_str)
+        self.state.daily_pnl = self.loss_tracker.get_daily_pnl(mode=mode_str)
+        console.print(f"[bold green]✅ {mode_display} loss tracker reset! Trading resumed.[/bold green]")
 
     def run_config_editor_sync(self):
         """Synchronous config editor (runs outside Live context)."""
@@ -2264,9 +2269,10 @@ class UnifiedPaperTrader:
         pnl_color = "green" if self.state.total_pnl >= 0 else "red"
         left_table.add_row("Total PnL", f"[{pnl_color}]${self.state.total_pnl:+.2f}[/]")
 
-        # 24H Rolling PnL with warning
-        daily_pnl = self.loss_tracker.get_daily_pnl()
-        daily_pnl_pct = self.loss_tracker.get_daily_pnl_pct()
+        # 24H Rolling PnL with warning (mode-specific)
+        mode_str = "live" if self.is_live_mode else "paper"
+        daily_pnl = self.loss_tracker.get_daily_pnl(mode=mode_str)
+        daily_pnl_pct = self.loss_tracker.get_daily_pnl_pct(mode=mode_str)
         if daily_pnl >= 0:
             daily_color = "green"
         elif abs(daily_pnl_pct) >= self.config.max_daily_loss_pct * 0.8:
@@ -2396,7 +2402,8 @@ class UnifiedPaperTrader:
         layout = Group(controls_panel, layout)
 
         # Add loss limit warning banner if needed
-        if self.loss_tracker.is_limit_hit(self.config.max_daily_loss_pct):
+        mode_str = "live" if self.is_live_mode else "paper"
+        if self.loss_tracker.is_limit_hit(self.config.max_daily_loss_pct, mode=mode_str):
             warning = Panel(
                 "[bold yellow]⚠ 24H LOSS LIMIT HIT — NEW ENTRIES PAUSED (Press [R] to reset)[/bold yellow]",
                 border_style="yellow",

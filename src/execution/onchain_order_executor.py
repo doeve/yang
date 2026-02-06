@@ -175,10 +175,12 @@ ERC20_ABI = [
 
 
 @dataclass
+@dataclass
 class OrderResult:
     """Result of an order execution."""
     success: bool
     tx_hash: Optional[str] = None
+    order_id: Optional[str] = None  # For compatibility with LiveExecutor
     filled_amount: float = 0.0
     avg_price: float = 0.0
     gas_used: int = 0
@@ -638,6 +640,120 @@ class OnchainOrderExecutor:
             logger.error(f"Merge position error: {e}")
             return OrderResult(success=False, error=str(e))
 
+    async def _fill_order_onchain(
+        self,
+        order: OrderbookOrder,
+        fill_amount: float,
+        token_id: str,
+    ) -> OrderResult:
+        """
+        Fill an order from the orderbook via CTF Exchange contract (onchain, no CLOB fees).
+
+        Args:
+            order: OrderbookOrder from CLOB API
+            fill_amount: Amount to fill (in tokens/shares)
+            token_id: Token ID being traded
+
+        Returns:
+            OrderResult with transaction details
+        """
+        if not self.public_w3 or not self.account:
+            return OrderResult(success=False, error="Not connected")
+
+        try:
+            # CTF Exchange contract
+            ctf_exchange = self.public_w3.eth.contract(
+                address=Web3.to_checksum_address(CONTRACTS["CTF_EXCHANGE"]),
+                abi=CTF_EXCHANGE_ABI,
+            )
+
+            # Convert amounts to wei (6 decimals for USDC-based tokens)
+            fill_amount_wei = int(fill_amount * 1e6)
+
+            # Build the order struct for the contract (without signature)
+            # Order struct: (salt, maker, signer, taker, tokenId, makerAmount, takerAmount, expiration, nonce, feeRateBps, side, signatureType)
+            order_struct = (
+                order.salt,
+                Web3.to_checksum_address(order.maker),
+                Web3.to_checksum_address(order.maker),  # signer = maker
+                self.address,  # taker = us
+                int(token_id) if not token_id.startswith("0x") else int(token_id, 16),
+                order.maker_amount,
+                order.taker_amount,
+                order.expiration,
+                order.nonce,
+                order.fee_rate_bps,
+                1 if order.side == "BUY" else 2,  # 1 = BUY, 2 = SELL
+                0,  # signatureType: 0 = EOA
+            )
+
+            # Signature is passed separately
+            signature_bytes = bytes.fromhex(order.signature[2:]) if order.signature.startswith("0x") else bytes.fromhex(order.signature)
+
+            # Build transaction
+            nonce = self.public_w3.eth.get_transaction_count(self.address)
+
+            # Get current gas prices
+            latest_block = self.public_w3.eth.get_block('latest')
+            base_fee = latest_block.get('baseFeePerGas', 30 * 10**9)
+            max_priority_fee = self.public_w3.to_wei(50, 'gwei')
+            max_fee = base_fee * 2 + max_priority_fee
+
+            # Call fillOrder on CTF Exchange (order, signature, fillAmount)
+            tx = ctf_exchange.functions.fillOrder(
+                order_struct,
+                signature_bytes,
+                fill_amount_wei,
+            ).build_transaction({
+                "from": self.address,
+                "nonce": nonce,
+                "gas": 350000,  # Higher gas for exchange interaction
+                "maxFeePerGas": max_fee,
+                "maxPriorityFeePerGas": max_priority_fee,
+            })
+
+            # Sign and send
+            signed_tx = self.account.sign_transaction(tx)
+            tx_hash = self.public_w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            tx_hash_hex = tx_hash.hex()
+
+            logger.info(
+                f"Fill order tx sent: {tx_hash_hex}",
+                tx_hash=tx_hash_hex,
+                fill_amount=fill_amount,
+            )
+
+            # Wait for confirmation
+            receipt = self.public_w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+            if receipt["status"] == 1:
+                usdc_received = fill_amount * order.price
+
+                logger.info(
+                    f"Order filled successfully",
+                    tx_hash=tx_hash_hex,
+                    tokens_sold=fill_amount,
+                    usdc_received=usdc_received,
+                )
+
+                return OrderResult(
+                    success=True,
+                    tx_hash=tx_hash_hex,
+                    filled_amount=fill_amount,
+                    avg_price=order.price,
+                    gas_used=receipt["gasUsed"],
+                )
+            else:
+                return OrderResult(
+                    success=False,
+                    tx_hash=tx_hash_hex,
+                    error="Transaction reverted",
+                )
+
+        except Exception as e:
+            logger.error(f"Fill order error: {e}")
+            return OrderResult(success=False, error=str(e))
+
     async def market_buy(
         self,
         token_id: str,
@@ -784,25 +900,54 @@ class OnchainOrderExecutor:
                     return result
 
             elif side.upper() == "SELL":
-                # SELL: For now, just log and return success
-                # Full implementation would:
-                # 1. Check if we have both YES and NO tokens (can merge)
-                # 2. If yes, merge to get USDC back
-                # 3. If only one side, would need to find buyer (complex)
+                # SELL: Query orderbook and fill buy orders via CTF Exchange
+                logger.info(
+                    f"💰 Selling {size:.2f} tokens @ {price:.3f}",
+                    token_id=token_id[:16] if len(token_id) > 16 else token_id,
+                )
+
+                # Get orderbook (people wanting to BUY what we're selling)
+                buy_orders = await self.get_orderbook(token_id, side="BUY")
+
+                if not buy_orders:
+                    return OrderResult(
+                        success=False,
+                        error="No buy orders available in orderbook"
+                    )
+
+                # Find best buy order (highest price)
+                best_order = max(buy_orders, key=lambda o: o.price)
+
+                # Check if price is acceptable
+                if best_order.price < price * 0.95:  # Allow 5% slippage
+                    return OrderResult(
+                        success=False,
+                        error=f"Best buy order price {best_order.price:.3f} too low (wanted {price:.3f})"
+                    )
+
+                # Determine how much we can fill
+                fill_size = min(size, best_order.size)
 
                 logger.info(
-                    f"⚠️ SELL order recorded (merge positions to close)",
-                    token_id=token_id[:16] if len(token_id) > 16 else token_id,
-                    size=size,
+                    f"📋 Filling buy order @ {best_order.price:.3f} for {fill_size:.2f} tokens",
+                    order_id=best_order.order_id[:16],
                 )
 
-                # Return success - actual USDC recovery happens via merge or redemption
-                return OrderResult(
-                    success=True,
-                    tx_hash=None,
-                    filled_amount=size,
-                    avg_price=price,
+                # Fill the order via CTF Exchange
+                result = await self._fill_order_onchain(
+                    order=best_order,
+                    fill_amount=fill_size,
+                    token_id=token_id,
                 )
+
+                if result.success:
+                    logger.info(
+                        f"✅ Sold {fill_size:.2f} tokens @ {best_order.price:.3f}",
+                        tx_hash=result.tx_hash[:16] if result.tx_hash else None,
+                        usdc_received=fill_size * best_order.price,
+                    )
+
+                return result
 
             else:
                 return OrderResult(
