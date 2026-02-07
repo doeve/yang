@@ -1769,12 +1769,51 @@ class UnifiedPaperTrader:
             traceback.print_exc()
             return False
 
+    async def is_position_redeemable(self, condition_id: str) -> bool:
+        """
+        Check if a position is ready for redemption (market resolved).
+
+        Returns True if the position can be redeemed, False otherwise.
+        """
+        try:
+            from web3 import Web3
+
+            # CTF contract for checking payout
+            ctf = self.onchain_executor.public_w3.eth.contract(
+                address=Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"),
+                abi=[
+                    {
+                        "inputs": [{"name": "conditionId", "type": "bytes32"}],
+                        "name": "payoutNumerators",
+                        "outputs": [{"name": "", "type": "uint256"}],
+                        "stateMutability": "view",
+                        "type": "function",
+                    }
+                ]
+            )
+
+            # Check if condition is resolved (has payout set)
+            if not condition_id.startswith("0x"):
+                condition_id = "0x" + condition_id
+            condition_bytes = bytes.fromhex(condition_id[2:])
+
+            # Try to get payout for index 0 - if this doesn't revert, market is resolved
+            payout = ctf.functions.payoutNumerators(condition_bytes, 0).call()
+
+            # If we got a payout value, market is resolved and redeemable
+            return True
+
+        except Exception as e:
+            # If call reverts or errors, market not resolved yet
+            logger.debug(f"Position not redeemable yet: {e}")
+            return False
+
     async def try_immediate_redeem(self):
         """
-        Immediately try to redeem current position after exit/settlement.
+        Schedule delayed redemption with polling.
 
-        Uses force redemption (no resolution check) for speed.
-        Silently fails if position can't be redeemed yet.
+        Waits 1 minute, then polls every 30 seconds to check if position is redeemable.
+        Only redeems when position is actually ready.
         """
         if not self.is_live_mode:
             logger.debug(
@@ -1800,16 +1839,100 @@ class UnifiedPaperTrader:
             )
             return
 
+        # Schedule background redemption polling
+        condition_id = self.state.condition_id
         logger.info(
-            "redeem_attempt_start",
+            "redeem_scheduled",
             mode="LIVE",
-            condition_id=self.state.condition_id[:16] + "...",
-            yes_id=self.state.active_yes_id[:16] + "..." if self.state.active_yes_id else None,
-            no_id=self.state.active_no_id[:16] + "..." if self.state.active_no_id else None
+            condition_id=condition_id[:16] + "...",
+            wait_time=60,
+            poll_interval=30,
+            message="Will check redeemability in 60 seconds, then every 30 seconds"
         )
+        console.print("[dim]📅 Redemption scheduled (1 min wait, then polling every 30s)[/dim]")
 
+        # Start background task
+        asyncio.create_task(self._poll_and_redeem(condition_id))
+
+    async def _poll_and_redeem(self, condition_id: str):
+        """
+        Background task: Wait 1 minute, then poll every 30s until redeemable, then redeem.
+        """
+        try:
+            # Wait 1 minute before first check
+            await asyncio.sleep(60)
+
+            logger.info(
+                "redeem_polling_start",
+                mode="LIVE",
+                condition_id=condition_id[:16] + "...",
+                message="Starting redemption polling"
+            )
+
+            # Poll every 30 seconds until redeemable
+            max_attempts = 20  # Stop after 10 minutes of polling
+            for attempt in range(max_attempts):
+                logger.debug(
+                    "redeem_poll_check",
+                    mode="LIVE",
+                    condition_id=condition_id[:16] + "...",
+                    attempt=attempt + 1,
+                    max_attempts=max_attempts
+                )
+
+                # Check if redeemable
+                if await self.is_position_redeemable(condition_id):
+                    logger.info(
+                        "redeem_ready",
+                        mode="LIVE",
+                        condition_id=condition_id[:16] + "...",
+                        message="Position is now redeemable"
+                    )
+                    console.print("[green]✓ Position ready for redemption[/green]")
+
+                    # Redeem now
+                    await self._execute_redeem(condition_id)
+                    return
+                else:
+                    logger.debug(
+                        "redeem_not_ready",
+                        mode="LIVE",
+                        condition_id=condition_id[:16] + "...",
+                        attempt=attempt + 1
+                    )
+
+                # Wait 30 seconds before next check
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(30)
+
+            logger.warning(
+                "redeem_poll_timeout",
+                mode="LIVE",
+                condition_id=condition_id[:16] + "...",
+                message="Stopped polling after max attempts - position may not be resolved"
+            )
+
+        except Exception as e:
+            logger.error(
+                "redeem_poll_error",
+                mode="LIVE",
+                condition_id=condition_id[:16] + "..." if condition_id else None,
+                error=str(e),
+                error_type=type(e).__name__
+            )
+
+    async def _execute_redeem(self, condition_id: str):
+        """
+        Execute the actual redemption transaction.
+        """
         try:
             from web3 import Web3
+
+            logger.info(
+                "redeem_attempt_start",
+                mode="LIVE",
+                condition_id=condition_id[:16] + "..."
+            )
 
             # CTF contract
             ctf = self.onchain_executor.public_w3.eth.contract(
