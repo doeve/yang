@@ -137,6 +137,7 @@ class UnifiedTradingState:
     wallet_balance: float = 0.0  # Real USDC balance (live mode)
     daily_pnl: float = 0.0  # Today's realized PnL
     condition_id: Optional[str] = None  # Current market's condition ID
+    last_balance_update: Optional[float] = None  # Timestamp of last balance update
 
 
 @dataclass
@@ -390,7 +391,9 @@ class UnifiedPaperTrader:
                     await self.executor.ensure_approvals()
 
                     # Update wallet balance
+                    import time
                     self.state.wallet_balance = await self.executor.get_usdc_balance()
+                    self.state.last_balance_update = time.time()
                     logger.info(
                         "live_mode_initialized",
                         mode="LIVE",
@@ -930,8 +933,10 @@ class UnifiedPaperTrader:
                         )
 
                 # Update wallet balance
+                import time
                 old_balance = self.state.wallet_balance
                 self.state.wallet_balance = await self.executor.get_usdc_balance()
+                self.state.last_balance_update = time.time()
                 logger.info(
                     "wallet_balance_updated",
                     mode="LIVE",
@@ -1105,8 +1110,10 @@ class UnifiedPaperTrader:
                             )
 
                     # Update wallet balance
+                    import time
                     old_balance = self.state.wallet_balance
                     self.state.wallet_balance = await self.executor.get_usdc_balance()
+                    self.state.last_balance_update = time.time()
                     logger.info(
                         "wallet_balance_updated_exit",
                         mode="LIVE",
@@ -1397,7 +1404,9 @@ class UnifiedPaperTrader:
                     )
                     if await self.executor.connect():
                         await self.executor.ensure_approvals()
+                        import time
                         self.state.wallet_balance = await self.executor.get_usdc_balance()
+                        self.state.last_balance_update = time.time()
                         console.print(f"[bold green]✅ Connected to live executor. Wallet: ${self.state.wallet_balance:.2f}[/bold green]")
                     else:
                         console.print("[bold red]❌ Failed to connect executor! Staying in paper mode.[/bold red]")
@@ -2062,8 +2071,10 @@ class UnifiedPaperTrader:
                     console.print(f"[green]✅ Redeemed ${usdc_redeemed:.2f} USDC[/green]")
                     # Update wallet balance
                     if self.executor:
+                        import time
                         old_wallet = self.state.wallet_balance
                         self.state.wallet_balance = await self.executor.get_usdc_balance()
+                        self.state.last_balance_update = time.time()
                         logger.info(
                             "wallet_balance_updated_redeem",
                             mode="LIVE",
@@ -2151,7 +2162,9 @@ class UnifiedPaperTrader:
                         )
                         # Update wallet balance
                         if self.executor:
+                            import time
                             self.state.wallet_balance = await self.executor.get_usdc_balance()
+                            self.state.last_balance_update = time.time()
                             console.print(f"  [green]Updated balance: ${self.state.wallet_balance:.2f}[/green]")
                 else:
                     console.print(f"[red]❌ Redemption failed: {result.error}[/red]")
@@ -2432,7 +2445,9 @@ class UnifiedPaperTrader:
 
         # Update wallet balance
         if self.executor:
+            import time
             self.state.wallet_balance = await self.executor.get_usdc_balance()
+            self.state.last_balance_update = time.time()
 
         # Display results
         console.print(f"[cyan]{'═'*70}[/cyan]")
@@ -2515,6 +2530,27 @@ class UnifiedPaperTrader:
 
         while self._running:
             try:
+                # Periodic balance update (every 5 minutes in live mode)
+                import time
+                if self.is_live_mode and self.executor:
+                    current_time = time.time()
+                    should_update_balance = (
+                        self.state.last_balance_update is None or
+                        (current_time - self.state.last_balance_update) >= 300  # 5 minutes
+                    )
+                    if should_update_balance:
+                        old_balance = self.state.wallet_balance
+                        self.state.wallet_balance = await self.executor.get_usdc_balance()
+                        self.state.last_balance_update = current_time
+                        if abs(self.state.wallet_balance - old_balance) > 0.01:
+                            logger.info(
+                                "wallet_balance_periodic_update",
+                                mode="LIVE",
+                                old_balance=old_balance,
+                                new_balance=self.state.wallet_balance,
+                                change=self.state.wallet_balance - old_balance
+                            )
+
                 # Market discovery
                 current_ts = self.get_current_candle_timestamp()
                 if self.state.current_candle_ts != current_ts:
@@ -2527,6 +2563,20 @@ class UnifiedPaperTrader:
                         self.state.no_price_history = []
                         self.state.btc_price_history = []
                         self.state.btc_open_price = None
+
+                        # Update balance when new market is found (live mode)
+                        if self.is_live_mode and self.executor:
+                            old_balance = self.state.wallet_balance
+                            self.state.wallet_balance = await self.executor.get_usdc_balance()
+                            self.state.last_balance_update = time.time()
+                            logger.info(
+                                "wallet_balance_new_market",
+                                mode="LIVE",
+                                old_balance=old_balance,
+                                new_balance=self.state.wallet_balance,
+                                change=self.state.wallet_balance - old_balance,
+                                market_timestamp=current_ts
+                            )
                     else:
                         console.print("[yellow]Waiting for new market...[/yellow]")
                         await asyncio.sleep(5)
