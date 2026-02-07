@@ -765,6 +765,19 @@ class UnifiedPaperTrader:
     async def execute_entry(self, side: str, position_size: float, model_output: Dict):
         """Execute position entry."""
         mode = "LIVE" if self.is_live_mode else "PAPER"
+
+        # Check if already in a position
+        if self.state.position_side is not None:
+            logger.warning(
+                "entry_blocked_existing_position",
+                mode=mode,
+                existing_side=self.state.position_side,
+                requested_side=side,
+                reason="Cannot enter new position while already holding a position"
+            )
+            console.print(f"[yellow]Skipping entry: Already in {self.state.position_side.upper()} position[/yellow]")
+            return
+
         logger.info(
             f"execute_entry",
             mode=mode,
@@ -859,18 +872,55 @@ class UnifiedPaperTrader:
                     token_id=token_id
                 )
 
-                # Wait for fill (optional but recommended)
+                # Wait for fill (required for live mode to track position accurately)
                 if result.order_id:
                     filled = await self.executor.wait_for_fill(result.order_id)
                     if not filled:
+                        # Timeout - but order might have filled anyway
+                        # Check actual token balance to see if we got the tokens
                         logger.warning(
-                            "live_order_not_filled",
+                            "live_order_timeout",
                             mode="LIVE",
                             side=side,
                             order_id=result.order_id,
-                            reason="Order not filled within timeout"
+                            reason="Order not confirmed within timeout - checking actual balance"
                         )
-                        console.print("[red]Order not filled within timeout[/red]")
+                        console.print("[yellow]Order timeout - checking if filled...[/yellow]")
+
+                        # Check if we actually received the tokens
+                        try:
+                            actual_balance = await self.executor._get_token_balance(token_id)
+                            balance_shares = actual_balance / 1e6
+
+                            if balance_shares >= (quantity * 0.95):  # Allow 5% tolerance
+                                logger.info(
+                                    "live_order_filled_after_timeout",
+                                    mode="LIVE",
+                                    side=side,
+                                    order_id=result.order_id,
+                                    balance_shares=balance_shares,
+                                    expected_shares=quantity,
+                                    reason="Order filled after timeout (confirmed by balance check)"
+                                )
+                                console.print(f"[green]✓ Order filled ({balance_shares:.2f} shares received)[/green]")
+                                # Update filled amount to actual received
+                                result.filled_amount = balance_shares
+                            else:
+                                logger.error(
+                                    "live_order_not_filled",
+                                    mode="LIVE",
+                                    side=side,
+                                    order_id=result.order_id,
+                                    balance_shares=balance_shares,
+                                    expected_shares=quantity,
+                                    reason="Order not filled - balance check confirms no tokens received"
+                                )
+                                console.print(f"[red]Order not filled - position NOT entered[/red]")
+                                return
+                        except Exception as balance_error:
+                            logger.error(f"Balance check failed: {balance_error}")
+                            console.print("[red]Could not verify fill - position NOT entered[/red]")
+                            return
                     else:
                         logger.info(
                             "live_order_filled",
@@ -1513,11 +1563,14 @@ class UnifiedPaperTrader:
                     time.sleep(0.3)
 
                 elif choice == "4":
-                    new_val = FloatPrompt.ask("Enter Max Position Size (USDC)", default=self.config.max_position_size_usdc)
+                    current_val = self.config.max_position_size_usdc
+                    logger.debug(f"Current max_position_size_usdc: {current_val}")
+                    new_val = FloatPrompt.ask("Enter Max Position Size (USDC)", default=current_val if current_val > 0 else 10.0)
                     self.config.max_position_size_usdc = new_val
                     if self.trading_config:
                         self.trading_config.risk.max_position_size_usdc = new_val
-                    console.print("[green]✓ Updated[/green]")
+                    console.print(f"[green]✓ Updated to ${new_val:.2f}[/green]")
+                    logger.info(f"Updated max_position_size_usdc to {new_val}")
                     import time
                     time.sleep(0.3)
 
@@ -1609,12 +1662,19 @@ class UnifiedPaperTrader:
         try:
             config_path = Path("config.yaml")
 
+            # Validate max_position_size_usdc before saving
+            max_pos_size = self.config.max_position_size_usdc
+            if max_pos_size <= 0:
+                logger.warning(f"Invalid max_position_size_usdc: {max_pos_size}, using default 10.0")
+                max_pos_size = 10.0
+                self.config.max_position_size_usdc = 10.0
+
             # Build config dict with ALL settings
             config_data = {
                 "trading_mode": self.config.trading_mode,
                 "risk": {
                     "max_daily_loss_pct": self.config.max_daily_loss_pct,
-                    "max_position_size_usdc": self.config.max_position_size_usdc,
+                    "max_position_size_usdc": max_pos_size,
                     "min_balance_usdc": getattr(self.config, 'min_balance_usdc', 10.0),  # Default if missing
                 },
                 "model": {
@@ -2459,10 +2519,17 @@ class UnifiedPaperTrader:
                 else self.state.last_no_price
             )
             unrealized_pnl_pct = (current_price - self.state.entry_price) / self.state.entry_price
-            # Calculate absolute unrealized PnL (use wallet_balance in live mode)
-            balance_for_display = self.state.wallet_balance if self.is_live_mode else self.state.balance
-            invested = self.state.position_size * balance_for_display
-            shares = invested / self.state.entry_price if self.state.entry_price > 0 else 0
+
+            # Calculate absolute unrealized PnL
+            # In live mode: use actual stored shares (don't recalculate from balance!)
+            # In paper mode: calculate from position size
+            if self.is_live_mode:
+                shares = self.state.position_shares
+                invested = shares * self.state.entry_price
+            else:
+                invested = self.state.position_size * self.state.balance
+                shares = invested / self.state.entry_price if self.state.entry_price > 0 else 0
+
             unrealized_pnl_abs = shares * (current_price - self.state.entry_price)
             pnl_color = "green" if unrealized_pnl_pct > 0 else "red"
 

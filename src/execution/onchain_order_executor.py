@@ -1426,6 +1426,12 @@ class OnchainOrderExecutor:
                                     error=f"No tokens to sell (balance: 0, position tracking incorrect)"
                                 )
 
+                            if balance_shares <= 0:
+                                return OrderResult(
+                                    success=False,
+                                    error=f"No tokens to sell (balance: {balance_shares:.2f} shares)"
+                                )
+
                             if balance_shares < size:
                                 # Retry with available balance
                                 logger.info(f"Retrying SELL with adjusted size: {size:.2f} → {balance_shares:.2f} shares")
