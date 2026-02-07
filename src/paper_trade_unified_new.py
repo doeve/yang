@@ -932,8 +932,9 @@ class UnifiedPaperTrader:
                             order_id=result.order_id
                         )
 
-                # Update wallet balance
+                # Update wallet balance (wait for CLOB settlement)
                 import time
+                await asyncio.sleep(3)  # Wait for CLOB settlement to finalize
                 old_balance = self.state.wallet_balance
                 self.state.wallet_balance = await self.executor.get_usdc_balance()
                 self.state.last_balance_update = time.time()
@@ -1109,8 +1110,9 @@ class UnifiedPaperTrader:
                                 order_id=result.order_id
                             )
 
-                    # Update wallet balance
+                    # Update wallet balance (wait for CLOB settlement)
                     import time
+                    await asyncio.sleep(3)  # Wait for CLOB settlement to finalize
                     old_balance = self.state.wallet_balance
                     self.state.wallet_balance = await self.executor.get_usdc_balance()
                     self.state.last_balance_update = time.time()
@@ -1217,8 +1219,8 @@ class UnifiedPaperTrader:
         self.state.ticks_held = 0
         self.state.max_pnl_seen = 0.0
 
-        # Try immediate redemption (non-blocking)
-        await self.try_immediate_redeem()
+        # NOTE: No redemption needed when exiting via CLOB - tokens already sold for USDC
+        # Redemption only happens at settlement (when holding position until market close)
 
     async def settle_position(self):
         """Settle position at candle end."""
@@ -1564,6 +1566,13 @@ class UnifiedPaperTrader:
 
                 elif choice == "3":
                     new_val = FloatPrompt.ask("Enter Max Daily Loss %", default=self.config.max_daily_loss_pct)
+
+                    # Validate: must be positive
+                    if new_val <= 0:
+                        console.print(f"[red]✗ Invalid value: {new_val}. Must be greater than 0. Using minimum of 0.5%[/red]")
+                        new_val = 0.5
+                        logger.warning(f"Invalid max_daily_loss_pct: {new_val}, setting to minimum 0.5")
+
                     self.config.max_daily_loss_pct = new_val
                     if self.trading_config:
                         self.trading_config.risk.max_daily_loss_pct = new_val
@@ -1575,6 +1584,13 @@ class UnifiedPaperTrader:
                     current_val = self.config.max_position_size_usdc
                     logger.debug(f"Current max_position_size_usdc: {current_val}")
                     new_val = FloatPrompt.ask("Enter Max Position Size (USDC)", default=current_val if current_val > 0 else 10.0)
+
+                    # Validate: must be positive
+                    if new_val <= 0:
+                        console.print(f"[red]✗ Invalid value: {new_val}. Must be greater than 0. Using minimum of $1.00[/red]")
+                        new_val = 1.0
+                        logger.warning(f"Invalid max_position_size_usdc: {new_val}, setting to minimum 1.0")
+
                     self.config.max_position_size_usdc = new_val
                     if self.trading_config:
                         self.trading_config.risk.max_position_size_usdc = new_val
@@ -1780,55 +1796,47 @@ class UnifiedPaperTrader:
 
     async def is_position_redeemable(self, condition_id: str) -> bool:
         """
-        Check if a position is ready for redemption using the Data API.
+        Check if a position is ready for redemption by querying the blockchain directly.
 
-        Returns True if the position can be redeemed, False otherwise.
-        Uses the Data API to check the 'redeemable' field for this specific wallet.
+        Returns True if the market is resolved on-chain (has payout set), False otherwise.
+        This checks the actual blockchain state, not the Data API which may have indexer lag.
         """
         try:
-            if not self.onchain_executor:
+            from web3 import Web3
+
+            if not self.onchain_executor or not self.onchain_executor.public_w3:
                 return False
 
-            wallet_address = self.onchain_executor.address
-            if not wallet_address:
-                return False
+            # CTF contract for checking payout
+            ctf = self.onchain_executor.public_w3.eth.contract(
+                address=Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"),
+                abi=[
+                    {
+                        "inputs": [
+                            {"name": "conditionId", "type": "bytes32"},
+                            {"name": "index", "type": "uint256"}
+                        ],
+                        "name": "payoutNumerators",
+                        "outputs": [{"name": "", "type": "uint256"}],
+                        "stateMutability": "view",
+                        "type": "function",
+                    }
+                ]
+            )
 
-            # Use SOCKS proxy if available
-            if SOCKS_AVAILABLE and self.trading_config.socks5_proxy:
-                from httpx_socks import SyncProxyTransport
-                transport = SyncProxyTransport.from_url(self.trading_config.socks5_proxy)
-                client = httpx.Client(transport=transport, verify=False, timeout=10)
-            else:
-                client = httpx.Client(verify=False, timeout=10)
+            # Check if condition is resolved (has payout set)
+            if not condition_id.startswith("0x"):
+                condition_id = "0x" + condition_id
+            condition_bytes = bytes.fromhex(condition_id[2:])
 
-            # Fetch positions for this wallet
-            base_url = "https://data-api.polymarket.com/positions"
-            params = {
-                "user": wallet_address,
-                "limit": 100,
-                "offset": 0,
-                "sizeThreshold": 0.0001,
-            }
+            # Try to get payout for index 0 - if this doesn't revert, market is resolved
+            payout = ctf.functions.payoutNumerators(condition_bytes, 0).call()
 
-            response = client.get(base_url, params=params)
-            response.raise_for_status()
-            positions = response.json()
-            client.close()
-
-            if not isinstance(positions, list):
-                return False
-
-            # Find position with this condition_id
-            for pos in positions:
-                if pos.get('conditionId') == condition_id:
-                    # Check if redeemable AND has value > 0
-                    is_redeemable = pos.get('redeemable', False)
-                    has_value = float(pos.get('currentValue', 0)) > 0
-                    return is_redeemable and has_value
-
-            return False
+            # If we got a payout value, market is resolved and redeemable on-chain
+            return True
 
         except Exception as e:
+            # If call reverts or errors, market not resolved yet
             logger.debug(f"Position not redeemable yet: {e}")
             return False
 
