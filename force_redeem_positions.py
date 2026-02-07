@@ -8,6 +8,7 @@ Skips all resolution checks and attempts redemption directly.
 import os
 import sys
 import asyncio
+import argparse
 from typing import List, Dict
 from dotenv import load_dotenv
 from rich.console import Console
@@ -243,8 +244,22 @@ async def force_redeem_position(
 
 async def redeem_all_positions(positions: List[Dict], executor: OnchainExecutor):
     """Attempt to redeem all positions."""
+    # Filter positions: only redeemable and value > 0
+    redeemable_positions = [
+        pos for pos in positions
+        if pos.get('redeemable', False) and float(pos.get('currentValue', 0)) > 0
+    ]
+
+    if not redeemable_positions:
+        console.print("[yellow]No redeemable positions with value > 0 found[/yellow]")
+        return
+
+    skipped_count = len(positions) - len(redeemable_positions)
+    if skipped_count > 0:
+        console.print(f"[dim]Skipping {skipped_count} positions (not redeemable or value = 0)[/dim]\n")
+
     console.print(f"[cyan]{'═'*70}[/cyan]")
-    console.print(f"[bold cyan]REDEMPTION ATTEMPTS[/bold cyan]")
+    console.print(f"[bold cyan]REDEMPTION ATTEMPTS ({len(redeemable_positions)} positions)[/bold cyan]")
     console.print(f"[cyan]{'═'*70}[/cyan]\n")
 
     initial_balance = await executor.get_usdc_balance()
@@ -252,8 +267,8 @@ async def redeem_all_positions(positions: List[Dict], executor: OnchainExecutor)
 
     results = {"success": 0, "failed": 0, "total_redeemed": 0.0}
 
-    for i, pos in enumerate(positions, 1):
-        console.print(f"[bold][{i}/{len(positions)}][/bold]")
+    for i, pos in enumerate(redeemable_positions, 1):
+        console.print(f"[bold][{i}/{len(redeemable_positions)}][/bold]")
 
         result = await force_redeem_position(
             executor,
@@ -273,7 +288,7 @@ async def redeem_all_positions(positions: List[Dict], executor: OnchainExecutor)
         console.print()
 
         # Delay between attempts
-        if i < len(positions):
+        if i < len(redeemable_positions):
             await asyncio.sleep(2)
 
     # Final balance
@@ -292,6 +307,12 @@ async def redeem_all_positions(positions: List[Dict], executor: OnchainExecutor)
 
 async def main():
     """Main entry point."""
+    # Parse arguments
+    parser = argparse.ArgumentParser(description="Force redeem Polymarket positions")
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="Automatically confirm redemption without prompting")
+    args = parser.parse_args()
+
     load_dotenv()
 
     private_key = os.getenv("ETH_PRIVATE_KEY")
@@ -323,10 +344,23 @@ async def main():
         # Display positions
         display_positions(positions)
 
-        # Ask confirmation
-        if not Confirm.ask(f"Attempt to redeem all {len(positions)} positions?"):
-            console.print("[yellow]Cancelled[/yellow]")
+        # Count redeemable positions
+        redeemable_count = sum(
+            1 for pos in positions
+            if pos.get('redeemable', False) and float(pos.get('currentValue', 0)) > 0
+        )
+
+        if redeemable_count == 0:
+            console.print("[yellow]No redeemable positions with value > 0 found[/yellow]")
             return 0
+
+        # Ask confirmation (skip if -y flag is set)
+        if not args.yes:
+            if not Confirm.ask(f"Attempt to redeem {redeemable_count} redeemable positions?"):
+                console.print("[yellow]Cancelled[/yellow]")
+                return 0
+        else:
+            console.print(f"[dim]Auto-confirming redemption of {redeemable_count} positions (--yes flag)[/dim]\n")
 
         # Connect executor
         console.print("\n[cyan]Connecting to blockchain...[/cyan]")

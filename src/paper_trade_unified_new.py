@@ -1771,40 +1771,55 @@ class UnifiedPaperTrader:
 
     async def is_position_redeemable(self, condition_id: str) -> bool:
         """
-        Check if a position is ready for redemption (market resolved).
+        Check if a position is ready for redemption using the Data API.
 
         Returns True if the position can be redeemed, False otherwise.
+        Uses the Data API to check the 'redeemable' field for this specific wallet.
         """
         try:
-            from web3 import Web3
+            if not self.onchain_executor:
+                return False
 
-            # CTF contract for checking payout
-            ctf = self.onchain_executor.public_w3.eth.contract(
-                address=Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"),
-                abi=[
-                    {
-                        "inputs": [{"name": "conditionId", "type": "bytes32"}],
-                        "name": "payoutNumerators",
-                        "outputs": [{"name": "", "type": "uint256"}],
-                        "stateMutability": "view",
-                        "type": "function",
-                    }
-                ]
-            )
+            wallet_address = self.onchain_executor.address
+            if not wallet_address:
+                return False
 
-            # Check if condition is resolved (has payout set)
-            if not condition_id.startswith("0x"):
-                condition_id = "0x" + condition_id
-            condition_bytes = bytes.fromhex(condition_id[2:])
+            # Use SOCKS proxy if available
+            if SOCKS_AVAILABLE and self.trading_config.socks5_proxy:
+                from httpx_socks import SyncProxyTransport
+                transport = SyncProxyTransport.from_url(self.trading_config.socks5_proxy)
+                client = httpx.Client(transport=transport, verify=False, timeout=10)
+            else:
+                client = httpx.Client(verify=False, timeout=10)
 
-            # Try to get payout for index 0 - if this doesn't revert, market is resolved
-            payout = ctf.functions.payoutNumerators(condition_bytes, 0).call()
+            # Fetch positions for this wallet
+            base_url = "https://data-api.polymarket.com/positions"
+            params = {
+                "user": wallet_address,
+                "limit": 100,
+                "offset": 0,
+                "sizeThreshold": 0.0001,
+            }
 
-            # If we got a payout value, market is resolved and redeemable
-            return True
+            response = client.get(base_url, params=params)
+            response.raise_for_status()
+            positions = response.json()
+            client.close()
+
+            if not isinstance(positions, list):
+                return False
+
+            # Find position with this condition_id
+            for pos in positions:
+                if pos.get('conditionId') == condition_id:
+                    # Check if redeemable AND has value > 0
+                    is_redeemable = pos.get('redeemable', False)
+                    has_value = float(pos.get('currentValue', 0)) > 0
+                    return is_redeemable and has_value
+
+            return False
 
         except Exception as e:
-            # If call reverts or errors, market not resolved yet
             logger.debug(f"Position not redeemable yet: {e}")
             return False
 
@@ -2339,16 +2354,17 @@ class UnifiedPaperTrader:
 
     async def force_redeem_all_positions(self):
         """
-        Fetch all positions and attempt force redemption on everything.
+        Fetch all positions and attempt force redemption on redeemable ones.
 
         This is useful for cleaning up all resolved positions at once.
+        Only attempts redemption on positions that are marked as redeemable
+        and have value > 0.
         """
         if not self.is_live_mode or not self.onchain_executor:
             console.print("[yellow]Force redeem only available in live mode[/yellow]")
             return
 
         console.print("\n[bold yellow]⚡ FORCE REDEEM ALL POSITIONS ⚡[/bold yellow]")
-        console.print("[dim]This will attempt to redeem ALL positions without checking resolution status[/dim]\n")
 
         # Fetch all positions
         positions = await self.fetch_all_positions()
@@ -2357,9 +2373,23 @@ class UnifiedPaperTrader:
             console.print("[yellow]No positions found[/yellow]")
             return
 
+        # Filter positions: only redeemable and value > 0
+        redeemable_positions = [
+            pos for pos in positions
+            if pos.get('redeemable', False) and float(pos.get('currentValue', 0)) > 0
+        ]
+
+        if not redeemable_positions:
+            console.print("[yellow]No redeemable positions with value > 0 found[/yellow]")
+            return
+
+        skipped_count = len(positions) - len(redeemable_positions)
+        if skipped_count > 0:
+            console.print(f"[dim]Skipping {skipped_count} positions (not redeemable or value = 0)[/dim]\n")
+
         # Display summary
-        total_value = sum(float(p.get('currentValue', 0)) for p in positions)
-        console.print(f"[bold]Found {len(positions)} positions (Total Value: ${total_value:.2f})[/bold]")
+        total_value = sum(float(p.get('currentValue', 0)) for p in redeemable_positions)
+        console.print(f"[bold]Found {len(redeemable_positions)} redeemable positions (Total Value: ${total_value:.2f})[/bold]")
 
         # Ask for confirmation
         console.print("\n[yellow]Press Enter to continue or Ctrl+C to cancel...[/yellow]")
@@ -2376,8 +2406,8 @@ class UnifiedPaperTrader:
         # Attempt redemptions
         results = {"success": 0, "failed": 0, "total_redeemed": 0.0}
 
-        for i, pos in enumerate(positions, 1):
-            console.print(f"[bold][{i}/{len(positions)}][/bold]")
+        for i, pos in enumerate(redeemable_positions, 1):
+            console.print(f"[bold][{i}/{len(redeemable_positions)}][/bold]")
 
             result = await self.force_redeem_single_position(
                 condition_id=pos.get('conditionId', ''),
@@ -2394,7 +2424,7 @@ class UnifiedPaperTrader:
             console.print()
 
             # Delay between attempts
-            if i < len(positions):
+            if i < len(redeemable_positions):
                 await asyncio.sleep(2)
 
         # Get final balance
