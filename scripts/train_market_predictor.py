@@ -14,14 +14,17 @@ Key improvements over previous approach:
 6. Trend-aware: learns from actual BTC/token price correlations
 
 Usage:
-    # Collect data and train
-    python scripts/train_market_predictor.py --collect-data --days 30
+    # Full pipeline: download data from scratch and train (default)
+    python scripts/train_market_predictor.py
 
-    # Train only (assumes data already collected)
+    # Download fresh data and train with custom settings
+    python scripts/train_market_predictor.py --days 30 --epochs 150 --batch-size 256
+
+    # Train only on previously downloaded data (skip download)
     python scripts/train_market_predictor.py --train-only
 
-    # Full pipeline with custom settings
-    python scripts/train_market_predictor.py --days 30 --epochs 150 --batch-size 256
+    # Download data only (no training)
+    python scripts/train_market_predictor.py --download-only
 """
 
 import argparse
@@ -38,18 +41,19 @@ from sklearn.model_selection import train_test_split
 console = Console()
 
 
-async def collect_historical_data(
+async def download_data(
     output_dir: str = "./data/historical",
     days_back: int = 30,
-    btc_interval: str = "1m",  # Use 1m for faster collection, still good resolution,
-    use_proxy: bool = True
+    btc_interval: str = "1m",
+    use_proxy: bool = True,
 ):
-    """Collect historical data from Binance and Polymarket."""
+    """Download historical data from Binance and Polymarket from scratch."""
     from src.data.historical_data_collector import HistoricalDataCollector
 
-    console.print("[bold blue]Step 1: Collecting Historical Data[/bold blue]")
+    console.print("[bold blue]Step 1: Downloading Historical Data[/bold blue]")
     console.print(f"  Days: {days_back}")
     console.print(f"  BTC interval: {btc_interval}")
+    console.print(f"  Proxy: {'enabled' if use_proxy else 'disabled'}")
     console.print(f"  Output: {output_dir}")
     console.print()
 
@@ -59,6 +63,11 @@ async def collect_historical_data(
         btc_interval=btc_interval,
     )
 
+    if not data or all(v.empty if hasattr(v, 'empty') else not v for v in data.values()):
+        console.print("[red]Data download failed or returned empty data![/red]")
+        return None
+
+    console.print("[green]Data download complete.[/green]")
     return data
 
 
@@ -80,7 +89,7 @@ def build_training_data(
     data = builder.load_data(days_back=days_back, btc_interval=btc_interval)
 
     if not data:
-        console.print("[red]No data found! Run with --collect-data first.[/red]")
+        console.print("[red]No data found! Run without --train-only to download data first.[/red]")
         return None, None, None, None
 
     features, position_states, actions, returns = builder.build_training_examples(
@@ -119,12 +128,14 @@ def train_model(
     position_states: np.ndarray,
     actions: np.ndarray,
     returns: np.ndarray,
-    output_dir: str = "./logs/market_predictor_v1",
+    output_dir: str = "./logs/market_predictor_v2",
     epochs: int = 100,
     batch_size: int = 128,
     patience: int = 15,
     val_split: float = 0.15,
     test_split: float = 0.10,
+    dropout: float = 0.3,
+    learning_rate: float = 1e-4,
 ):
     """Train the unified market predictor model."""
     from src.models.market_predictor import (
@@ -138,6 +149,8 @@ def train_model(
     console.print(f"  Epochs: {epochs}")
     console.print(f"  Batch size: {batch_size}")
     console.print(f"  Patience: {patience}")
+    console.print(f"  Dropout: {dropout}")
+    console.print(f"  Learning rate: {learning_rate}")
     console.print()
 
     # Split data: train/val/test
@@ -179,8 +192,8 @@ def train_model(
         position_state_dim=position_states.shape[1],
         hidden_dims=(256, 128, 64),
         attention_heads=4,
-        dropout=0.25,
-        learning_rate=3e-4,
+        dropout=dropout,
+        learning_rate=learning_rate,
         weight_decay=1e-5,
     )
 
@@ -257,34 +270,59 @@ def train_model(
 async def main():
     parser = argparse.ArgumentParser(description="Train unified market predictor")
 
-    # Data collection
-    parser.add_argument("--collect-data", action="store_true", help="Collect historical data first")
-    parser.add_argument("--train-only", action="store_true", help="Skip data collection, train only")
-    parser.add_argument("--days", type=int, default=30, help="Days of historical data")
-    parser.add_argument("--btc-interval", type=str, default="1m", help="BTC data interval")
-    parser.add_argument("--data-dir", type=str, default="./data/historical")
+    # Data
+    parser.add_argument("--train-only", action="store_true",
+                        help="Skip data download, train on existing data")
+    parser.add_argument("--download-only", action="store_true",
+                        help="Download data only, skip training")
+    parser.add_argument("--days", type=int, default=30,
+                        help="Days of historical data to download")
+    parser.add_argument("--btc-interval", type=str, default="1m",
+                        help="BTC data interval (1s, 1m, 15m)")
+    parser.add_argument("--data-dir", type=str, default="./data/historical",
+                        help="Directory for downloaded/cached data")
+    parser.add_argument("--no-proxy", action="store_true",
+                        help="Disable SOCKS5 proxy for Polymarket API")
 
     # Training
-    parser.add_argument("--output", type=str, default="./logs/market_predictor_v1")
+    parser.add_argument("--output", type=str, default="./logs/market_predictor_v2",
+                        help="Output directory for trained model")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--samples-per-candle", type=int, default=15)
+    parser.add_argument("--dropout", type=float, default=0.3,
+                        help="Dropout rate (default: 0.3, increased from 0.25)")
+    parser.add_argument("--lr", type=float, default=1e-4,
+                        help="Learning rate (default: 1e-4, reduced from 3e-4)")
+
+    # Legacy compatibility
+    parser.add_argument("--collect-data", action="store_true",
+                        help="(Legacy) Same as default behavior - downloads data")
 
     args = parser.parse_args()
 
-    console.print("[bold]Unified Market Predictor Training[/bold]")
-    console.print("=" * 50)
+    console.print("[bold]Unified Market Predictor Training Pipeline[/bold]")
+    console.print("=" * 55)
     console.print()
 
-    # Step 1: Data collection (optional)
-    if args.collect_data and not args.train_only:
-        await collect_historical_data(
+    # Step 1: Download data (default unless --train-only)
+    if not args.train_only:
+        data = await download_data(
             output_dir=args.data_dir,
             days_back=args.days,
             btc_interval=args.btc_interval,
+            use_proxy=not args.no_proxy,
         )
         console.print()
+
+        if data is None:
+            console.print("[red]Data download failed. Use --train-only to train on cached data.[/red]")
+            return
+
+        if args.download_only:
+            console.print("[green]Data download complete. Use --train-only to train on this data.[/green]")
+            return
 
     # Step 2: Build training data
     features, position_states, actions, returns = build_training_data(
@@ -296,6 +334,7 @@ async def main():
 
     if features is None:
         console.print("[red]Training aborted: No data available[/red]")
+        console.print("[dim]Run without --train-only to download fresh data.[/dim]")
         return
 
     console.print()
@@ -310,13 +349,15 @@ async def main():
         epochs=args.epochs,
         batch_size=args.batch_size,
         patience=args.patience,
+        dropout=args.dropout,
+        learning_rate=args.lr,
     )
 
     console.print()
     console.print("[bold green]Training complete![/bold green]")
     console.print()
     console.print("[bold]Next Steps:[/bold]")
-    console.print(f"  1. Run paper trading: python src/paper_trade_unified.py --model {args.output}")
+    console.print(f"  1. Run paper trading: python src/paper_trade_unified_new.py --model {args.output}")
     console.print(f"  2. Analyze results in {args.output}/")
 
 

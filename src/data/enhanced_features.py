@@ -49,7 +49,7 @@ class EnhancedFeatureBuilder:
     """
     Build enhanced features for market prediction.
 
-    Output dimension: 71 features
+    Output dimension: 83 features
     - Price State: 8 features
     - Momentum: 8 features (4 windows x 2 directions)
     - Volatility: 6 features
@@ -59,11 +59,12 @@ class EnhancedFeatureBuilder:
     - Entry Quality: 8 features
     - BTC Guidance: 10 features
     - Cross-Signal: 7 features
+    - Moving Averages: 12 features (token + BTC EMAs, relative positions, crossovers)
     """
 
     def __init__(self, config: Optional[EnhancedFeatureConfig] = None):
         self.config = config or EnhancedFeatureConfig()
-        self.feature_dim = 71
+        self.feature_dim = 83
         self._build_feature_names()
         logger.info(
             "EnhancedFeatureBuilder initialized",
@@ -115,6 +116,13 @@ class EnhancedFeatureBuilder:
             'momentum_volatility_ratio', 'trend_time_interaction',
             'convergence_quality', 'signal_agreement', 'noise_ratio',
             'regime_clarity', 'action_confidence',
+
+            # Moving Averages (12)
+            'yes_ema_10', 'yes_ema_30', 'yes_ema_60',
+            'yes_price_vs_ema_10', 'yes_price_vs_ema_30', 'yes_price_vs_ema_60',
+            'ema_crossover_10_30', 'ema_crossover_10_60',
+            'btc_ema_20', 'btc_ema_60',
+            'btc_price_vs_ema_20', 'btc_price_vs_ema_60',
         ]
 
         return self.feature_names
@@ -553,6 +561,52 @@ class EnhancedFeatureBuilder:
             signal_agree * 0.2
         )
         features.append(np.clip(action_conf, 0, 1))
+
+        # ==================== MOVING AVERAGES (12) ====================
+        # Token YES price EMAs at 3 windows
+        ma_windows = [10, 30, 60]
+        yes_emas = []
+        for w in ma_windows:
+            if len(yes_prices) > w:
+                ema_val = self._ema(yes_prices[-w-1:], self.config.ema_alpha)[-1]
+            else:
+                ema_val = yes_price
+            yes_emas.append(ema_val)
+            features.append(ema_val)
+
+        # Token price relative to each EMA (price / EMA - 1)
+        for ema_val in yes_emas:
+            rel = (yes_price - ema_val) / (ema_val + 1e-8)
+            features.append(np.clip(rel * 10, -2.0, 2.0))
+
+        # EMA crossover signals (short vs long)
+        # Positive = short EMA above long EMA (bullish)
+        ema_cross_10_30 = (yes_emas[0] - yes_emas[1]) / (yes_emas[1] + 1e-8) * 10
+        ema_cross_10_60 = (yes_emas[0] - yes_emas[2]) / (yes_emas[2] + 1e-8) * 10
+        features.append(np.clip(ema_cross_10_30, -2.0, 2.0))
+        features.append(np.clip(ema_cross_10_60, -2.0, 2.0))
+
+        # BTC EMAs at 2 windows
+        btc_ma_windows = [20, 60]
+        if btc_prices is not None and len(btc_prices) > 0:
+            btc_current = btc_prices[-1]
+            for w in btc_ma_windows:
+                if len(btc_prices) > w:
+                    btc_ema_val = self._ema(btc_prices[-w-1:], self.config.ema_alpha)[-1]
+                else:
+                    btc_ema_val = btc_current
+                features.append(np.clip((btc_current - btc_ema_val) / (btc_ema_val + 1e-8) * 100, -5.0, 5.0))
+
+            # BTC price relative to EMAs
+            for w in btc_ma_windows:
+                if len(btc_prices) > w:
+                    btc_ema_val = self._ema(btc_prices[-w-1:], self.config.ema_alpha)[-1]
+                    rel = (btc_current - btc_ema_val) / (btc_ema_val + 1e-8) * 100
+                else:
+                    rel = 0.0
+                features.append(np.clip(rel, -5.0, 5.0))
+        else:
+            features.extend([0.0] * 4)  # 2 EMAs + 2 relative positions
 
         # ==================== FINALIZE ====================
         features = np.array(features, dtype=np.float32)

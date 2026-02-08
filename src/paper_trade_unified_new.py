@@ -157,6 +157,10 @@ class UnifiedPaperTradeConfig:
     min_expected_return: float = 0.02  # Only if model predicts >2% return
     min_time_remaining: float = 0.05  # Don't enter in last 5% of candle
 
+    # Risk management
+    stop_loss_pct: float = 0.08  # Exit if unrealized loss exceeds 8%
+    trailing_stop_pct: float = 0.40  # Exit if price drops 40% from peak PnL
+
     # Polymarket API
     polymarket_api: str = "https://clob.polymarket.com"
     polymarket_gamma_api: str = "https://gamma-api.polymarket.com"
@@ -716,6 +720,38 @@ class UnifiedPaperTrader:
             )
             current_pnl = (current_price - self.state.entry_price) / (self.state.entry_price + 1e-8)
             self.state.max_pnl_seen = max(self.state.max_pnl_seen, current_pnl)
+
+            # Stop-loss: exit if unrealized loss exceeds threshold
+            if current_pnl < -self.config.stop_loss_pct:
+                mode = "LIVE" if self.is_live_mode else "PAPER"
+                logger.warning(
+                    "stop_loss_triggered",
+                    mode=mode,
+                    side=self.state.position_side,
+                    current_pnl_pct=f"{current_pnl*100:.1f}%",
+                    threshold=f"-{self.config.stop_loss_pct*100:.0f}%",
+                    entry_price=self.state.entry_price,
+                    current_price=current_price,
+                )
+                console.print(f"[bold red]STOP-LOSS triggered at {current_pnl*100:.1f}% (threshold: -{self.config.stop_loss_pct*100:.0f}%)[/bold red]")
+                await self.execute_exit("stop_loss")
+                return
+
+            # Trailing stop: exit if price drops significantly from peak PnL
+            if self.state.max_pnl_seen > 0.02 and current_pnl < self.state.max_pnl_seen * (1.0 - self.config.trailing_stop_pct):
+                mode = "LIVE" if self.is_live_mode else "PAPER"
+                logger.warning(
+                    "trailing_stop_triggered",
+                    mode=mode,
+                    side=self.state.position_side,
+                    current_pnl_pct=f"{current_pnl*100:.1f}%",
+                    max_pnl_pct=f"{self.state.max_pnl_seen*100:.1f}%",
+                    entry_price=self.state.entry_price,
+                    current_price=current_price,
+                )
+                console.print(f"[bold yellow]TRAILING STOP triggered: PnL dropped from {self.state.max_pnl_seen*100:.1f}% to {current_pnl*100:.1f}%[/bold yellow]")
+                await self.execute_exit("trailing_stop")
+                return
 
         # Handle model's action
         if action == Action.WAIT:

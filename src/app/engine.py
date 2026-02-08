@@ -148,6 +148,15 @@ class TradingEngine:
         # Get current pos
         pos = await self.execution.get_position(market_id)
         
+        # Stop-loss check
+        if pos:
+            current_p = snapshot.get("yes_price", 0.5) if pos.side == "yes" else snapshot.get("no_price", 0.5)
+            unrealized_pnl = (current_p - pos.entry_price) / (pos.entry_price + 1e-8)
+            if unrealized_pnl < -self.config.risk.stop_loss_pct:
+                logger.warning(f"Stop-loss triggered: {unrealized_pnl:.1%} < -{self.config.risk.stop_loss_pct:.0%}")
+                await self.execution.close_position(market_id)
+                return
+
         # Check Expiry/Settlement
         if time_remaining == 0 and pos:
              logger.info(f"Market Expired: Forcing Close for {market_id}")

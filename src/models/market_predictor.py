@@ -61,7 +61,7 @@ class MarketPredictorConfig:
 
     # Feature dimensions
     base_feature_dim: int = 51  # From TokenFeatureBuilder
-    position_state_dim: int = 6  # Enhanced position state
+    position_state_dim: int = 12  # Enhanced position state (expanded)
     context_dim: int = 16  # Additional learned context
 
     # Architecture
@@ -275,7 +275,9 @@ class MarketPredictorModel(nn.Module):
 
 
 class EnhancedPositionState:
-    """Build enhanced position state vector."""
+    """Build enhanced position state vector (12D)."""
+
+    DIMENSION = 12
 
     @staticmethod
     def compute(
@@ -288,30 +290,50 @@ class EnhancedPositionState:
         max_pnl_seen: float,
     ) -> np.ndarray:
         """
-        Compute 6-dimensional position state.
+        Compute 12-dimensional position state.
 
         Features:
-        1. has_position (0 or 1)
-        2. position_direction (-1 for NO, 0 for none, +1 for YES)
-        3. unrealized_pnl (normalized)
-        4. holding_time_fraction (ticks_held normalized by typical hold time)
-        5. drawdown_from_max (current vs best seen)
-        6. time_pressure (exponential as time runs out)
+         1. has_position (0 or 1)
+         2. position_direction (-1 for NO, 0 for none, +1 for YES)
+         3. unrealized_pnl (normalized)
+         4. holding_time_fraction (ticks_held normalized by typical hold time)
+         5. drawdown_from_max (current vs best seen)
+         6. time_pressure (exponential as time runs out)
+         7. pnl_per_tick (trade efficiency: pnl / time held)
+         8. position_urgency (drawdown * time_pressure interaction)
+         9. is_profitable (1 if unrealized_pnl > 0, else 0)
+        10. price_to_entry_ratio (current_price / entry_price)
+        11. risk_reward_ratio (fraction of peak gain retained)
+        12. stop_loss_proximity (how close to -8% stop-loss)
         """
         if has_position and entry_price > 0:
             position_dir = 1.0 if position_side == "yes" else -1.0
             unrealized_pnl = (current_price - entry_price) / (entry_price + 1e-8)
             holding_time = min(ticks_held / 50.0, 1.0)  # Normalize to typical range
             drawdown = (max_pnl_seen - unrealized_pnl) if max_pnl_seen > unrealized_pnl else 0.0
+
+            # New features
+            pnl_per_tick = unrealized_pnl / max(ticks_held, 1) * 10.0  # Scale up
+            price_to_entry = current_price / (entry_price + 1e-8)
+            risk_reward = unrealized_pnl / (max_pnl_seen + 1e-8) if max_pnl_seen > 0.01 else 0.0
+            stop_loss_proximity = max(0.0, 1.0 - abs(unrealized_pnl) / 0.08) if unrealized_pnl < 0 else 1.0
         else:
             position_dir = 0.0
             unrealized_pnl = 0.0
             holding_time = 0.0
             drawdown = 0.0
+            pnl_per_tick = 0.0
+            price_to_entry = 1.0
+            risk_reward = 0.0
+            stop_loss_proximity = 1.0
 
         # Time pressure: exponential increase as settlement approaches
         time_pressure = np.exp(3.0 * (1.0 - time_remaining)) - 1.0
         time_pressure = min(time_pressure, 10.0) / 10.0  # Normalize
+
+        # Interaction features
+        position_urgency = np.clip(drawdown, 0.0, 1.0) * time_pressure
+        is_profitable = 1.0 if unrealized_pnl > 0 else 0.0
 
         return np.array([
             float(has_position),
@@ -320,24 +342,32 @@ class EnhancedPositionState:
             holding_time,
             np.clip(drawdown, 0.0, 1.0),
             time_pressure,
+            np.clip(pnl_per_tick, -1.0, 1.0),
+            np.clip(position_urgency, 0.0, 1.0),
+            is_profitable,
+            np.clip(price_to_entry - 1.0, -0.5, 0.5),  # Center around 0
+            np.clip(risk_reward, -1.0, 1.0),
+            stop_loss_proximity,
         ], dtype=np.float32)
 
 
 class OptimalActionLabeler:
     """
-    Label historical data with optimal actions based on hindsight.
+    Label historical data with optimal actions.
 
-    For each state, compute what the BEST action would have been
-    given knowledge of future prices.
+    Uses a LIMITED forward window to reduce look-ahead bias.
+    Only falls back to settlement outcome when very close to candle end.
     """
 
     def __init__(
         self,
         transaction_cost: float = 0.01,
         min_profit_threshold: float = 0.02,
+        forward_window: int = 5,  # Only look N ticks ahead (not to settlement)
     ):
         self.transaction_cost = transaction_cost
         self.min_profit_threshold = min_profit_threshold
+        self.forward_window = forward_window
 
     def compute_optimal_action(
         self,
@@ -349,100 +379,109 @@ class OptimalActionLabeler:
         outcome: int,  # 0 = NO wins, 1 = YES wins
     ) -> Tuple[int, float]:
         """
-        Compute optimal action at current_idx given future knowledge.
+        Compute optimal action at current_idx using limited forward window.
+
+        Instead of looking all the way to settlement (which creates
+        unrealistic training labels), we only look forward_window ticks
+        ahead. Settlement outcome is only used when within 2 ticks of end.
 
         Returns:
             (action, expected_value)
         """
         current_yes = yes_prices[current_idx]
         current_no = 1.0 - current_yes
-        time_remaining = 1.0 - current_idx / len(yes_prices)
+        remaining_ticks = len(yes_prices) - 1 - current_idx
+        near_settlement = remaining_ticks <= 2
 
-        # Settlement prices
-        settlement_yes = float(outcome)
-        settlement_no = 1.0 - settlement_yes
+        # Limit how far ahead we look
+        max_future = min(current_idx + self.forward_window, len(yes_prices) - 1)
 
         if has_position:
             # Currently holding - evaluate EXIT vs HOLD
             if position_side == "yes":
                 current_price = current_yes
-                final_value = settlement_yes
             else:
                 current_price = current_no
-                final_value = settlement_no
-
-            # Value of holding to settlement
-            hold_value = (final_value - entry_price) / (entry_price + 1e-8)
-            hold_value -= self.transaction_cost  # Exit cost at settlement
 
             # Value of exiting now
             exit_value = (current_price - entry_price) / (entry_price + 1e-8)
             exit_value -= self.transaction_cost
 
-            # Check if there's a better exit point ahead
-            best_exit_value = exit_value
-            for future_idx in range(current_idx + 1, len(yes_prices)):
-                future_price = yes_prices[future_idx] if position_side == "yes" else (1.0 - yes_prices[future_idx])
-                future_exit = (future_price - entry_price) / (entry_price + 1e-8) - self.transaction_cost
-                best_exit_value = max(best_exit_value, future_exit)
+            # Value of holding over forward window
+            best_future_price = current_price
+            for future_idx in range(current_idx + 1, max_future + 1):
+                fp = yes_prices[future_idx] if position_side == "yes" else (1.0 - yes_prices[future_idx])
+                best_future_price = max(best_future_price, fp)
 
-            if hold_value > exit_value and hold_value > best_exit_value - 0.01:
+            hold_value = (best_future_price - entry_price) / (entry_price + 1e-8)
+            hold_value -= self.transaction_cost
+
+            # Near settlement: use actual outcome
+            if near_settlement:
+                settlement_price = float(outcome) if position_side == "yes" else 1.0 - float(outcome)
+                hold_value = (settlement_price - entry_price) / (entry_price + 1e-8) - self.transaction_cost
+
+            if hold_value > exit_value + 0.005:
                 return Action.HOLD, hold_value
             else:
-                return Action.EXIT, max(exit_value, best_exit_value)
+                return Action.EXIT, exit_value
 
         else:
             # No position - evaluate WAIT vs BUY_YES vs BUY_NO
-            wait_value = 0.0  # Opportunity cost
 
-            # Value of buying YES now
+            # Value of buying YES now and holding over forward window
             yes_entry_cost = current_yes + self.transaction_cost
-            yes_final_value = settlement_yes - self.transaction_cost
-            yes_pnl = (yes_final_value - yes_entry_cost) / (yes_entry_cost + 1e-8)
+            best_yes_price = current_yes
+            for future_idx in range(current_idx + 1, max_future + 1):
+                best_yes_price = max(best_yes_price, yes_prices[future_idx])
+            yes_pnl = (best_yes_price - yes_entry_cost) / (yes_entry_cost + 1e-8)
 
-            # Check for better entry
-            best_yes_pnl = yes_pnl
-            for future_idx in range(current_idx + 1, len(yes_prices)):
-                future_entry = yes_prices[future_idx] + self.transaction_cost
-                future_pnl = (settlement_yes - self.transaction_cost - future_entry) / (future_entry + 1e-8)
-                best_yes_pnl = max(best_yes_pnl, future_pnl)
-
-            # Value of buying NO now
+            # Value of buying NO now and holding over forward window
             no_entry_cost = current_no + self.transaction_cost
-            no_final_value = settlement_no - self.transaction_cost
-            no_pnl = (no_final_value - no_entry_cost) / (no_entry_cost + 1e-8)
+            best_no_price = current_no
+            for future_idx in range(current_idx + 1, max_future + 1):
+                future_no = 1.0 - yes_prices[future_idx]
+                best_no_price = max(best_no_price, future_no)
+            no_pnl = (best_no_price - no_entry_cost) / (no_entry_cost + 1e-8)
 
-            best_no_pnl = no_pnl
-            for future_idx in range(current_idx + 1, len(yes_prices)):
-                future_entry = (1.0 - yes_prices[future_idx]) + self.transaction_cost
-                future_pnl = (settlement_no - self.transaction_cost - future_entry) / (future_entry + 1e-8)
-                best_no_pnl = max(best_no_pnl, future_pnl)
+            # Near settlement: use actual outcome
+            if near_settlement:
+                yes_pnl = (float(outcome) - yes_entry_cost) / (yes_entry_cost + 1e-8)
+                no_pnl = (1.0 - float(outcome) - no_entry_cost) / (no_entry_cost + 1e-8)
 
-            # Choose best action
-            # If waiting leads to better entry, prefer waiting
-            if best_yes_pnl > yes_pnl + self.min_profit_threshold:
-                # Better YES entry available later
-                if best_no_pnl > no_pnl + self.min_profit_threshold:
-                    # Both could be better later, wait
-                    return Action.WAIT, 0.0
-                elif no_pnl > self.min_profit_threshold:
-                    return Action.BUY_NO, no_pnl
-                else:
-                    return Action.WAIT, 0.0
+            # Check if waiting yields a better entry in the forward window
+            best_future_yes_pnl = yes_pnl
+            best_future_no_pnl = no_pnl
+            for future_idx in range(current_idx + 1, max_future + 1):
+                future_yes_entry = yes_prices[future_idx] + self.transaction_cost
+                future_no_entry = (1.0 - yes_prices[future_idx]) + self.transaction_cost
 
-            if best_no_pnl > no_pnl + self.min_profit_threshold:
-                if yes_pnl > self.min_profit_threshold:
-                    return Action.BUY_YES, yes_pnl
-                else:
-                    return Action.WAIT, 0.0
+                # For future entries, look at remaining window
+                sub_max = min(future_idx + self.forward_window, len(yes_prices) - 1)
+                sub_best_yes = max(yes_prices[future_idx:sub_max + 1]) if future_idx <= sub_max else yes_prices[future_idx]
+                sub_best_no = max(1.0 - yes_prices[future_idx:sub_max + 1]) if future_idx <= sub_max else 1.0 - yes_prices[future_idx]
 
-            # Current entry is optimal or close to it
+                fy_pnl = (sub_best_yes - future_yes_entry) / (future_yes_entry + 1e-8)
+                fn_pnl = (sub_best_no - future_no_entry) / (future_no_entry + 1e-8)
+                best_future_yes_pnl = max(best_future_yes_pnl, fy_pnl)
+                best_future_no_pnl = max(best_future_no_pnl, fn_pnl)
+
+            # If waiting clearly yields better entry, wait
+            if best_future_yes_pnl > yes_pnl + self.min_profit_threshold and best_future_no_pnl > no_pnl + self.min_profit_threshold:
+                return Action.WAIT, 0.0
+
+            # Choose best action now
             if yes_pnl > no_pnl and yes_pnl > self.min_profit_threshold:
+                # But if waiting is much better for YES, wait
+                if best_future_yes_pnl > yes_pnl + self.min_profit_threshold:
+                    return Action.WAIT, 0.0
                 return Action.BUY_YES, yes_pnl
             elif no_pnl > yes_pnl and no_pnl > self.min_profit_threshold:
+                if best_future_no_pnl > no_pnl + self.min_profit_threshold:
+                    return Action.WAIT, 0.0
                 return Action.BUY_NO, no_pnl
             else:
-                return Action.WAIT, wait_value
+                return Action.WAIT, 0.0
 
 
 class MarketPredictorDataset(Dataset):
