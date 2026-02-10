@@ -333,8 +333,8 @@ class OptimalActionLabeler:
 
     def __init__(
         self,
-        transaction_cost: float = 0.01,
-        min_profit_threshold: float = 0.02,
+        transaction_cost: float = 0.05,
+        min_profit_threshold: float = 0.06,
     ):
         self.transaction_cost = transaction_cost
         self.min_profit_threshold = min_profit_threshold

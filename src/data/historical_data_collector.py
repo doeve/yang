@@ -496,7 +496,7 @@ class TrainingDataBuilder:
         )
 
         feature_builder = EnhancedFeatureBuilder()
-        labeler = OptimalActionLabeler()
+        labeler = OptimalActionLabeler(transaction_cost=0.05, min_profit_threshold=0.06)
 
         features_list = []
         position_states_list = []

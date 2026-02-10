@@ -18,6 +18,9 @@ risk:
   # Minimum balance to maintain (don't trade below this)
   min_balance_usdc: 10.0
 
+  # Stop loss: auto-exit when position PnL drops below this percentage
+  stop_loss_pct: 20.0
+
 # Execution Settings
 execution:
   # Use CLOB API for all operations (BUY and SELL)
@@ -40,8 +43,10 @@ execution:
 # Model Settings (can be overridden by CLI)
 model:
   path: "./logs/market_predictor_v1"
-  min_confidence: 0.3
-  min_expected_return: 0.02
+  # min_confidence: 0.3
+  min_confidence: 0.5
+  # min_expected_return: 0.02
+  min_expected_return: 0.03
 
 # Logging
 logging:

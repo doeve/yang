@@ -138,6 +138,7 @@ class UnifiedTradingState:
     daily_pnl: float = 0.0  # Today's realized PnL
     condition_id: Optional[str] = None  # Current market's condition ID
     last_balance_update: Optional[float] = None  # Timestamp of last balance update
+    invested_amount: float = 0.0  # Actual USDC spent on entry (live mode)
 
 
 @dataclass
@@ -153,7 +154,7 @@ class UnifiedPaperTradeConfig:
     min_position_size: float = 0.05  # Min 5%
 
     # Entry filters (soft - model learns these, but we add safety)
-    min_confidence: float = 0.3  # Only act on confident predictions
+    min_confidence: float = 0.5  # Only act on confident predictions
     min_expected_return: float = 0.02  # Only if model predicts >2% return
     min_time_remaining: float = 0.05  # Don't enter in last 5% of candle
 
@@ -172,6 +173,7 @@ class UnifiedPaperTradeConfig:
     trading_mode: str = "paper"  # "paper" or "live"
     max_daily_loss_pct: float = 5.0
     max_position_size_usdc: float = 100.0
+    stop_loss_pct: float = 8.0  # Auto-exit if position PnL drops below -X%
 
 
 class UnifiedPaperTrader:
@@ -717,6 +719,13 @@ class UnifiedPaperTrader:
             current_pnl = (current_price - self.state.entry_price) / (self.state.entry_price + 1e-8)
             self.state.max_pnl_seen = max(self.state.max_pnl_seen, current_pnl)
 
+            # Stop-loss check
+            if self.config.stop_loss_pct > 0:
+                if current_pnl <= -(self.config.stop_loss_pct / 100.0):
+                    logger.warning("stop_loss_triggered", pnl_pct=current_pnl, threshold=-self.config.stop_loss_pct)
+                    await self.execute_exit("stop_loss")
+                    return
+
         # Handle model's action
         if action == Action.WAIT:
             # Do nothing - model says wait
@@ -961,7 +970,6 @@ class UnifiedPaperTrader:
 
         self.state.position_side = side
         self.state.position_size = position_size
-        self.state.entry_price = price
         self.state.entry_tick = self._tick_count
         self.state.ticks_held = 0
         self.state.max_pnl_seen = 0.0
@@ -970,15 +978,23 @@ class UnifiedPaperTrader:
         if self.is_live_mode and self.executor:
             # Use the actual filled amount from the order result
             self.state.position_shares = result.filled_amount if result and result.success else quantity
+            # Compute actual cost from wallet balance change
+            actual_cost = old_balance - self.state.wallet_balance  # USDC spent
+            self.state.invested_amount = actual_cost
+            self.state.entry_price = actual_cost / self.state.position_shares if self.state.position_shares > 0 else price
             logger.info(
                 "position_shares_stored",
                 mode="LIVE",
                 shares=self.state.position_shares,
-                side=side
+                side=side,
+                midpoint_price=price,
+                actual_entry_price=self.state.entry_price,
+                invested_amount=self.state.invested_amount
             )
         else:
             # Paper mode: calculate shares from position size
             self.state.position_shares = quantity
+            self.state.entry_price = price
 
         # Use correct balance for display (already calculated above)
         dollar_size = position_size * balance_to_use
@@ -1026,7 +1042,8 @@ class UnifiedPaperTrader:
         # In paper mode, calculate from position size
         if self.is_live_mode:
             shares = self.state.position_shares
-            invested = shares * entry_price
+            invested = self.state.invested_amount if self.state.invested_amount > 0 else shares * entry_price
+            pre_exit_balance = self.state.wallet_balance
         else:
             invested = self.state.position_size * self.state.balance
             shares = invested / entry_price if entry_price > 0 else 0
@@ -1147,11 +1164,17 @@ class UnifiedPaperTrader:
                     reason="No token ID available for exit"
                 )
 
-        exit_value = shares * current_price
-        pnl = exit_value - invested
+        # Compute PnL: use actual wallet balance diff in live mode, midpoint in paper mode
+        if self.is_live_mode:
+            actual_proceeds = self.state.wallet_balance - pre_exit_balance
+            pnl = actual_proceeds - invested
+            old_balance = pre_exit_balance
+        else:
+            exit_value = shares * current_price
+            pnl = exit_value - invested
+            old_balance = self.state.balance
+            self.state.balance += pnl
 
-        old_balance = self.state.balance
-        self.state.balance += pnl
         self.state.total_pnl += pnl
 
         # Record in loss tracker
@@ -1165,6 +1188,7 @@ class UnifiedPaperTrader:
         else:
             self.state.losses += 1
 
+        current_balance = self.state.wallet_balance if self.is_live_mode else self.state.balance
         logger.info(
             "trade_pnl_calculated",
             mode=mode,
@@ -1173,7 +1197,7 @@ class UnifiedPaperTrader:
             pnl=pnl,
             pnl_pct=(pnl / invested * 100) if invested > 0 else 0,
             old_balance=old_balance,
-            new_balance=self.state.balance,
+            new_balance=current_balance,
             total_pnl=self.state.total_pnl,
             old_24h_pnl=old_daily_pnl,
             new_24h_pnl=self.state.daily_pnl,
@@ -1188,6 +1212,7 @@ class UnifiedPaperTrader:
             "entry": entry_price,
             "exit": current_price,
             "pnl": pnl,
+            "balance": current_balance,
             "reason": reason,
             "ticks_held": self.state.ticks_held,
             "mode": "live" if self.is_live_mode else "paper",
@@ -1218,6 +1243,7 @@ class UnifiedPaperTrader:
         self.state.entry_tick = 0
         self.state.ticks_held = 0
         self.state.max_pnl_seen = 0.0
+        self.state.invested_amount = 0.0
 
         # NOTE: No redemption needed when exiting via CLOB - tokens already sold for USDC
         # Redemption only happens at settlement (when holding position until market close)
@@ -1321,6 +1347,7 @@ class UnifiedPaperTrader:
             "entry": self.state.entry_price,
             "exit": payout,
             "pnl": pnl,
+            "balance": self.state.balance,
             "reason": "settlement",
             "ticks_held": self.state.ticks_held,
             "mode": "live" if self.is_live_mode else "paper",
@@ -2516,6 +2543,8 @@ class UnifiedPaperTrader:
                         await self.open_config_editor()
                     elif key == 'r':
                         self.reset_daily_limit()
+                    elif key == 'x':
+                        await self.execute_exit("manual_exit")
                     elif key == 'f':
                         await self.force_redeem_all_positions()
                     elif key == 'q':
@@ -2760,6 +2789,7 @@ class UnifiedPaperTrader:
         trades_table.add_column("Entry", width=6)
         trades_table.add_column("Exit", width=6)
         trades_table.add_column("PnL", width=10)
+        trades_table.add_column("PnL%", width=7)
         trades_table.add_column("Reason", width=6)
 
         recent_trades = list(reversed(self.state.trades[-10:]))
@@ -2777,8 +2807,13 @@ class UnifiedPaperTrader:
                 "model_signal": "MODEL",
                 "time_expiry": "TIME",
                 "settlement": "SETT",
+                "stop_loss": "SL",
+                "manual_exit": "MANUAL",
             }.get(trade.get("reason", ""), trade.get("reason", "")[:5])
 
+            # PnL as percentage of total balance
+            balance = trade.get("balance", 0)
+            pnl_pct = (trade["pnl"] / balance * 100) if balance > 0 else 0.0
             trades_table.add_row(
                 time_str,
                 f"[{mode_style}]{mode_icon}[/]",
@@ -2786,11 +2821,12 @@ class UnifiedPaperTrader:
                 f"{trade['entry']:.3f}",
                 f"{trade['exit']:.3f}",
                 f"[{pnl_color}]${trade['pnl']:+.2f}[/]",
+                f"[{pnl_color}]{pnl_pct:+.1f}%[/]",
                 reason_short,
             )
 
         if not recent_trades:
-            trades_table.add_row("", "", "", "[dim]No trades yet[/]", "", "", "")
+            trades_table.add_row("", "", "", "[dim]No trades yet[/]", "", "", "", "")
 
         # Build panels
         status_title = f"[bold cyan]Status[/] {mode_text}"
@@ -2804,6 +2840,7 @@ class UnifiedPaperTrader:
         controls_table.add_row("[L]", "Switch Paper/Live mode")
         controls_table.add_row("[C]", "Open Config Editor")
         controls_table.add_row("[R]", "Reset daily loss limit")
+        controls_table.add_row("[X]", "Force exit current position")
         if self.is_live_mode:
             controls_table.add_row("[F]", "Force redeem all positions")
         controls_table.add_row("[Q]", "Quit")
@@ -2901,7 +2938,7 @@ class BacktestConfig:
     min_position_size: float = 0.05
 
     # Entry filters
-    min_confidence: float = 0.3
+    min_confidence: float = 0.5
     min_expected_return: float = 0.02
     min_time_remaining: float = 0.05
 
@@ -3896,6 +3933,7 @@ async def main():
             trading_mode=trading_config.trading_mode,
             max_daily_loss_pct=trading_config.risk.max_daily_loss_pct,
             max_position_size_usdc=trading_config.risk.max_position_size_usdc,
+            stop_loss_pct=trading_config.risk.stop_loss_pct,
         )
 
         trader = UnifiedPaperTrader(config, trading_config)

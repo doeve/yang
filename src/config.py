@@ -22,6 +22,7 @@ class RiskConfig:
     max_daily_loss_pct: float = 5.0
     max_position_size_usdc: float = 100.0
     min_balance_usdc: float = 10.0
+    stop_loss_pct: float = 8.0
 
 
 @dataclass
@@ -38,7 +39,7 @@ class ExecutionConfig:
 class ModelConfig:
     """Model settings."""
     path: str = "./logs/market_predictor_v1"
-    min_confidence: float = 0.3
+    min_confidence: float = 0.5
     min_expected_return: float = 0.02
 
 
@@ -132,6 +133,7 @@ def load_config(
                 max_daily_loss_pct=risk_data.get("max_daily_loss_pct", 5.0),
                 max_position_size_usdc=risk_data.get("max_position_size_usdc", 100.0),
                 min_balance_usdc=risk_data.get("min_balance_usdc", 10.0),
+                stop_loss_pct=risk_data.get("stop_loss_pct", 8.0),
             )
         
         if "execution" in yaml_data:
@@ -148,7 +150,7 @@ def load_config(
             model_data = yaml_data["model"]
             config.model = ModelConfig(
                 path=model_data.get("path", "./logs/market_predictor_v1"),
-                min_confidence=model_data.get("min_confidence", 0.3),
+                min_confidence=model_data.get("min_confidence", 0.5),
                 min_expected_return=model_data.get("min_expected_return", 0.02),
             )
         
