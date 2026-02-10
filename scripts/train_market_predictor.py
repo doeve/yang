@@ -27,7 +27,7 @@ Usage:
 import argparse
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -276,6 +276,7 @@ async def main():
     parser.add_argument("--collect-data", action="store_true", help="Collect historical data first")
     parser.add_argument("--train-only", action="store_true", help="Skip data collection, train only")
     parser.add_argument("--days", type=int, default=30, help="Days of historical data")
+    parser.add_argument("--start-date", type=str, default=None, help="Start date for data collection (YYYY-MM-DD), overrides --days")
     parser.add_argument("--btc-interval", type=str, default="1m", help="BTC data interval")
     parser.add_argument("--data-dir", type=str, default="./data/historical")
 
@@ -288,8 +289,17 @@ async def main():
 
     args = parser.parse_args()
 
+    # Convert --start-date to days_back
+    if args.start_date:
+        start_dt = datetime.strptime(args.start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        args.days = (datetime.now(timezone.utc) - start_dt).days
+        if args.days < 1:
+            console.print(f"[red]--start-date {args.start_date} is in the future![/red]")
+            return
+
     console.print("[bold]Unified Market Predictor Training[/bold]")
     console.print("=" * 50)
+    console.print(f"  Data range: {args.days} days" + (f" (from {args.start_date})" if args.start_date else ""))
     console.print()
 
     # Step 1: Data collection (optional)
