@@ -511,12 +511,13 @@ class TrainingDataBuilder:
             console.print("[red]No price or candle data available![/red]")
             return np.array([]), np.array([]), np.array([]), np.array([])
 
-        # Group prices by candle
-        candle_groups = prices_df.groupby('candle_timestamp')
+        # Iterate candles in temporal order (important for time-based train/test split)
+        candle_timestamps_sorted = sorted(prices_df['candle_timestamp'].unique())
 
-        console.print(f"Building training examples from {len(candle_groups)} candles...")
+        console.print(f"Building training examples from {len(candle_timestamps_sorted)} candles...")
 
-        for candle_ts, candle_prices in candle_groups:
+        for candle_ts in candle_timestamps_sorted:
+            candle_prices = prices_df[prices_df['candle_timestamp'] == candle_ts]
             # Need at least 20 prices to have meaningful samples (start from idx 10)
             if len(candle_prices) < 20:
                 continue
@@ -535,12 +536,15 @@ class TrainingDataBuilder:
                 if not btc_candle.empty:
                     btc_prices = btc_candle['close'].values
                     btc_open = btc_prices[0]
+                    btc_volumes = btc_candle['volume'].values if 'volume' in btc_candle.columns else None
                 else:
                     btc_prices = None
                     btc_open = None
+                    btc_volumes = None
             else:
                 btc_prices = None
                 btc_open = None
+                btc_volumes = None
 
             # Sample points within candle (start from index 10, end at last valid index)
             max_idx = len(yes_prices) - 1
@@ -550,24 +554,44 @@ class TrainingDataBuilder:
             )
             sample_indices = np.unique(sample_indices)  # Remove duplicates
 
-            # Simulate position scenarios
-            scenarios = [
-                (False, None, 0.0, 0),  # No position
-                (True, "yes", 0.4, 10),  # Long YES from earlier
-                (True, "no", 0.6, 10),   # Long NO from earlier
-            ]
-
             for idx in sample_indices:
                 # Ensure idx is within bounds
                 if idx >= len(yes_prices):
                     continue
                 time_remaining = max(0.0, 1.0 - idx / len(yes_prices))
 
+                # Build realistic position scenarios per sample point
+                import random
+                scenarios = [(False, None, 0.0, 0, 0.0)]  # Always include no-position
+
+                if idx > 5:
+                    # Random YES entries from earlier indices
+                    num_yes = random.randint(1, 2)
+                    for _ in range(num_yes):
+                        entry_idx = random.randint(0, idx - 1)
+                        entry_p = yes_prices[entry_idx]
+                        ticks = idx - entry_idx
+                        # Compute actual max unrealized PnL between entry and current
+                        max_pnl = float(np.max(yes_prices[entry_idx:idx+1]) - entry_p) / (entry_p + 1e-8)
+                        scenarios.append((True, "yes", entry_p, ticks, max_pnl))
+
+                    # Random NO entries from earlier indices
+                    num_no = random.randint(1, 2)
+                    for _ in range(num_no):
+                        entry_idx = random.randint(0, idx - 1)
+                        entry_p = no_prices[entry_idx]
+                        ticks = idx - entry_idx
+                        max_pnl = float(np.max(no_prices[entry_idx:idx+1]) - entry_p) / (entry_p + 1e-8)
+                        scenarios.append((True, "no", entry_p, ticks, max_pnl))
+
                 # Compute features
                 btc_slice = None
+                btc_vol_slice = None
                 if btc_prices is not None and len(btc_prices) > 0:
                     btc_idx = min(idx + 1, len(btc_prices))
                     btc_slice = btc_prices[:btc_idx]
+                    if btc_volumes is not None and len(btc_volumes) > 0:
+                        btc_vol_slice = btc_volumes[:btc_idx]
 
                 features = feature_builder.compute_features(
                     yes_prices=yes_prices[:idx+1],
@@ -575,12 +599,12 @@ class TrainingDataBuilder:
                     time_remaining=time_remaining,
                     btc_prices=btc_slice,
                     btc_open=btc_open,
+                    btc_volumes=btc_vol_slice,
                 )
 
-                for has_pos, pos_side, entry_price, ticks_held in scenarios:
+                for has_pos, pos_side, entry_price, ticks_held, max_pnl in scenarios:
                     # Compute position state
                     current_price = yes_prices[idx] if pos_side == "yes" else no_prices[idx]
-                    max_pnl = 0.1 if has_pos else 0.0
 
                     position_state = EnhancedPositionState.compute(
                         has_position=has_pos,

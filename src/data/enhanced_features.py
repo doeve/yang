@@ -49,7 +49,7 @@ class EnhancedFeatureBuilder:
     """
     Build enhanced features for market prediction.
 
-    Output dimension: 71 features
+    Output dimension: 74 features
     - Price State: 8 features
     - Momentum: 8 features (4 windows x 2 directions)
     - Volatility: 6 features
@@ -58,12 +58,13 @@ class EnhancedFeatureBuilder:
     - Time Features: 6 features
     - Entry Quality: 8 features
     - BTC Guidance: 10 features
+    - BTC Volume: 3 features
     - Cross-Signal: 7 features
     """
 
     def __init__(self, config: Optional[EnhancedFeatureConfig] = None):
         self.config = config or EnhancedFeatureConfig()
-        self.feature_dim = 71
+        self.feature_dim = 74
         self._build_feature_names()
         logger.info(
             "EnhancedFeatureBuilder initialized",
@@ -111,6 +112,9 @@ class EnhancedFeatureBuilder:
             'btc_direction', 'btc_correlation', 'btc_divergence',
             'btc_trend_strength', 'btc_regime', 'btc_interaction', 'btc_lead_signal',
 
+            # BTC Volume (3)
+            'btc_volume_ratio', 'btc_volume_trend', 'btc_volume_price_corr',
+
             # Cross-Signal (7)
             'momentum_volatility_ratio', 'trend_time_interaction',
             'convergence_quality', 'signal_agreement', 'noise_ratio',
@@ -142,6 +146,7 @@ class EnhancedFeatureBuilder:
         time_remaining: float,
         btc_prices: Optional[np.ndarray] = None,
         btc_open: Optional[float] = None,
+        btc_volumes: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Compute enhanced feature vector.
@@ -152,9 +157,10 @@ class EnhancedFeatureBuilder:
             time_remaining: Fraction of candle remaining (1.0 = start)
             btc_prices: Optional BTC price history
             btc_open: BTC candle open price
+            btc_volumes: Optional BTC volume history
 
         Returns:
-            Feature vector (71 dimensions)
+            Feature vector (74 dimensions)
         """
         features = []
 
@@ -506,6 +512,47 @@ class EnhancedFeatureBuilder:
             ])
         else:
             features.extend([0.0] * 10)
+
+        # ==================== BTC VOLUME (3) ====================
+        if btc_volumes is not None and len(btc_volumes) > 10:
+            # Volume spike detection: recent avg / overall avg
+            recent_vol_avg = np.mean(btc_volumes[-10:])
+            overall_vol_avg = np.mean(btc_volumes) + 1e-8
+            btc_vol_ratio = recent_vol_avg / overall_vol_avg
+            features.append(np.clip(btc_vol_ratio, 0.0, 5.0))
+
+            # Volume trend: slope of recent 30-tick volume
+            vol_window = min(30, len(btc_volumes))
+            if vol_window >= 5:
+                x_range = np.arange(vol_window)
+                slope = stats.linregress(x_range, btc_volumes[-vol_window:]).slope
+                vol_norm = overall_vol_avg
+                btc_vol_trend = slope / vol_norm
+                features.append(np.clip(btc_vol_trend, -5.0, 5.0))
+            else:
+                features.append(0.0)
+
+            # Volume-price correlation
+            if btc_prices is not None and len(btc_prices) >= 10:
+                corr_window = min(30, len(btc_volumes), len(btc_prices))
+                if corr_window >= 5:
+                    abs_vol_changes = np.abs(np.diff(btc_volumes[-corr_window:]))
+                    abs_price_changes = np.abs(np.diff(btc_prices[-corr_window:]))
+                    if len(abs_vol_changes) >= 3:
+                        try:
+                            corr, _ = stats.spearmanr(abs_vol_changes, abs_price_changes)
+                            btc_vol_price_corr = 0.0 if np.isnan(corr) else corr
+                        except Exception:
+                            btc_vol_price_corr = 0.0
+                    else:
+                        btc_vol_price_corr = 0.0
+                else:
+                    btc_vol_price_corr = 0.0
+                features.append(btc_vol_price_corr)
+            else:
+                features.append(0.0)
+        else:
+            features.extend([0.0, 0.0, 0.0])
 
         # ==================== CROSS-SIGNAL (7) ====================
         # Momentum/volatility ratio

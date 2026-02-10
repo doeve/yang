@@ -70,6 +70,9 @@ class MarketPredictorConfig:
     dropout: float = 0.2
     use_layer_norm: bool = True
 
+    # Feature group attention (None = disabled for backward compat)
+    feature_group_sizes: Optional[Tuple[int, ...]] = None
+
     # Output
     num_actions: int = 5  # WAIT, BUY_YES, BUY_NO, EXIT, HOLD
 
@@ -84,11 +87,32 @@ class MarketPredictorConfig:
     entropy_weight: float = 0.01  # Encourage exploration
 
 
-class TemporalAttention(nn.Module):
-    """Self-attention for temporal patterns in price history."""
+class FeatureGroupAttention(nn.Module):
+    """
+    Attention across semantic feature groups.
 
-    def __init__(self, embed_dim: int, num_heads: int = 4, dropout: float = 0.1):
+    Splits the raw input into semantic groups (price, momentum, volatility, etc.),
+    projects each to a common embedding, then runs multi-head self-attention
+    across the groups. This lets the model learn cross-group interactions.
+    """
+
+    def __init__(
+        self,
+        group_sizes: Tuple[int, ...],
+        embed_dim: int = 64,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+    ):
         super().__init__()
+        self.group_sizes = group_sizes
+        self.num_groups = len(group_sizes)
+        self.embed_dim = embed_dim
+
+        # Per-group linear projections
+        self.group_projections = nn.ModuleList([
+            nn.Linear(size, embed_dim) for size in group_sizes
+        ])
+
         self.attention = nn.MultiheadAttention(
             embed_dim=embed_dim,
             num_heads=num_heads,
@@ -98,12 +122,26 @@ class TemporalAttention(nn.Module):
         self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (batch, seq_len, embed_dim) or (batch, embed_dim)
-        if x.dim() == 2:
-            x = x.unsqueeze(1)  # Add sequence dimension
+        """
+        Args:
+            x: Raw input features (batch, sum(group_sizes))
+        Returns:
+            (batch, embed_dim) mean-pooled attention output
+        """
+        # Split input into groups
+        splits = torch.split(x, list(self.group_sizes), dim=-1)
 
-        attn_out, _ = self.attention(x, x, x)
-        return self.norm(x + attn_out).squeeze(1)
+        # Project each group to embed_dim
+        tokens = torch.stack([
+            proj(split) for proj, split in zip(self.group_projections, splits)
+        ], dim=1)  # (batch, num_groups, embed_dim)
+
+        # Self-attention across groups
+        attn_out, _ = self.attention(tokens, tokens, tokens)
+        attn_out = self.norm(tokens + attn_out)  # (batch, num_groups, embed_dim)
+
+        # Mean pool across groups
+        return attn_out.mean(dim=1)  # (batch, embed_dim)
 
 
 class MarketPredictorModel(nn.Module):
@@ -137,12 +175,20 @@ class MarketPredictorModel(nn.Module):
         self.encoder = nn.Sequential(*encoder_layers)
         final_dim = self.config.hidden_dims[-1]
 
-        # Temporal attention for pattern recognition
-        self.temporal_attention = TemporalAttention(
-            embed_dim=final_dim,
-            num_heads=self.config.attention_heads,
-            dropout=self.config.dropout,
-        )
+        # Feature group attention (replaces old TemporalAttention)
+        if self.config.feature_group_sizes is not None:
+            assert sum(self.config.feature_group_sizes) == input_dim, (
+                f"feature_group_sizes sum {sum(self.config.feature_group_sizes)} "
+                f"!= input_dim {input_dim}"
+            )
+            self.feature_group_attention = FeatureGroupAttention(
+                group_sizes=self.config.feature_group_sizes,
+                embed_dim=final_dim,
+                num_heads=self.config.attention_heads,
+                dropout=self.config.dropout,
+            )
+        else:
+            self.feature_group_attention = None
 
         # Action Q-value heads (dueling architecture)
         self.value_head = nn.Sequential(
@@ -208,8 +254,10 @@ class MarketPredictorModel(nn.Module):
         # Encode features
         h = self.encoder(x)
 
-        # Apply temporal attention
-        h = self.temporal_attention(h)
+        # Apply feature group attention (residual connection)
+        if self.feature_group_attention is not None:
+            h_attn = self.feature_group_attention(x)
+            h = h + h_attn
 
         # Dueling Q-values: Q(s,a) = V(s) + A(s,a) - mean(A(s,a))
         value = self.value_head(h)
@@ -498,6 +546,7 @@ class MarketPredictorTrainer:
         batch_size: int = 128,
         patience: int = 15,
         output_dir: str = "./logs/market_predictor",
+        class_weights: Optional[np.ndarray] = None,
     ) -> Tuple[MarketPredictorModel, Dict[str, Any]]:
         """Train the market predictor model."""
         output_path = Path(output_dir)
@@ -532,7 +581,11 @@ class MarketPredictorTrainer:
         )
 
         # Loss functions
-        action_criterion = nn.CrossEntropyLoss()
+        if class_weights is not None:
+            weight_tensor = torch.FloatTensor(class_weights).to(self.device)
+            action_criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+        else:
+            action_criterion = nn.CrossEntropyLoss()
         return_criterion = nn.SmoothL1Loss()
 
         history = {
@@ -657,12 +710,15 @@ class MarketPredictorTrainer:
 
         # Save final model and config
         torch.save(model.state_dict(), output_path / "final_model.pt")
+        config_save = {
+            "config": {k: v for k, v in self.config.__dict__.items() if not k.startswith('_')},
+            "feature_dim": int(train_features.shape[1]),
+            "position_state_dim": int(train_position_states.shape[1]),
+        }
+        if self.config.feature_group_sizes is not None:
+            config_save["feature_group_sizes"] = list(self.config.feature_group_sizes)
         with open(output_path / "config.json", "w") as f:
-            json.dump({
-                "config": {k: v for k, v in self.config.__dict__.items() if not k.startswith('_')},
-                "feature_dim": int(train_features.shape[1]),
-                "position_state_dim": int(train_position_states.shape[1]),
-            }, f, indent=2, default=str)
+            json.dump(config_save, f, indent=2, default=str)
 
         logger.info(
             "Training complete",
@@ -684,9 +740,14 @@ def load_market_predictor(
     with open(model_path / "config.json", "r") as f:
         config_dict = json.load(f)
 
+    feature_group_sizes = config_dict.get("feature_group_sizes")
+    if feature_group_sizes is not None:
+        feature_group_sizes = tuple(feature_group_sizes)
+
     config = MarketPredictorConfig(
         base_feature_dim=config_dict["feature_dim"],
         position_state_dim=config_dict["position_state_dim"],
+        feature_group_sizes=feature_group_sizes,
     )
 
     model = MarketPredictorModel(config)

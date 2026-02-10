@@ -33,7 +33,6 @@ from pathlib import Path
 import numpy as np
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
-from sklearn.model_selection import train_test_split
 
 console = Console()
 
@@ -123,8 +122,6 @@ def train_model(
     epochs: int = 100,
     batch_size: int = 128,
     patience: int = 15,
-    val_split: float = 0.15,
-    test_split: float = 0.10,
 ):
     """Train the unified market predictor model."""
     from src.models.market_predictor import (
@@ -140,38 +137,54 @@ def train_model(
     console.print(f"  Patience: {patience}")
     console.print()
 
-    # Split data: train/val/test
-    # First split: separate test set
-    (
-        features_trainval, features_test,
-        pos_trainval, pos_test,
-        actions_trainval, actions_test,
-        returns_trainval, returns_test,
-    ) = train_test_split(
-        features, position_states, actions, returns,
-        test_size=test_split,
-        random_state=42,
-        stratify=actions,  # Stratify by action to maintain distribution
-    )
+    # Time-based sequential split (no future leakage)
+    n = len(features)
+    train_end = int(n * 0.75)
+    val_end = int(n * 0.90)
 
-    # Second split: separate validation from training
-    val_ratio = val_split / (1 - test_split)  # Adjust ratio after test split
-    (
-        features_train, features_val,
-        pos_train, pos_val,
-        actions_train, actions_val,
-        returns_train, returns_val,
-    ) = train_test_split(
-        features_trainval, pos_trainval, actions_trainval, returns_trainval,
-        test_size=val_ratio,
-        random_state=42,
-        stratify=actions_trainval,
-    )
+    features_train = features[:train_end]
+    pos_train = position_states[:train_end]
+    actions_train = actions[:train_end]
+    returns_train = returns[:train_end]
 
-    console.print(f"[green]Data split:[/green]")
-    console.print(f"  Train: {len(features_train)}")
-    console.print(f"  Val: {len(features_val)}")
-    console.print(f"  Test: {len(features_test)}")
+    features_val = features[train_end:val_end]
+    pos_val = position_states[train_end:val_end]
+    actions_val = actions[train_end:val_end]
+    returns_val = returns[train_end:val_end]
+
+    features_test = features[val_end:]
+    pos_test = position_states[val_end:]
+    actions_test = actions[val_end:]
+    returns_test = returns[val_end:]
+
+    console.print(f"[green]Time-based data split:[/green]")
+    console.print(f"  Train: {len(features_train)} (first 75%)")
+    console.print(f"  Val: {len(features_val)} (next 15%)")
+    console.print(f"  Test: {len(features_test)} (last 10%)")
+
+    # Compute class weights from training set
+    action_counts = np.bincount(actions_train, minlength=Action.num_actions())
+    total = len(actions_train)
+    num_classes = Action.num_actions()
+    class_weights = total / (num_classes * (action_counts + 1))
+    class_weights = class_weights / class_weights.mean()  # Normalize to mean=1
+    class_weights = np.clip(class_weights, 0.2, 5.0)
+
+    console.print(f"\n[bold]Class weights:[/bold]")
+    for i, name in enumerate(Action.names()):
+        console.print(f"  {name}: {class_weights[i]:.3f} (count={action_counts[i]})")
+
+    # Feature group sizes for attention
+    # Groups: price(8), momentum(8), volatility(6), trend(10), convergence(8),
+    #         time(6), entry_quality(8), btc_guidance(10), btc_volume(3),
+    #         cross_signal(7), position(6)
+    feature_group_sizes = (8, 8, 6, 10, 8, 6, 8, 10, 3, 7, 6)
+    expected_input_dim = features.shape[1] + position_states.shape[1]
+    assert sum(feature_group_sizes) == expected_input_dim, (
+        f"feature_group_sizes sum {sum(feature_group_sizes)} != "
+        f"input dim {expected_input_dim} "
+        f"(features={features.shape[1]} + pos_state={position_states.shape[1]})"
+    )
 
     # Create config with correct dimensions
     config = MarketPredictorConfig(
@@ -182,6 +195,7 @@ def train_model(
         dropout=0.25,
         learning_rate=3e-4,
         weight_decay=1e-5,
+        feature_group_sizes=feature_group_sizes,
     )
 
     # Train
@@ -199,6 +213,7 @@ def train_model(
         batch_size=batch_size,
         patience=patience,
         output_dir=output_dir,
+        class_weights=class_weights,
     )
 
     # Evaluate on test set
