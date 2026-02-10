@@ -148,16 +148,21 @@ class HistoricalDataCollector:
         self,
         days_back: int = 30,
         interval: str = "1s",
+        start_date: Optional[datetime] = None,
     ) -> pd.DataFrame:
         """
         Fetch BTC data for a date range.
 
         For 1s data, we need to batch requests due to API limits.
         """
-        console.print(f"[bold blue]Fetching {days_back} days of BTC {interval} data...[/bold blue]")
+        if start_date is not None:
+            start_time = start_date
+            end_time = start_date + timedelta(days=days_back)
+        else:
+            end_time = datetime.now(timezone.utc)
+            start_time = end_time - timedelta(days=days_back)
 
-        end_time = datetime.now(timezone.utc)
-        start_time = end_time - timedelta(days=days_back)
+        console.print(f"[bold blue]Fetching BTC {interval} data: {start_time.strftime('%Y-%m-%d')} to {end_time.strftime('%Y-%m-%d')}[/bold blue]")
 
         all_data = []
         current_start = start_time
@@ -304,6 +309,7 @@ class HistoricalDataCollector:
     async def fetch_polymarket_data_range(
         self,
         days_back: int = 30,
+        start_date: Optional[datetime] = None,
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
         Fetch Polymarket 15-minute candles and their price histories.
@@ -311,15 +317,18 @@ class HistoricalDataCollector:
         Returns:
             (candles_df, prices_df)
         """
-        console.print(f"[bold blue]Fetching {days_back} days of Polymarket data...[/bold blue]")
-
-        # Calculate timestamp range (aligned to 15-min boundaries)
-        now = int(datetime.now(timezone.utc).timestamp())
-        current_boundary = (now // 900) * 900
-        start_ts = current_boundary - (days_back * 24 * 3600)
+        if start_date is not None:
+            start_ts = (int(start_date.timestamp()) // 900) * 900
+            end_ts = start_ts + (days_back * 24 * 3600)
+            console.print(f"[bold blue]Fetching Polymarket data: {start_date.strftime('%Y-%m-%d')} + {days_back} days[/bold blue]")
+        else:
+            now = int(datetime.now(timezone.utc).timestamp())
+            end_ts = (now // 900) * 900
+            start_ts = end_ts - (days_back * 24 * 3600)
+            console.print(f"[bold blue]Fetching {days_back} days of Polymarket data...[/bold blue]")
 
         # Generate all 15-min timestamps
-        timestamps = list(range(start_ts, current_boundary + 1, 900))
+        timestamps = list(range(start_ts, end_ts + 1, 900))
 
         console.print(f"Scanning {len(timestamps)} candle timestamps...")
 
@@ -377,6 +386,7 @@ class HistoricalDataCollector:
         self,
         days_back: int = 30,
         btc_interval: str = "1s",
+        start_date: Optional[datetime] = None,
     ) -> Dict[str, pd.DataFrame]:
         """
         Collect all historical data.
@@ -393,11 +403,13 @@ class HistoricalDataCollector:
             btc_df = await self.fetch_btc_data_range(
                 days_back=days_back,
                 interval=btc_interval,
+                start_date=start_date,
             )
 
             # Fetch Polymarket data
             candles_df, prices_df = await self.fetch_polymarket_data_range(
                 days_back=days_back,
+                start_date=start_date,
             )
 
             # Save to disk

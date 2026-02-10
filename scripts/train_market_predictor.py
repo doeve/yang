@@ -29,6 +29,7 @@ import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 from rich.console import Console
@@ -41,13 +42,16 @@ async def collect_historical_data(
     output_dir: str = "./data/historical",
     days_back: int = 30,
     btc_interval: str = "1m",  # Use 1m for faster collection, still good resolution,
-    use_proxy: bool = True
+    use_proxy: bool = True,
+    start_date: Optional[datetime] = None,
 ):
     """Collect historical data from Binance and Polymarket."""
     from src.data.historical_data_collector import HistoricalDataCollector
 
     console.print("[bold blue]Step 1: Collecting Historical Data[/bold blue]")
     console.print(f"  Days: {days_back}")
+    if start_date:
+        console.print(f"  Start date: {start_date.strftime('%Y-%m-%d')}")
     console.print(f"  BTC interval: {btc_interval}")
     console.print(f"  Output: {output_dir}")
     console.print()
@@ -56,6 +60,7 @@ async def collect_historical_data(
     data = await collector.collect_all_data(
         days_back=days_back,
         btc_interval=btc_interval,
+        start_date=start_date,
     )
 
     return data
@@ -289,17 +294,20 @@ async def main():
 
     args = parser.parse_args()
 
-    # Convert --start-date to days_back
+    # Parse --start-date
+    start_date = None
     if args.start_date:
-        start_dt = datetime.strptime(args.start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        args.days = (datetime.now(timezone.utc) - start_dt).days
-        if args.days < 1:
+        start_date = datetime.strptime(args.start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        if start_date > datetime.now(timezone.utc):
             console.print(f"[red]--start-date {args.start_date} is in the future![/red]")
             return
 
     console.print("[bold]Unified Market Predictor Training[/bold]")
     console.print("=" * 50)
-    console.print(f"  Data range: {args.days} days" + (f" (from {args.start_date})" if args.start_date else ""))
+    if start_date:
+        console.print(f"  Data range: {args.days} days from {args.start_date}")
+    else:
+        console.print(f"  Data range: last {args.days} days")
     console.print()
 
     # Step 1: Data collection (optional)
@@ -308,6 +316,7 @@ async def main():
             output_dir=args.data_dir,
             days_back=args.days,
             btc_interval=args.btc_interval,
+            start_date=start_date,
         )
         console.print()
 
