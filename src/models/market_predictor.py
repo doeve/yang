@@ -751,9 +751,8 @@ def load_market_predictor(
     )
 
     model = MarketPredictorModel(config)
-    model.load_state_dict(
-        torch.load(model_path / "final_model.pt", map_location=device, weights_only=True)
-    )
+    state_dict = torch.load(model_path / "final_model.pt", map_location=device, weights_only=True)
+    model.load_state_dict(state_dict, strict=False)
     model.to(device)
     model.eval()
 
