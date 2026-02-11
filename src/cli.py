@@ -16,6 +16,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn
+from datetime import datetime, timezone
 
 app = typer.Typer(
     name="yang",
@@ -1463,7 +1464,8 @@ def train_unified_cmd(
     batch_size: int = typer.Option(128, help="Batch size"),
     patience: int = typer.Option(15, help="Early stopping patience"),
     samples_per_candle: int = typer.Option(15, help="Training samples per candle"),
-    no_proxy: bool = typer.Option(False, "--no-proxy", help="Do not use socks5 proxy to gather polymarket Data")
+    no_proxy: bool = typer.Option(False, "--no-proxy", help="Do not use socks5 proxy to gather polymarket Data"),
+    start_date: Optional[datetime] = typer.Option(None, "--start-date", help="Start date for data collection (YYYY-MM-DD), overrides --days")
 ):
     """Train unified MarketPredictor model on real historical data.
 
@@ -1501,6 +1503,7 @@ def train_unified_cmd(
                 days_back=days,
                 btc_interval=btc_interval,
                 use_proxy=not no_proxy,
+                start_date=start_date,
             )
             console.print()
 
